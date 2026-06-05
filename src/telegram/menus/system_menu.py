@@ -59,8 +59,17 @@ def _main_text_and_kb() -> tuple[str, dict]:
     else:
         tl_summary = "关"
 
+    custom = cfg.get("customSettings") or {}
+    default_1m = bool(custom.get("enableDefaultContext1m", False))
+    cc_system = bool(custom.get("enableClaudeCodeSystemPrompt", True))
+
     text += f"黑名单: 默认 {bl_default_count} 条 · 渠道专属 {bl_by_ch_count} 条"
     text += f"\n翻译层: <code>{tl_summary}</code>"
+    text += (
+        "\n自定义: "
+        f"1M默认 <code>{'开' if default_1m else '关'}</code>"
+        f" · Claude Code提示词 <code>{'开' if cc_system else '关'}</code>"
+    )
 
     net = cfg.get("network") or {}
     dns_servers = (net.get("dns") or {}).get("servers") or ["8.8.8.8"]
@@ -88,8 +97,9 @@ def _main_text_and_kb() -> tuple[str, dict]:
          ui.btn("🌐 网络设置", "sys:show:network")],
         [ui.btn("🧬 WS模式", "sys:show:ws_mode"),
          ui.btn("🗣 翻译层", "tl:show")],
-        [ui.btn("🆕 版本更新", "menu:update"),
-         ui.btn("◀ 返回主菜单", "menu:main")],
+        [ui.btn("🧩 自定义设置", "sys:show:custom"),
+         ui.btn("🆕 版本更新", "menu:update")],
+        [ui.btn("◀ 返回主菜单", "menu:main")],
     ])
     return text, kb
 
@@ -1536,6 +1546,11 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data == "sys:show:ws_mode":            _show_ws_mode(chat_id, message_id, cb_id); return True
     if data == "sys:ws_mode:toggle":          _on_ws_mode_toggle(chat_id, message_id, cb_id); return True
 
+    # 自定义设置
+    if data == "sys:show:custom":             _show_custom_settings(chat_id, message_id, cb_id); return True
+    if data.startswith("sys:custom:toggle:"):
+        _on_custom_toggle(chat_id, message_id, cb_id, data.split(":", 3)[3]); return True
+
     return False
 
 
@@ -1748,3 +1763,55 @@ def _on_ws_mode_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
     config.update(_mut)
     ui.answer_cb(cb_id, "已切换")
     _show_ws_mode(chat_id, message_id, "")
+
+
+# ─── 自定义设置 ─────────────────────────────────────────────────────
+
+def _custom_settings_cfg() -> dict:
+    cfg = config.get()
+    custom = cfg.get("customSettings") or {}
+    return {
+        "enableDefaultContext1m": bool(custom.get("enableDefaultContext1m", False)),
+        "enableClaudeCodeSystemPrompt": bool(custom.get("enableClaudeCodeSystemPrompt", True)),
+    }
+
+
+def _show_custom_settings(chat_id: int, message_id: int, cb_id: str) -> None:
+    if cb_id:
+        ui.answer_cb(cb_id)
+    custom = _custom_settings_cfg()
+    default_1m = custom["enableDefaultContext1m"]
+    cc_system = custom["enableClaudeCodeSystemPrompt"]
+    lines = [
+        "🧩 <b>自定义设置</b>",
+        "",
+        f"默认开启 1M 长上下文: <code>{'开' if default_1m else '关'}</code>",
+        f"Claude Code 身份提示词: <code>{'开' if cc_system else '关'}</code>",
+        "",
+        "说明：",
+        "• <b>默认开启 1M 长上下文</b>：开启后，对支持的 Opus 4.x 默认带 <code>context-1m</code> beta；关闭后仅在下游显式请求 1M 时才带。",
+        "• <b>Claude Code 身份提示词</b>：开启时维持原 cc_mimicry 行为，注入 <code>You are Claude Code...</code> 并把用户 system 下移为一轮对话；关闭时不注入该身份提示词，用户 system 尽量保留在 top-level system。",
+        "",
+        "<i>这组开关只影响 Claude OAuth / cc_mimicry 链路；第三方 API 渠道仍按渠道自己的配置执行。</i>",
+    ]
+    ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb([
+        [ui.btn("🔴 关闭默认 1M" if default_1m else "🟢 开启默认 1M", "sys:custom:toggle:enableDefaultContext1m")],
+        [ui.btn("🔴 关闭 Claude Code 提示词" if cc_system else "🟢 开启 Claude Code 提示词", "sys:custom:toggle:enableClaudeCodeSystemPrompt")],
+        [ui.btn("◀ 返回设置", "menu:settings")],
+    ]))
+
+
+def _on_custom_toggle(chat_id: int, message_id: int, cb_id: str, field: str) -> None:
+    if field not in {"enableDefaultContext1m", "enableClaudeCodeSystemPrompt"}:
+        ui.answer_cb(cb_id, "未知设置")
+        return
+    cfg = _custom_settings_cfg()
+    new_val = not bool(cfg[field])
+
+    def _mut(c):
+        custom = c.setdefault("customSettings", {})
+        custom[field] = new_val
+
+    config.update(_mut)
+    ui.answer_cb(cb_id, "已切换")
+    _show_custom_settings(chat_id, message_id, "")

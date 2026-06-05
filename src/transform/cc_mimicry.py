@@ -105,9 +105,12 @@ DEVICE_ID = _load_or_create_device_id()
 
 def load_config():
     cfg = _ap_config.get()
+    custom = cfg.get("customSettings") or {}
     return {
         "cch_mode": cfg.get("cchMode", "disabled"),
         "cch_static_value": cfg.get("cchStaticValue", "00000"),
+        "enable_default_context_1m": bool(custom.get("enableDefaultContext1m", False)),
+        "enable_claude_code_system_prompt": bool(custom.get("enableClaudeCodeSystemPrompt", True)),
     }
 
 
@@ -133,13 +136,14 @@ def compute_fingerprint(messages):
     return hashlib.sha256(f"{FINGERPRINT_SALT}{chars}{CC_VERSION}".encode()).hexdigest()[:3]
 
 
-# ─── System prompt ───（与 cc-proxy 一字不改）
+# ─── System prompt ───
 
 def build_system_blocks(messages):
     fp = compute_fingerprint(messages)
     version = f"{CC_VERSION}.{fp}"
     cfg = load_config()
     cch_mode = _normalize_cch_mode(cfg.get("cch_mode", "dynamic"))
+    include_claude_code_prompt = bool(cfg.get("enable_claude_code_system_prompt", True))
     blocks = []
     if cch_mode != "disabled":
         parts = [f"cc_version={version}", f"cc_entrypoint={CC_ENTRYPOINT}"]
@@ -149,10 +153,32 @@ def build_system_blocks(messages):
             parts.append(f"cch={_normalize_cch_value(cfg.get('cch_static_value', '00000'))}")
         attribution = "x-anthropic-billing-header: " + "; ".join(parts) + ";"
         blocks.append({"type": "text", "text": attribution})
-    blocks.append(
-        {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
-    )
+    if include_claude_code_prompt:
+        blocks.append(
+            {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+        )
     return blocks
+
+
+def _user_system_to_blocks(user_system):
+    """把下游原始 system 保留为 Anthropic top-level system blocks。"""
+    if not user_system:
+        return []
+    if isinstance(user_system, str):
+        text = user_system.strip()
+        return [{"type": "text", "text": text}] if text else []
+    if isinstance(user_system, list):
+        blocks = []
+        for block in user_system:
+            if isinstance(block, str):
+                if block.strip():
+                    blocks.append({"type": "text", "text": block})
+            elif isinstance(block, dict):
+                btype = block.get("type")
+                if btype == "text" and str(block.get("text", "")).strip():
+                    blocks.append({k: v for k, v in block.items() if k in {"type", "text", "cache_control"}})
+        return blocks
+    return []
 
 
 def inject_user_system_to_messages(messages, user_system):
@@ -659,12 +685,21 @@ def apply_opus_adaptive_thinking(payload, model):
 def transform_request(body, email="", session_id=None):
     messages = body.get("messages", [])
     user_system = body.get("system")
-    messages = inject_user_system_to_messages(messages, user_system)
+    cfg = load_config()
+    include_claude_code_prompt = bool(cfg.get("enable_claude_code_system_prompt", True))
+    if include_claude_code_prompt:
+        messages = inject_user_system_to_messages(messages, user_system)
+    else:
+        # 关闭 Claude Code 身份提示词时，不再把用户 system 伪造成 user/assistant 对话，
+        # 而是尽量保留为 Anthropic 原生 top-level system。
+        messages = inject_user_system_to_messages(messages, None)
     messages = _normalize_messages_for_api(messages)
     messages = _strip_assistant_thinking_blocks(messages)
     messages = _strip_message_cache_control(messages)
     messages = add_cache_breakpoints(messages)
     system_blocks = build_system_blocks(messages)
+    if not include_claude_code_prompt:
+        system_blocks.extend(_user_system_to_blocks(user_system))
     model = body.get("model", "claude-sonnet-4-20250514")
 
     # 动态工具名映射（tools > 5 时触发）
@@ -685,8 +720,9 @@ def transform_request(body, email="", session_id=None):
     payload = {
         "model": model,
         "messages": messages,
-        "system": system_blocks,
     }
+    if system_blocks:
+        payload["system"] = system_blocks
 
     if body.get("tools"):
         tools = _strip_tool_cache_control([dict(t) if isinstance(t, dict) else t for t in body["tools"]])
@@ -892,8 +928,9 @@ def request_wants_context_1m(body=None, *, downstream_betas=None,
 
 
 def should_default_context_1m(model) -> bool:
-    """Parrot 默认策略：Opus 4.x 默认 1M；Sonnet 4.x 只在显式 1M 时开启。"""
-    return _is_opus_4_plus_model(model)
+    """是否默认开启 1M context beta。关闭后仅响应下游显式 1M 请求。"""
+    cfg = load_config()
+    return bool(cfg.get("enable_default_context_1m", False)) and _is_opus_4_plus_model(model)
 
 
 def _is_opus_4_plus_model(model) -> bool:
@@ -944,8 +981,8 @@ def _messages_betas_for_request(model=None, betas=None, *, payload=None,
 
     规则不再是固定全量 join，而是按最终 payload / 模型 / 下游显式能力请求生成：
       - oauth-2025-04-20 属 token 端点，messages 永远不带；
-      - context-1m：Opus 4.x 默认开启；Sonnet 4.5/4.6 仅在下游显式 1M 信号时开启；
-        需要强制关闭时可传 wants_context_1m=False；
+      - context-1m：由 customSettings.enableDefaultContext1m 控制是否默认开启；
+        关闭时仅在下游显式 1M 信号时开启；也可传 wants_context_1m=False 强制关闭；
       - mid-conversation-system 按 CC 模型白名单带；
       - context-management 仅最终 payload 含 context_management 时带；
       - extended-cache-ttl 仅最终 payload 含 ttl:"1h" 时带。

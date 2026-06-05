@@ -209,6 +209,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "cchMode": "disabled",
     "cchStaticValue": "00000",
+    # ─── 用户自定义开关 ─────────────────────────────────────────
+    # 单独收纳本地 fork 的行为开关，避免和上游 CCH / 翻译 / 渠道设置混在一起，
+    # 后续 rebase/merge 上游时也更容易处理冲突。
+    "customSettings": {
+        # 是否对支持的模型默认开启 1M context beta。
+        # False = 仅在下游显式请求 1M 时开启，避免 Opus 4.x 自动触发
+        # "Usage credits are required for long context requests"。
+        "enableDefaultContext1m": False,
+        # Claude OAuth 的 cc_mimicry 是否注入 Claude Code 身份 system prompt。
+        # True 保持上游默认行为；False 仅关闭该身份提示词，并保留用户 system。
+        "enableClaudeCodeSystemPrompt": True,
+    },
     "oauthDefaultModels": [
         "claude-opus-4-5",
         "claude-opus-4-6",
