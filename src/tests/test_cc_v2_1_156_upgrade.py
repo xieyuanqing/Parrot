@@ -258,6 +258,48 @@ def test_payload_gates_context_management_and_extended_ttl():
     assert "extended-cache-ttl-2025-04-11" not in betas
 
 
+def _collect_cache_controls(obj):
+    found = []
+    if isinstance(obj, dict):
+        cc = obj.get("cache_control")
+        if isinstance(cc, dict):
+            found.append(cc)
+        for value in obj.values():
+            found.extend(_collect_cache_controls(value))
+    elif isinstance(obj, list):
+        for value in obj:
+            found.extend(_collect_cache_controls(value))
+    return found
+
+
+def test_transform_request_cache_ttl_can_use_default_5m_without_extended_beta():
+    body = {
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"name": "foo", "description": "d", "input_schema": {"type": "object"}}],
+    }
+    payload, _ = m.transform_request(body, session_id="s", cache_ttl="5m")
+    cache_controls = _collect_cache_controls(payload)
+    assert cache_controls
+    assert all(cc == {"type": "ephemeral"} for cc in cache_controls)
+    h = m.build_upstream_headers("tok", session_id="s", model="claude-sonnet-4-6", payload=payload)
+    assert "extended-cache-ttl-2025-04-11" not in h["anthropic-beta"].split(",")
+
+
+def test_transform_request_cache_ttl_1h_keeps_extended_beta():
+    body = {
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"name": "foo", "description": "d", "input_schema": {"type": "object"}}],
+    }
+    payload, _ = m.transform_request(body, session_id="s", cache_ttl="1h")
+    cache_controls = _collect_cache_controls(payload)
+    assert cache_controls
+    assert all(cc == {"type": "ephemeral", "ttl": "1h"} for cc in cache_controls)
+    h = m.build_upstream_headers("tok", session_id="s", model="claude-sonnet-4-6", payload=payload)
+    assert "extended-cache-ttl-2025-04-11" in h["anthropic-beta"].split(",")
+
+
 # ─────────────────────────── headers (§7) ───────────────────────────
 
 def test_headers_no_x_client_request_id():

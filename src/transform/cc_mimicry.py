@@ -6,6 +6,8 @@
   - 文件头路径 / device_id 文件名（`.cc_proxy_ids.json` → `.anthropic_proxy_ids.json`）
   - `build_metadata()` 接受 email 参数（原来从全局 oauth 读）
   - `transform_request()` 接受 email 参数，透传给 `build_metadata()`
+  - `transform_request()` 接受 cache_ttl 参数，仅供 Parrot 官方 Claude OAuth
+    渠道选择 5m/1h prompt cache TTL；不改变第三方 API 渠道默认行为。
   - 提供 `load_config()` 适配层把 anthropic-proxy 的 `cchMode` / `cchStaticValue`
     翻译成 cc-proxy 原 key 名（`cch_mode` / `cch_static_value`），这样下面所有
     函数体可以保留读 `cch_mode` 的原样写法，无需改动。
@@ -97,6 +99,31 @@ def _load_or_create_device_id():
 DEVICE_ID = _load_or_create_device_id()
 
 
+# ─── cache TTL ───────────────────────────────────────────────────
+
+def normalize_cache_ttl(value) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"1h", "hour", "1hour", "60m", "3600", "3600s"}:
+        return "1h"
+    return "5m"
+
+
+def cache_control_for_ttl(cache_ttl="1h") -> dict:
+    """Return API cache_control for a logical TTL.
+
+    Anthropic's 5-minute prompt cache is the default ephemeral cache duration,
+    so it is represented as `{type: ephemeral}`. The 1-hour cache requires both
+    `ttl: 1h` in payload and `extended-cache-ttl` beta in headers.
+    """
+    if normalize_cache_ttl(cache_ttl) == "1h":
+        return {"type": "ephemeral", "ttl": "1h"}
+    return {"type": "ephemeral"}
+
+
+def claude_oauth_cache_ttl() -> str:
+    return normalize_cache_ttl(load_config().get("claude_oauth_cache_ttl", "5m"))
+
+
 # ─── load_config 适配层 ──────────────────────────────────────────
 # 下方移植的函数（build_system_blocks / sign_body）原版读的是
 # cc-proxy 的 cfg["cch_mode"] / cfg["cch_static_value"]；
@@ -110,7 +137,9 @@ def load_config():
         "cch_mode": cfg.get("cchMode", "disabled"),
         "cch_static_value": cfg.get("cchStaticValue", "00000"),
         "enable_default_context_1m": bool(custom.get("enableDefaultContext1m", False)),
-        "enable_claude_code_system_prompt": bool(custom.get("enableClaudeCodeSystemPrompt", True)),
+        # Claude OAuth 身份指纹必须保留；旧配置里的 False 不再生效。
+        "enable_claude_code_system_prompt": True,
+        "claude_oauth_cache_ttl": normalize_cache_ttl(custom.get("claudeOAuthCacheTtl", "5m")),
     }
 
 
@@ -138,7 +167,7 @@ def compute_fingerprint(messages):
 
 # ─── System prompt ───
 
-def build_system_blocks(messages):
+def build_system_blocks(messages, cache_ttl="1h"):
     fp = compute_fingerprint(messages)
     version = f"{CC_VERSION}.{fp}"
     cfg = load_config()
@@ -155,7 +184,7 @@ def build_system_blocks(messages):
         blocks.append({"type": "text", "text": attribution})
     if include_claude_code_prompt:
         blocks.append(
-            {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": cache_control_for_ttl(cache_ttl)}
         )
     return blocks
 
@@ -279,17 +308,18 @@ def _normalize_messages_for_api(messages):
 
 # ─── 缓存断点 ───（与 cc-proxy 一字不改）
 
-def _inject_cache_on_msg(msg):
+def _inject_cache_on_msg(msg, cache_ttl="1h"):
     msg = dict(msg)
+    cache_control = cache_control_for_ttl(cache_ttl)
     content = msg.get("content")
     if isinstance(content, list) and content:
         content = list(content)
         last_block = dict(content[-1])
-        last_block["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+        last_block["cache_control"] = cache_control
         content[-1] = last_block
         msg["content"] = content
     elif isinstance(content, str):
-        msg["content"] = [{"type": "text", "text": content, "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
+        msg["content"] = [{"type": "text", "text": content, "cache_control": cache_control}]
     return msg
 
 
@@ -414,7 +444,7 @@ def _strip_tool_cache_control(tools):
     return [_normalize_anthropic_tool(tool) for tool in tools]
 
 
-def add_cache_breakpoints(messages):
+def add_cache_breakpoints(messages, cache_ttl="1h"):
     """注入缓存断点。断点位置：倒数第二个 user turn + 最后一条消息。
     加上 system + tools 共 4 个断点（上限）。
     注意：调用前应先 _strip_message_cache_control 清除客户端标记。"""
@@ -423,7 +453,7 @@ def add_cache_breakpoints(messages):
     messages = [dict(m) for m in messages]
 
     # 1. 最后一条消息
-    messages[-1] = _inject_cache_on_msg(messages[-1])
+    messages[-1] = _inject_cache_on_msg(messages[-1], cache_ttl=cache_ttl)
 
     # 2. 倒数第二个 user turn：缓存多轮对话历史
     #    确保会话前缀在连续请求间可被复用
@@ -433,7 +463,7 @@ def add_cache_breakpoints(messages):
             if messages[i].get("role") == "user":
                 user_count += 1
                 if user_count == 2:
-                    messages[i] = _inject_cache_on_msg(messages[i])
+                    messages[i] = _inject_cache_on_msg(messages[i], cache_ttl=cache_ttl)
                     break
 
     return messages
@@ -682,7 +712,8 @@ def apply_opus_adaptive_thinking(payload, model):
 
 # ─── 请求转换 ───（仅签名参数化 email；函数体与 cc-proxy 一致）
 
-def transform_request(body, email="", session_id=None):
+def transform_request(body, email="", session_id=None, cache_ttl="1h"):
+    cache_ttl = normalize_cache_ttl(cache_ttl)
     messages = body.get("messages", [])
     user_system = body.get("system")
     cfg = load_config()
@@ -696,8 +727,8 @@ def transform_request(body, email="", session_id=None):
     messages = _normalize_messages_for_api(messages)
     messages = _strip_assistant_thinking_blocks(messages)
     messages = _strip_message_cache_control(messages)
-    messages = add_cache_breakpoints(messages)
-    system_blocks = build_system_blocks(messages)
+    messages = add_cache_breakpoints(messages, cache_ttl=cache_ttl)
+    system_blocks = build_system_blocks(messages, cache_ttl=cache_ttl)
     if not include_claude_code_prompt:
         system_blocks.extend(_user_system_to_blocks(user_system))
     model = body.get("model", "claude-sonnet-4-20250514")
@@ -730,7 +761,7 @@ def transform_request(body, email="", session_id=None):
             if isinstance(t, dict) and "name" in t:
                 t["name"] = _sanitize_tool_name(t["name"], dynamic_tool_map)
         tools[-1] = dict(tools[-1])
-        tools[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+        tools[-1]["cache_control"] = cache_control_for_ttl(cache_ttl)
         payload["tools"] = tools
 
     # tool_choice：CC 不"主动加"，但客户端显式传入时必须透传（含工具名混淆），

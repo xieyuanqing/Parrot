@@ -217,9 +217,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # False = 仅在下游显式请求 1M 时开启，避免 Opus 4.x 自动触发
         # "Usage credits are required for long context requests"。
         "enableDefaultContext1m": False,
-        # Claude OAuth 的 cc_mimicry 是否注入 Claude Code 身份 system prompt。
-        # True 保持上游默认行为；False 仅关闭该身份提示词，并保留用户 system。
+        # Claude OAuth 的 cc_mimicry 必须注入 Claude Code 身份 system prompt。
+        # 保留此字段兼容旧配置，但运行期强制视为 True。
         "enableClaudeCodeSystemPrompt": True,
+        # Claude 官方 OAuth 渠道 prompt cache TTL："5m" 或 "1h"。
+        # 5m = 默认 ephemeral cache，写入 1.25x；1h = extended cache，写入 2x。
+        "claudeOAuthCacheTtl": "5m",
     },
     "oauthDefaultModels": [
         "claude-opus-4-5",

@@ -51,7 +51,8 @@ class OAuthChannel(Channel):
         # §7.4/§8：同一请求一个 session_id，同源喂给 body.metadata 与 header
         sid = str(uuid.uuid4())
         payload, dynamic_map = cc_mimicry.transform_request(
-            body_with_model, email=self.email, session_id=sid)
+            body_with_model, email=self.email, session_id=sid,
+            cache_ttl=cc_mimicry.claude_oauth_cache_ttl())
         signed = cc_mimicry.sign_body(payload)
         downstream_betas = body_with_model.get(cc_mimicry.PARROT_DOWNSTREAM_BETAS_KEY)
         original_model = body_with_model.get(cc_mimicry.PARROT_ORIGINAL_MODEL_KEY)
