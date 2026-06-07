@@ -61,16 +61,17 @@ def _main_text_and_kb() -> tuple[str, dict]:
 
     custom = cfg.get("customSettings") or {}
     default_1m = bool(custom.get("enableDefaultContext1m", False))
-    cache_ttl = str(custom.get("claudeOAuthCacheTtl", "5m") or "5m").strip().lower()
-    if cache_ttl not in {"5m", "1h"}:
-        cache_ttl = "5m"
+    cache_ttl = str(custom.get("claudeOAuthCacheTtl", "passthrough") or "passthrough").strip().lower()
+    if cache_ttl not in {"passthrough", "5m", "1h"}:
+        cache_ttl = "passthrough"
+    cache_label = "请求透传" if cache_ttl == "passthrough" else cache_ttl
 
     text += f"黑名单: 默认 {bl_default_count} 条 · 渠道专属 {bl_by_ch_count} 条"
     text += f"\n翻译层: <code>{tl_summary}</code>"
     text += (
         "\n自定义: "
         f"1M默认 <code>{'开' if default_1m else '关'}</code>"
-        f" · Claude缓存 <code>{cache_ttl}</code>"
+        f" · Claude缓存 <code>{cache_label}</code>"
     )
 
     net = cfg.get("network") or {}
@@ -1773,9 +1774,9 @@ def _on_ws_mode_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
 def _custom_settings_cfg() -> dict:
     cfg = config.get()
     custom = cfg.get("customSettings") or {}
-    cache_ttl = str(custom.get("claudeOAuthCacheTtl", "5m") or "5m").strip().lower()
-    if cache_ttl not in {"5m", "1h"}:
-        cache_ttl = "5m"
+    cache_ttl = str(custom.get("claudeOAuthCacheTtl", "passthrough") or "passthrough").strip().lower()
+    if cache_ttl not in {"passthrough", "5m", "1h"}:
+        cache_ttl = "passthrough"
     return {
         "enableDefaultContext1m": bool(custom.get("enableDefaultContext1m", False)),
         "enableClaudeCodeSystemPrompt": True,
@@ -1789,22 +1790,23 @@ def _show_custom_settings(chat_id: int, message_id: int, cb_id: str) -> None:
     custom = _custom_settings_cfg()
     default_1m = custom["enableDefaultContext1m"]
     cache_ttl = custom["claudeOAuthCacheTtl"]
+    cache_label = "请求透传" if cache_ttl == "passthrough" else cache_ttl
     lines = [
         "🧩 <b>自定义设置</b>",
         "",
         f"默认开启 1M 长上下文: <code>{'开' if default_1m else '关'}</code>",
-        f"Claude 官方 OAuth 缓存 TTL: <code>{cache_ttl}</code>",
+        f"Claude 官方 OAuth 缓存: <code>{cache_label}</code>",
         "",
         "说明：",
         "• <b>默认开启 1M 长上下文</b>：开启后，对支持的 Opus 4.x 默认带 <code>context-1m</code> beta；关闭后仅在下游显式请求 1M 时才带。",
-        "• <b>Claude 官方 OAuth 缓存 TTL</b>：5m 使用默认 prompt cache（写入 1.25x）；1h 使用 extended cache（写入 2x，复用窗口更长）。",
+        "• <b>Claude 官方 OAuth 缓存</b>：当前为请求透传；Parrot 不再自动添加 <code>cache_control</code>、<code>ttl=1h</code> 或 <code>extended-cache-ttl</code>，客户端请求里带什么就转什么。",
         "• Claude Code 身份指纹已强制保留，不再提供关闭按钮；这是 OAuth 链路可用性要求。",
         "",
-        "<i>1h/5m 缓存 TTL 只影响 Claude 官方 OAuth 渠道；第三方 API 渠道仍按渠道自己的配置执行。</i>",
+        "<i>缓存透传只影响 Claude 官方 OAuth 渠道；第三方 API 渠道仍按渠道自己的配置执行。</i>",
     ]
     ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb([
         [ui.btn("🔴 关闭默认 1M" if default_1m else "🟢 开启默认 1M", "sys:custom:toggle:enableDefaultContext1m")],
-        [ui.btn("切到 1小时缓存" if cache_ttl == "5m" else "切到 5分钟缓存", "sys:custom:cache_ttl:toggle")],
+        [ui.btn("缓存请求透传", "sys:custom:cache_ttl:toggle")],
         [ui.btn("◀ 返回设置", "menu:settings")],
     ]))
 
@@ -1826,15 +1828,12 @@ def _on_custom_toggle(chat_id: int, message_id: int, cb_id: str, field: str) -> 
 
 
 def _on_custom_cache_ttl_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
-    cfg = _custom_settings_cfg()
-    new_ttl = "1h" if cfg["claudeOAuthCacheTtl"] == "5m" else "5m"
-
     def _mut(c):
         custom = c.setdefault("customSettings", {})
-        custom["claudeOAuthCacheTtl"] = new_ttl
+        custom["claudeOAuthCacheTtl"] = "passthrough"
         # 旧开关保留兼容，但运行期不允许关 Claude Code 身份指纹。
         custom["enableClaudeCodeSystemPrompt"] = True
 
     config.update(_mut)
-    ui.answer_cb(cb_id, "已切换")
+    ui.answer_cb(cb_id, "已设为请求透传")
     _show_custom_settings(chat_id, message_id, "")

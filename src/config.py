@@ -220,9 +220,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Claude OAuth 的 cc_mimicry 必须注入 Claude Code 身份 system prompt。
         # 保留此字段兼容旧配置，但运行期强制视为 True。
         "enableClaudeCodeSystemPrompt": True,
-        # Claude 官方 OAuth 渠道 prompt cache TTL："5m" 或 "1h"。
-        # 5m = 默认 ephemeral cache，写入 1.25x；1h = extended cache，写入 2x。
-        "claudeOAuthCacheTtl": "5m",
+        # Claude 官方 OAuth 渠道 prompt cache：默认请求透传。
+        # passthrough = 不自动添加 cache_control/TTL；下游请求带什么就转什么。
+        # 旧值 "5m"/"1h" 仍被 cc_mimicry 兼容，但生产默认不再使用。
+        "claudeOAuthCacheTtl": "passthrough",
     },
     "oauthDefaultModels": [
         "claude-opus-4-5",

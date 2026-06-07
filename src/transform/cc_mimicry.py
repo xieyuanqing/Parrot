@@ -101,27 +101,38 @@ DEVICE_ID = _load_or_create_device_id()
 
 # ─── cache TTL ───────────────────────────────────────────────────
 
+PASSTHROUGH_CACHE_TTL = "passthrough"
+
+
 def normalize_cache_ttl(value) -> str:
     raw = str(value or "").strip().lower()
+    if raw in {"passthrough", "pass", "raw", "none", "off", "disabled", "disable"}:
+        return PASSTHROUGH_CACHE_TTL
     if raw in {"1h", "hour", "1hour", "60m", "3600", "3600s"}:
         return "1h"
     return "5m"
 
 
-def cache_control_for_ttl(cache_ttl="1h") -> dict:
+def cache_control_for_ttl(cache_ttl="1h") -> dict | None:
     """Return API cache_control for a logical TTL.
 
     Anthropic's 5-minute prompt cache is the default ephemeral cache duration,
     so it is represented as `{type: ephemeral}`. The 1-hour cache requires both
     `ttl: 1h` in payload and `extended-cache-ttl` beta in headers.
+
+    `passthrough` means Parrot does not add cache_control; downstream-provided
+    cache_control fields are preserved by the caller instead.
     """
-    if normalize_cache_ttl(cache_ttl) == "1h":
+    normalized_ttl = normalize_cache_ttl(cache_ttl)
+    if normalized_ttl == PASSTHROUGH_CACHE_TTL:
+        return None
+    if normalized_ttl == "1h":
         return {"type": "ephemeral", "ttl": "1h"}
     return {"type": "ephemeral"}
 
 
 def claude_oauth_cache_ttl() -> str:
-    return normalize_cache_ttl(load_config().get("claude_oauth_cache_ttl", "5m"))
+    return normalize_cache_ttl(load_config().get("claude_oauth_cache_ttl", PASSTHROUGH_CACHE_TTL))
 
 
 # ─── load_config 适配层 ──────────────────────────────────────────
@@ -139,7 +150,7 @@ def load_config():
         "enable_default_context_1m": bool(custom.get("enableDefaultContext1m", False)),
         # Claude OAuth 身份指纹必须保留；旧配置里的 False 不再生效。
         "enable_claude_code_system_prompt": True,
-        "claude_oauth_cache_ttl": normalize_cache_ttl(custom.get("claudeOAuthCacheTtl", "5m")),
+        "claude_oauth_cache_ttl": normalize_cache_ttl(custom.get("claudeOAuthCacheTtl", PASSTHROUGH_CACHE_TTL)),
     }
 
 
@@ -183,9 +194,11 @@ def build_system_blocks(messages, cache_ttl="1h"):
         attribution = "x-anthropic-billing-header: " + "; ".join(parts) + ";"
         blocks.append({"type": "text", "text": attribution})
     if include_claude_code_prompt:
-        blocks.append(
-            {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": cache_control_for_ttl(cache_ttl)}
-        )
+        cc_block: dict = {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}
+        cc_cache_control = cache_control_for_ttl(cache_ttl)
+        if cc_cache_control:
+            cc_block["cache_control"] = cc_cache_control
+        blocks.append(cc_block)
     return blocks
 
 
@@ -311,6 +324,8 @@ def _normalize_messages_for_api(messages):
 def _inject_cache_on_msg(msg, cache_ttl="1h"):
     msg = dict(msg)
     cache_control = cache_control_for_ttl(cache_ttl)
+    if not cache_control:
+        return msg
     content = msg.get("content")
     if isinstance(content, list) and content:
         content = list(content)
@@ -359,6 +374,15 @@ def _strip_message_cache_control(messages):
         else:
             result.append(msg)
     return result
+
+
+def _preserve_message_cache_control(messages):
+    """保留客户端原始 cache_control。
+
+    passthrough 模式下，Parrot 不替客户端选择缓存断点，也不把 5m/1h
+    策略写进 payload；只保留 normalize 后仍合法的 cache_control 字段。
+    """
+    return messages
 
 
 _ANTHROPIC_TOOL_ALLOWED_KEYS = {
@@ -414,9 +438,9 @@ def _normalize_anthropic_tool(tool):
     if not isinstance(tool, dict):
         return tool
     if _is_anthropic_server_tool(tool):
-        return {k: v for k, v in tool.items() if k != "cache_control"}
+        return dict(tool)
 
-    normalized = {k: v for k, v in tool.items() if k in _ANTHROPIC_TOOL_ALLOWED_KEYS and k != "cache_control"}
+    normalized = {k: v for k, v in tool.items() if k in _ANTHROPIC_TOOL_ALLOWED_KEYS}
 
     # OpenAI/chat-style compatibility: {type:function,function:{name,description,parameters}}
     fn = tool.get("function")
@@ -440,7 +464,7 @@ def _normalize_anthropic_tool(tool):
 
 
 def _strip_tool_cache_control(tools):
-    """移除客户端在 tools 上设置的 cache_control，并规范化普通 client tools。"""
+    """规范化普通 client tools，并保留客户端提供的 cache_control。"""
     return [_normalize_anthropic_tool(tool) for tool in tools]
 
 
@@ -449,6 +473,8 @@ def add_cache_breakpoints(messages, cache_ttl="1h"):
     加上 system + tools 共 4 个断点（上限）。
     注意：调用前应先 _strip_message_cache_control 清除客户端标记。"""
     if not messages:
+        return messages
+    if normalize_cache_ttl(cache_ttl) == PASSTHROUGH_CACHE_TTL:
         return messages
     messages = [dict(m) for m in messages]
 
@@ -726,8 +752,11 @@ def transform_request(body, email="", session_id=None, cache_ttl="1h"):
         messages = inject_user_system_to_messages(messages, None)
     messages = _normalize_messages_for_api(messages)
     messages = _strip_assistant_thinking_blocks(messages)
-    messages = _strip_message_cache_control(messages)
-    messages = add_cache_breakpoints(messages, cache_ttl=cache_ttl)
+    if cache_ttl == PASSTHROUGH_CACHE_TTL:
+        messages = _preserve_message_cache_control(messages)
+    else:
+        messages = _strip_message_cache_control(messages)
+        messages = add_cache_breakpoints(messages, cache_ttl=cache_ttl)
     system_blocks = build_system_blocks(messages, cache_ttl=cache_ttl)
     if not include_claude_code_prompt:
         system_blocks.extend(_user_system_to_blocks(user_system))
@@ -760,8 +789,9 @@ def transform_request(body, email="", session_id=None, cache_ttl="1h"):
         for t in tools:
             if isinstance(t, dict) and "name" in t:
                 t["name"] = _sanitize_tool_name(t["name"], dynamic_tool_map)
-        tools[-1] = dict(tools[-1])
-        tools[-1]["cache_control"] = cache_control_for_ttl(cache_ttl)
+        if cache_ttl != PASSTHROUGH_CACHE_TTL:
+            tools[-1] = dict(tools[-1])
+            tools[-1]["cache_control"] = cache_control_for_ttl(cache_ttl)
         payload["tools"] = tools
 
     # tool_choice：CC 不"主动加"，但客户端显式传入时必须透传（含工具名混淆），
