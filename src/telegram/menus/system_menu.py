@@ -61,6 +61,7 @@ def _main_text_and_kb() -> tuple[str, dict]:
 
     custom = cfg.get("customSettings") or {}
     default_1m = bool(custom.get("enableDefaultContext1m", False))
+    tavern_cache = bool(custom.get("enableSillyTavernCacheMode", False))
     cache_ttl = str(custom.get("claudeOAuthCacheTtl", "passthrough") or "passthrough").strip().lower()
     if cache_ttl not in {"passthrough", "5m", "1h"}:
         cache_ttl = "passthrough"
@@ -72,6 +73,7 @@ def _main_text_and_kb() -> tuple[str, dict]:
         "\n自定义: "
         f"1M默认 <code>{'开' if default_1m else '关'}</code>"
         f" · Claude缓存 <code>{cache_label}</code>"
+        f" · 酒馆 <code>{'开' if tavern_cache else '关'}</code>"
     )
 
     net = cfg.get("network") or {}
@@ -1779,6 +1781,7 @@ def _custom_settings_cfg() -> dict:
         cache_ttl = "passthrough"
     return {
         "enableDefaultContext1m": bool(custom.get("enableDefaultContext1m", False)),
+        "enableSillyTavernCacheMode": bool(custom.get("enableSillyTavernCacheMode", False)),
         "enableClaudeCodeSystemPrompt": True,
         "claudeOAuthCacheTtl": cache_ttl,
     }
@@ -1789,6 +1792,7 @@ def _show_custom_settings(chat_id: int, message_id: int, cb_id: str) -> None:
         ui.answer_cb(cb_id)
     custom = _custom_settings_cfg()
     default_1m = custom["enableDefaultContext1m"]
+    tavern_cache = custom["enableSillyTavernCacheMode"]
     cache_ttl = custom["claudeOAuthCacheTtl"]
     cache_label = "请求透传" if cache_ttl == "passthrough" else cache_ttl
     lines = [
@@ -1796,23 +1800,26 @@ def _show_custom_settings(chat_id: int, message_id: int, cb_id: str) -> None:
         "",
         f"默认开启 1M 长上下文: <code>{'开' if default_1m else '关'}</code>",
         f"Claude 官方 OAuth 缓存: <code>{cache_label}</code>",
+        f"酒馆缓存模式: <code>{'开' if tavern_cache else '关'}</code>",
         "",
         "说明：",
         "• <b>默认开启 1M 长上下文</b>：开启后，对支持的 Opus 4.x 默认带 <code>context-1m</code> beta；关闭后仅在下游显式请求 1M 时才带。",
-        "• <b>Claude 官方 OAuth 缓存</b>：当前为请求透传；Parrot 不再自动添加 <code>cache_control</code>、<code>ttl=1h</code> 或 <code>extended-cache-ttl</code>，客户端请求里带什么就转什么。",
+        "• <b>Claude 官方 OAuth 缓存</b>：请求透传=不自动添加 cache_control；5m/1h=由 Parrot 自动加缓存断点。",
+        "• <b>酒馆缓存模式</b>：只在 Claude OAuth 自动缓存开启时生效；会把断点从动态尾巴前移到当前输入之前的稳定历史，适合 SillyTavern/RP 预设。",
         "• Claude Code 身份指纹已强制保留，不再提供关闭按钮；这是 OAuth 链路可用性要求。",
         "",
-        "<i>缓存透传只影响 Claude 官方 OAuth 渠道；第三方 API 渠道仍按渠道自己的配置执行。</i>",
+        "<i>这些自定义缓存设置只影响 Claude 官方 OAuth 渠道；第三方 API 渠道仍按渠道自己的配置执行。</i>",
     ]
     ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb([
         [ui.btn("🔴 关闭默认 1M" if default_1m else "🟢 开启默认 1M", "sys:custom:toggle:enableDefaultContext1m")],
-        [ui.btn("缓存请求透传", "sys:custom:cache_ttl:toggle")],
+        [ui.btn("🟣 关闭酒馆缓存" if tavern_cache else "🟢 开启酒馆缓存", "sys:custom:toggle:enableSillyTavernCacheMode")],
+        [ui.btn(f"Claude缓存: {cache_label}", "sys:custom:cache_ttl:toggle")],
         [ui.btn("◀ 返回设置", "menu:settings")],
     ]))
 
 
 def _on_custom_toggle(chat_id: int, message_id: int, cb_id: str, field: str) -> None:
-    if field not in {"enableDefaultContext1m"}:
+    if field not in {"enableDefaultContext1m", "enableSillyTavernCacheMode"}:
         ui.answer_cb(cb_id, "未知设置")
         return
     cfg = _custom_settings_cfg()
@@ -1830,10 +1837,14 @@ def _on_custom_toggle(chat_id: int, message_id: int, cb_id: str, field: str) -> 
 def _on_custom_cache_ttl_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
     def _mut(c):
         custom = c.setdefault("customSettings", {})
-        custom["claudeOAuthCacheTtl"] = "passthrough"
+        current = str(custom.get("claudeOAuthCacheTtl", "passthrough") or "passthrough").strip().lower()
+        order = ["passthrough", "5m", "1h"]
+        if current not in order:
+            current = "passthrough"
+        custom["claudeOAuthCacheTtl"] = order[(order.index(current) + 1) % len(order)]
         # 旧开关保留兼容，但运行期不允许关 Claude Code 身份指纹。
         custom["enableClaudeCodeSystemPrompt"] = True
 
     config.update(_mut)
-    ui.answer_cb(cb_id, "已设为请求透传")
+    ui.answer_cb(cb_id, "已切换缓存 TTL")
     _show_custom_settings(chat_id, message_id, "")

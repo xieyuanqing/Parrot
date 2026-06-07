@@ -224,6 +224,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # passthrough = 不自动添加 cache_control/TTL；下游请求带什么就转什么。
         # 旧值 "5m"/"1h" 仍被 cc_mimicry 兼容，但生产默认不再使用。
         "claudeOAuthCacheTtl": "passthrough",
+        # 酒馆缓存模式：开启后，Claude OAuth 自动缓存不再打在 Tavern 常见的
+        # 动态尾巴（当前 interactive_input / ACK / 测试尾巴）上，而是前移到
+        # 当前输入之前的最后一条稳定历史消息，牺牲一点缓存长度换取连续推进时可读。
+        "enableSillyTavernCacheMode": False,
     },
     "oauthDefaultModels": [
         "claude-opus-4-5",

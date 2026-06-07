@@ -151,6 +151,7 @@ def load_config():
         # Claude OAuth 身份指纹必须保留；旧配置里的 False 不再生效。
         "enable_claude_code_system_prompt": True,
         "claude_oauth_cache_ttl": normalize_cache_ttl(custom.get("claudeOAuthCacheTtl", PASSTHROUGH_CACHE_TTL)),
+        "enable_silly_tavern_cache_mode": bool(custom.get("enableSillyTavernCacheMode", False)),
     }
 
 
@@ -495,6 +496,83 @@ def add_cache_breakpoints(messages, cache_ttl="1h"):
     return messages
 
 
+_SILLY_TAVERN_CURRENT_INPUT_MARKERS = (
+    "<interactive_input>",
+    "</interaction_history>",
+    "<interleaved_thinking>",
+    "<content_constraints>",
+    "<plot_guide>",
+)
+
+
+def _message_text_for_cache_heuristic(msg) -> str:
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block.get("text", ""))
+        return "\n".join(parts)
+    return ""
+
+
+def _find_silly_tavern_current_input_index(messages) -> int | None:
+    """Locate Tavern's current-turn dynamic user message.
+
+    Some RP presets append `[Dramatron ACCEPT]` / `[测试内容]` after the real
+    current user input, so the current input is not necessarily the last message.
+    Prefer explicit Tavern/preset markers; fall back to a final user message for
+    ordinary Anthropic clients.
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        text = _message_text_for_cache_heuristic(msg).lower()
+        if any(marker in text for marker in _SILLY_TAVERN_CURRENT_INPUT_MARKERS):
+            return i
+    if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
+        return len(messages) - 1
+    return None
+
+
+def add_silly_tavern_cache_breakpoints(messages, cache_ttl="1h"):
+    """Inject cache breakpoints before Tavern's dynamic tail.
+
+    Standard mode marks the last message and second-last user turn. For
+    SillyTavern/RP presets that move the current `<interactive_input>`, ACK and
+    test-tail into different history positions on the next turn, those points are
+    too late and become write-only. This mode marks the last stable history
+    message before the current input, plus the preceding stable user turn when
+    available, so the next normal conversation step can read the previous prefix.
+    """
+    if not messages:
+        return messages
+    if normalize_cache_ttl(cache_ttl) == PASSTHROUGH_CACHE_TTL:
+        return messages
+
+    current_idx = _find_silly_tavern_current_input_index(messages)
+    if current_idx is None or current_idx <= 0:
+        return messages
+
+    messages = [dict(m) for m in messages]
+
+    # Longest stable prefix: message immediately before current dynamic input.
+    stable_tail_idx = current_idx - 1
+    messages[stable_tail_idx] = _inject_cache_on_msg(messages[stable_tail_idx], cache_ttl=cache_ttl)
+
+    # Optional earlier breakpoint: previous stable user before that point.
+    # This gives Anthropic another reusable prefix without touching the dynamic tail.
+    for i in range(stable_tail_idx - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            messages[i] = _inject_cache_on_msg(messages[i], cache_ttl=cache_ttl)
+            break
+
+    return messages
+
+
 _THINKING_BLOCK_TYPES = {"thinking", "redacted_thinking"}
 _THINKING_REMOVED_TEXT = "[Thinking removed]"
 
@@ -756,7 +834,10 @@ def transform_request(body, email="", session_id=None, cache_ttl="1h"):
         messages = _preserve_message_cache_control(messages)
     else:
         messages = _strip_message_cache_control(messages)
-        messages = add_cache_breakpoints(messages, cache_ttl=cache_ttl)
+        if bool(cfg.get("enable_silly_tavern_cache_mode", False)):
+            messages = add_silly_tavern_cache_breakpoints(messages, cache_ttl=cache_ttl)
+        else:
+            messages = add_cache_breakpoints(messages, cache_ttl=cache_ttl)
     system_blocks = build_system_blocks(messages, cache_ttl=cache_ttl)
     if not include_claude_code_prompt:
         system_blocks.extend(_user_system_to_blocks(user_system))
