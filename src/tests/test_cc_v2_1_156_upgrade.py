@@ -161,13 +161,9 @@ def test_messages_beta_matches_capture_head7_for_explicit_1m():
     assert mine[:7] == capture7
 
 
-def test_context_1m_defaults_for_opus_only_and_sonnet_requires_explicit_signal():
-    # Parrot 可用性策略：Opus 4.x 默认开启 1M；Sonnet 4.5/4.6 只在下游显式要求时开启。
-    for model in ("claude-opus-4-8", "claude-opus-4-6"):
-        h = m.build_upstream_headers("tok", session_id="s", model=model)
-        assert "context-1m-2025-08-07" in h["anthropic-beta"].split(",")
-
-    for model in ("claude-sonnet-4-5", "claude-sonnet-4-6"):
+def test_context_1m_default_disabled_and_explicit_signal_still_works():
+    # 本地补丁策略：默认不再给 Opus 4.x 加 1M；只有下游显式要求时开启。
+    for model in ("claude-opus-4-8", "claude-opus-4-6", "claude-sonnet-4-5", "claude-sonnet-4-6"):
         h = m.build_upstream_headers("tok", session_id="s", model=model)
         assert "context-1m-2025-08-07" not in h["anthropic-beta"].split(",")
         h = m.build_upstream_headers("tok", session_id="s", model=model, wants_context_1m=True)
@@ -182,9 +178,15 @@ def test_context_1m_defaults_for_opus_only_and_sonnet_requires_explicit_signal()
     )
     assert "context-1m-2025-08-07" not in h["anthropic-beta"].split(",")
 
-    # 显式 False 仍可强制关闭。
-    h = m.build_upstream_headers("tok", session_id="s", model="claude-opus-4-8", wants_context_1m=False)
-    assert "context-1m-2025-08-07" not in h["anthropic-beta"].split(",")
+    # 兼容旧开关：手动开启后 Opus 4.x 可恢复默认 1M，但显式 False 仍可强制关闭。
+    m._ap_config.update(lambda cfg: cfg.setdefault("customSettings", {}).__setitem__("enableDefaultContext1m", True))
+    try:
+        h = m.build_upstream_headers("tok", session_id="s", model="claude-opus-4-8")
+        assert "context-1m-2025-08-07" in h["anthropic-beta"].split(",")
+        h = m.build_upstream_headers("tok", session_id="s", model="claude-opus-4-8", wants_context_1m=False)
+        assert "context-1m-2025-08-07" not in h["anthropic-beta"].split(",")
+    finally:
+        m._ap_config.update(lambda cfg: cfg.setdefault("customSettings", {}).__setitem__("enableDefaultContext1m", False))
 
 
 def test_context_1m_request_signals():
