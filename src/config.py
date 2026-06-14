@@ -148,6 +148,25 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # enabled=True 时此节流忽略，刷新由 intervalSeconds 后台循环负责。
         "accessRefreshThrottleSeconds": 180,
     },
+    # ─── OAuth 5h 滚动窗口启动器 ─────────────────────────────────
+    # 默认关闭。开启后，当已知 5h reset 时间过去且账号在 reset 后没有真实模型请求时，
+    # 对 Claude/OpenAI OAuth 账号发一次最小请求，主动启动下一段滚动窗口。
+    "quotaPrimer": {
+        "enabled": False,
+        "intervalSeconds": 60,
+        "initialDelaySeconds": 90,
+        "graceSeconds": 60,
+        "minIntervalSeconds": 17400,
+        "timeoutSeconds": 20,
+        "maxTokens": 1,
+        "bootstrapWhenUnknown": False,
+        "claudeZeroUtilFallback": True,
+        "halfHourSlotFallback": True,
+        "halfHourSlotWindowSeconds": 120,
+        "includeQuotaDisabledAfterReset": True,
+        "providers": {"claude": True, "openai": True},
+        "notify": False,
+    },
     "contentBlacklist": {
         "default": [],
         "byChannel": {},

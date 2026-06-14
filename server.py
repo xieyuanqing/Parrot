@@ -29,7 +29,7 @@ from src import (
     __version__,
     affinity, auth, config, cooldown, errors, failover,
     fingerprint, image_db, log_db, model_mapping, network, network_monitor, notifier, oauth_manager, probe,
-    public_ip, scheduler, scorer, state_db, status_monitor, translation, update_checker, updater, upstream,
+    public_ip, quota_primer, scheduler, scorer, state_db, status_monitor, translation, update_checker, updater, upstream,
 )
 from src.channel import registry
 from src.client_ip import get_client_ip
@@ -243,6 +243,7 @@ async def lifespan(app: FastAPI):
     if os.environ.get("PARROT_NO_REFRESH") != "1":
         _background_tasks.append(asyncio.create_task(oauth_manager.proactive_refresh_loop()))
         _background_tasks.append(asyncio.create_task(oauth_manager.quota_monitor_loop()))
+        _background_tasks.append(asyncio.create_task(quota_primer.primer_loop()))
     _background_tasks.append(asyncio.create_task(probe.recovery_loop()))
     _background_tasks.append(asyncio.create_task(status_monitor.monitor_loop()))
     _background_tasks.append(asyncio.create_task(network_monitor.monitor_loop()))
