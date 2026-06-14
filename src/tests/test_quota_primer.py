@@ -1,4 +1,3 @@
-import datetime as dt
 import unittest
 from unittest.mock import patch
 
@@ -12,8 +11,6 @@ class QuotaPrimerDueReasonTest(unittest.TestCase):
             "minIntervalSeconds": 300,
             "bootstrapWhenUnknown": False,
             "claudeZeroUtilFallback": True,
-            "halfHourSlotFallback": True,
-            "halfHourSlotWindowSeconds": 120,
             "includeQuotaDisabledAfterReset": True,
         }
         self.acc = {"email": "a@example.com", "disabled_reason": None}
@@ -60,24 +57,20 @@ class QuotaPrimerDueReasonTest(unittest.TestCase):
 
     def test_zero_util_fallback_is_claude_only(self):
         row = {"five_hour_reset": None, "five_hour_util": 0.0, "last_passive_update_at": 0}
-        cfg = dict(self.cfg)
-        cfg["halfHourSlotFallback"] = False
         self.assertEqual(
-            self._due(row, cfg=cfg, account_key="openai:a@example.com"),
+            self._due(row, account_key="openai:a@example.com"),
             (False, "skip:no_known_reset"),
         )
 
-    def test_half_hour_slot_fallback(self):
-        slot_now = dt.datetime(2026, 6, 14, 5, 30, 30, tzinfo=dt.timezone.utc).timestamp()
-        old_ms = int((slot_now - 3600) * 1000)
-        row = {"five_hour_reset": None, "five_hour_util": 12.0, "last_passive_update_at": old_ms}
-        self.assertEqual(self._due(row, now=slot_now), (True, "half_hour_slot_fallback"))
+    def test_missing_reset_with_nonzero_util_does_not_prime_without_known_reset(self):
+        row = {"five_hour_reset": None, "five_hour_util": 12.0, "last_passive_update_at": 0}
+        self.assertEqual(self._due(row), (False, "skip:no_known_reset"))
 
-    def test_half_hour_slot_fallback_skips_outside_slot(self):
-        outside = dt.datetime(2026, 6, 14, 5, 17, 0, tzinfo=dt.timezone.utc).timestamp()
-        old_ms = int((outside - 3600) * 1000)
-        row = {"five_hour_reset": None, "five_hour_util": 12.0, "last_passive_update_at": old_ms}
-        self.assertEqual(self._due(row, now=outside), (False, "skip:no_known_reset"))
+    def test_unknown_bootstrap_still_requires_explicit_enable(self):
+        row = {"five_hour_reset": None, "five_hour_util": 12.0, "last_passive_update_at": 0}
+        cfg = dict(self.cfg)
+        cfg["bootstrapWhenUnknown"] = True
+        self.assertEqual(self._due(row, cfg=cfg), (True, "unknown_bootstrap"))
 
 
 if __name__ == "__main__":

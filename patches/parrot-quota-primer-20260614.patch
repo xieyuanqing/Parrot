@@ -1,16 +1,8 @@
-From 641f91f1ba068d449961d91a10273335e7f5c0d3 Mon Sep 17 00:00:00 2001
-From: xieyuanqing <43878017+xieyuanqing@users.noreply.github.com>
-Date: Sun, 14 Jun 2026 13:28:15 +0800
-Subject: [PATCH] local: add OAuth quota primer
-
----
- server.py                      |   3 +-
- src/config.py                  |  19 ++
- src/quota_primer.py            | 352 +++++++++++++++++++++++++++++++++
- src/tests/test_quota_primer.py |  84 ++++++++
- 4 files changed, 457 insertions(+), 1 deletion(-)
- create mode 100644 src/quota_primer.py
- create mode 100644 src/tests/test_quota_primer.py
+server.py                      |   3 +-
+ src/config.py                  |  17 +++
+ src/quota_primer.py            | 333 +++++++++++++++++++++++++++++++++++++++++
+ src/tests/test_quota_primer.py |  77 ++++++++++
+ 4 files changed, 429 insertions(+), 1 deletion(-)
 
 diff --git a/server.py b/server.py
 index 74e2faa..11b7a6a 100644
@@ -34,10 +26,10 @@ index 74e2faa..11b7a6a 100644
      _background_tasks.append(asyncio.create_task(status_monitor.monitor_loop()))
      _background_tasks.append(asyncio.create_task(network_monitor.monitor_loop()))
 diff --git a/src/config.py b/src/config.py
-index 61eb8f0..ec31c32 100644
+index 61eb8f0..6fbe59c 100644
 --- a/src/config.py
 +++ b/src/config.py
-@@ -148,6 +148,25 @@ DEFAULT_CONFIG: dict[str, Any] = {
+@@ -148,6 +148,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
          # enabled=True 时此节流忽略，刷新由 intervalSeconds 后台循环负责。
          "accessRefreshThrottleSeconds": 180,
      },
@@ -54,8 +46,6 @@ index 61eb8f0..ec31c32 100644
 +        "maxTokens": 1,
 +        "bootstrapWhenUnknown": False,
 +        "claudeZeroUtilFallback": True,
-+        "halfHourSlotFallback": True,
-+        "halfHourSlotWindowSeconds": 120,
 +        "includeQuotaDisabledAfterReset": True,
 +        "providers": {"claude": True, "openai": True},
 +        "notify": False,
@@ -65,10 +55,10 @@ index 61eb8f0..ec31c32 100644
          "byChannel": {},
 diff --git a/src/quota_primer.py b/src/quota_primer.py
 new file mode 100644
-index 0000000..eb3ffce
+index 0000000..e8d9784
 --- /dev/null
 +++ b/src/quota_primer.py
-@@ -0,0 +1,352 @@
+@@ -0,0 +1,333 @@
 +"""OAuth quota rolling-window primer.
 +
 +Some subscription backends use a rolling 5h window that only starts on the first
@@ -116,8 +106,6 @@ index 0000000..eb3ffce
 +        "maxTokens": 1,
 +        "bootstrapWhenUnknown": False,
 +        "claudeZeroUtilFallback": True,
-+        "halfHourSlotFallback": True,
-+        "halfHourSlotWindowSeconds": 120,
 +        "includeQuotaDisabledAfterReset": True,
 +        "providers": {"claude": True, "openai": True},
 +        "notify": False,
@@ -206,14 +194,6 @@ index 0000000..eb3ffce
 +        return None
 +
 +
-+def _near_half_hour_slot(now: float, window_seconds: int) -> bool:
-+    if window_seconds <= 0:
-+        return False
-+    minute = int(now // 60)
-+    seconds_into_half_hour = (minute % 30) * 60 + int(now % 60)
-+    return seconds_into_half_hour <= window_seconds or seconds_into_half_hour >= 1800 - window_seconds
-+
-+
 +def _recent_model_request(row: dict | None, now: float, min_interval: int) -> bool:
 +    last_model_at = _last_model_request_at(row)
 +    return last_model_at is not None and now - last_model_at < min_interval
@@ -259,15 +239,6 @@ index 0000000..eb3ffce
 +            if _recent_model_request(row, now, min_interval):
 +                return False, "skip:recent_model_request"
 +            return True, "zero_util_fallback"
-+        # Last-resort observation-based fallback: Claude/ChatGPT subscription
-+        # refreshes often happen around :00 / :30. Only use it near those slots
-+        # and only when there has been no model request for nearly a full 5h.
-+        if cfg.get("halfHourSlotFallback", True) and row is not None:
-+            slot_window = max(0, int(cfg.get("halfHourSlotWindowSeconds", 120) or 120))
-+            if _near_half_hour_slot(now, slot_window):
-+                if _recent_model_request(row, now, min_interval):
-+                    return False, "skip:recent_model_request"
-+                return True, "half_hour_slot_fallback"
 +        if cfg.get("bootstrapWhenUnknown"):
 +            return True, "unknown_bootstrap"
 +        return False, "skip:no_known_reset"
@@ -423,11 +394,10 @@ index 0000000..eb3ffce
 +        await asyncio.sleep(max(30, interval))
 diff --git a/src/tests/test_quota_primer.py b/src/tests/test_quota_primer.py
 new file mode 100644
-index 0000000..e133946
+index 0000000..6a46199
 --- /dev/null
 +++ b/src/tests/test_quota_primer.py
-@@ -0,0 +1,84 @@
-+import datetime as dt
+@@ -0,0 +1,77 @@
 +import unittest
 +from unittest.mock import patch
 +
@@ -441,8 +411,6 @@ index 0000000..e133946
 +            "minIntervalSeconds": 300,
 +            "bootstrapWhenUnknown": False,
 +            "claudeZeroUtilFallback": True,
-+            "halfHourSlotFallback": True,
-+            "halfHourSlotWindowSeconds": 120,
 +            "includeQuotaDisabledAfterReset": True,
 +        }
 +        self.acc = {"email": "a@example.com", "disabled_reason": None}
@@ -489,28 +457,248 @@ index 0000000..e133946
 +
 +    def test_zero_util_fallback_is_claude_only(self):
 +        row = {"five_hour_reset": None, "five_hour_util": 0.0, "last_passive_update_at": 0}
-+        cfg = dict(self.cfg)
-+        cfg["halfHourSlotFallback"] = False
 +        self.assertEqual(
-+            self._due(row, cfg=cfg, account_key="openai:a@example.com"),
++            self._due(row, account_key="openai:a@example.com"),
 +            (False, "skip:no_known_reset"),
 +        )
 +
-+    def test_half_hour_slot_fallback(self):
-+        slot_now = dt.datetime(2026, 6, 14, 5, 30, 30, tzinfo=dt.timezone.utc).timestamp()
-+        old_ms = int((slot_now - 3600) * 1000)
-+        row = {"five_hour_reset": None, "five_hour_util": 12.0, "last_passive_update_at": old_ms}
-+        self.assertEqual(self._due(row, now=slot_now), (True, "half_hour_slot_fallback"))
++    def test_missing_reset_with_nonzero_util_does_not_prime_without_known_reset(self):
++        row = {"five_hour_reset": None, "five_hour_util": 12.0, "last_passive_update_at": 0}
++        self.assertEqual(self._due(row), (False, "skip:no_known_reset"))
 +
-+    def test_half_hour_slot_fallback_skips_outside_slot(self):
-+        outside = dt.datetime(2026, 6, 14, 5, 17, 0, tzinfo=dt.timezone.utc).timestamp()
-+        old_ms = int((outside - 3600) * 1000)
-+        row = {"five_hour_reset": None, "five_hour_util": 12.0, "last_passive_update_at": old_ms}
-+        self.assertEqual(self._due(row, now=outside), (False, "skip:no_known_reset"))
++    def test_unknown_bootstrap_still_requires_explicit_enable(self):
++        row = {"five_hour_reset": None, "five_hour_util": 12.0, "last_passive_update_at": 0}
++        cfg = dict(self.cfg)
++        cfg["bootstrapWhenUnknown"] = True
++        self.assertEqual(self._due(row, cfg=cfg), (True, "unknown_bootstrap"))
 +
 +
 +if __name__ == "__main__":
 +    unittest.main()
--- 
-2.43.0
 
+--- Changes ---
+
+server.py
+  @@ -29,7 +29,7 @@ from src import (
+  -    public_ip, scheduler, scorer, state_db, status_monitor, translation, update_checker, updater, upstream,
+  +    public_ip, quota_primer, scheduler, scorer, state_db, status_monitor, translation, update_checker, updater, upstream,
+   )
+   from src.channel import registry
+   from src.client_ip import get_client_ip
+  @@ -243,6 +243,7 @@ async def lifespan(app: FastAPI):
+  +        _background_tasks.append(asyncio.create_task(quota_primer.primer_loop()))
+       _background_tasks.append(asyncio.create_task(probe.recovery_loop()))
+       _background_tasks.append(asyncio.create_task(status_monitor.monitor_loop()))
+       _background_tasks.append(asyncio.create_task(network_monitor.monitor_loop()))
+  +2 -1
+
+src/config.py
+  @@ -148,6 +148,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
+  +    # ─── OAuth 5h 滚动窗口启动器 ─────────────────────────────────
+  +    # 默认关闭。开启后，当已知 5h reset 时间过去且账号在 reset 后没有真实模型请求时，
+  +    # 对 Claude/OpenAI OAuth 账号发一次最小请求，主动启动下一段滚动窗口。
+  +    "quotaPrimer": {
+  +        "enabled": False,
+  +        "intervalSeconds": 60,
+  +        "initialDelaySeconds": 90,
+  +        "graceSeconds": 60,
+  +        "minIntervalSeconds": 17400,
+  +        "timeoutSeconds": 20,
+  +        "maxTokens": 1,
+  +        "bootstrapWhenUnknown": False,
+  +        "claudeZeroUtilFallback": True,
+  +        "includeQuotaDisabledAfterReset": True,
+  +        "providers": {"claude": True, "openai": True},
+  +        "notify": False,
+  +    },
+       "contentBlacklist": {
+           "default": [],
+           "byChannel": {},
+  +17 -0
+
+src/quota_primer.py
+  @@ -0,0 +1,333 @@
+  +"""OAuth quota rolling-window primer.
+  +
+  +Some subscription backends use a rolling 5h window that only starts on the first
+  +model request after the previous window refreshes. This module can send one
+  +minimal request after a known 5h reset time has passed so the next rolling window
+  +starts even if no user traffic arrives immediately.
+  +
+  +Safety defaults:
+  +- disabled by default;
+  +- only OAuth channels are considered;
+  +- user/auth disabled accounts are never touched;
+  +- quota-disabled accounts are touched only after their reset time passed and only
+  +  when quotaPrimer.includeQuotaDisabledAfterReset is true;
+  +- one successful primer is recorded per observed reset timestamp.
+  +"""
+  +
+  +from __future__ import annotations
+  +
+  +import asyncio
+  +import json
+  +import os
+  +import time
+  +from datetime import datetime, timezone
+  +from typing import Any
+  +
+  +import httpx
+  +
+  +from . import config, network, oauth_manager, state_db
+  +from .anthropic import rate_limit_headers as anthropic_rl
+  +from .channel.oauth_channel import OAuthChannel
+  +from .channel.openai_oauth_channel import OpenAIOAuthChannel
+  +from .channel import registry
+  +
+  +_STATE_PREFIX = "quota_primer:"
+  +
+  +
+  +def _cfg() -> dict:
+  +    base = {
+  +        "enabled": False,
+  +        "intervalSeconds": 60,
+  +        "initialDelaySeconds": 90,
+  +        "graceSeconds": 60,
+  +        "minIntervalSeconds": 17_400,  # 4h50m guard against bad/moving reset data
+  +        "timeoutSeconds": 20,
+  +        "maxTokens": 1,
+  +        "bootstrapWhenUnknown": False,
+  +        "claudeZeroUtilFallback": True,
+  +        "includeQuotaDisabledAfterReset": True,
+  +        "providers": {"claude": True, "openai": True},
+  +        "notify": False,
+  +    }
+  +    cur = config.get().get("quotaPrimer") or {}
+  +    out = dict(base)
+  +    out.update({k: v for k, v in cur.items() if k != "providers"})
+  +    providers = dict(base["providers"])
+  +    providers.update(cur.get("providers") or {})
+  +    out["providers"] = providers
+  +    return out
+  +
+  +
+  +def _now() -> float:
+  +    return time.time()
+  +
+  +
+  +def _parse_iso_utc(value: Any) -> float | None:
+  +    if not value:
+  +        return None
+  +    s = str(value).strip()
+  +    if not s:
+  +        return None
+  +    try:
+  +        if s.endswith("Z"):
+  +            dt = datetime.fromisoformat(s[:-1] + "+00:00")
+  +        else:
+  +            dt = datetime.fromisoformat(s)
+  +        if dt.tzinfo is None:
+  +            dt = dt.replace(tzinfo=timezone.utc)
+  +        return dt.timestamp()
+  +    except Exception:
+  +        return None
+  +
+  +
+  +def _state_key(account_key: str) -> str:
+  +    return _STATE_PREFIX + account_key
+  +
+  +
+  +def _load_state(account_key: str) -> dict:
+  +    raw = state_db.schema_meta_get(_state_key(account_key))
+  +    if not raw:
+  +        return {}
+  +    try:
+  +        data = json.loads(raw)
+  +        return data if isinstance(data, dict) else {}
+  +    except Exception:
+  +        return {}
+  +
+  +
+  +def _save_state(account_key: str, patch: dict) -> dict:
+  +    data = _load_state(account_key)
+  +    data.update(patch)
+  ... (233 lines truncated)
+  +333 -0
+
+src/tests/test_quota_primer.py
+  @@ -0,0 +1,77 @@
+  +import unittest
+  +from unittest.mock import patch
+  +
+  +from src import quota_primer
+  +
+  +
+  +class QuotaPrimerDueReasonTest(unittest.TestCase):
+  +    def setUp(self):
+  +        self.cfg = {
+  +            "graceSeconds": 60,
+  +            "minIntervalSeconds": 300,
+  +            "bootstrapWhenUnknown": False,
+  +            "claudeZeroUtilFallback": True,
+  +            "includeQuotaDisabledAfterReset": True,
+  +        }
+  +        self.acc = {"email": "a@example.com", "disabled_reason": None}
+  +
+  +    def _due(self, row, acc=None, cfg=None, *, account_key="claude:a@example.com", now: float = 1_800_000_000):
+  +        with patch.object(quota_primer, "_load_state", return_value={}):
+  +            return quota_primer._due_reason(
+  +                account_key,
+  +                row,
+  +                self.acc if acc is None else acc,
+  +                self.cfg if cfg is None else cfg,
+  +                now=now,
+  +            )
+  +
+  +    def test_due_after_known_reset(self):
+  +        row = {"five_hour_reset": "2026-01-01T00:00:00Z", "last_passive_update_at": 0}
+  +        self.assertEqual(self._due(row), (True, "reset_due"))
+  +
+  +    def test_skip_when_reset_is_future(self):
+  +        row = {"five_hour_reset": "2099-01-01T00:00:00Z", "last_passive_update_at": 0}
+  +        self.assertEqual(self._due(row), (False, "skip:reset_future"))
+  +
+  +    def test_skip_when_model_request_already_happened_after_reset(self):
+  +        row = {"five_hour_reset": "2026-01-01T00:00:00Z", "last_passive_update_at": 1_800_000_000_000}
+  +        self.assertEqual(self._due(row), (False, "skip:already_used_after_reset"))
+  +
+  +    def test_never_primes_user_or_auth_disabled_accounts(self):
+  +        row = {"five_hour_reset": "2026-01-01T00:00:00Z", "last_passive_update_at": 0}
+  +        self.assertEqual(self._due(row, {"disabled_reason": "user"}), (False, "skip:user"))
+  +        self.assertEqual(self._due(row, {"disabled_reason": "auth_error"}), (False, "skip:auth_error"))
+  +
+  +    def test_quota_disabled_can_prime_after_reset(self):
+  +        row = {"five_hour_reset": "2026-01-01T00:00:00Z", "last_passive_update_at": 0}
+  +        acc = {"email": "a@example.com", "disabled_reason": "quota", "disabled_until": "2026-01-01T00:00:00Z"}
+  +        self.assertEqual(self._due(row, acc), (True, "reset_due"))
+  +
+  +    def test_claude_zero_util_fallback_when_reset_is_missing(self):
+  +        row = {"five_hour_reset": None, "five_hour_util": 0.0, "last_passive_update_at": 0}
+  +        self.assertEqual(self._due(row), (True, "zero_util_fallback"))
+  +
+  +    def test_claude_zero_util_fallback_skips_recent_model_request(self):
+  +        row = {"five_hour_reset": None, "five_hour_util": 0.0, "last_passive_update_at": 1_799_999_900_000}
+  +        self.assertEqual(self._due(row), (False, "skip:recent_model_request"))
+  +
+  +    def test_zero_util_fallback_is_claude_only(self):
+  +        row = {"five_hour_reset": None, "five_hour_util": 0.0, "last_passive_update_at": 0}
+  +        self.assertEqual(
+  +            self._due(row, account_key="openai:a@example.com"),
+  +            (False, "skip:no_known_reset"),
+  +        )
+  +
+  +    def test_missing_reset_with_nonzero_util_does_not_prime_without_known_reset(self):
+  +        row = {"five_hour_reset": None, "five_hour_util": 12.0, "last_passive_update_at": 0}
+  +        self.assertEqual(self._due(row), (False, "skip:no_known_reset"))
+  +
+  +    def test_unknown_bootstrap_still_requires_explicit_enable(self):
+  +        row = {"five_hour_reset": None, "five_hour_util": 12.0, "last_passive_update_at": 0}
+  +        cfg = dict(self.cfg)
+  +        cfg["bootstrapWhenUnknown"] = True
+  +        self.assertEqual(self._due(row, cfg=cfg), (True, "unknown_bootstrap"))
+  +
+  +
+  +if __name__ == "__main__":
+  +    unittest.main()
+  +77 -0
+[full diff: rtk git diff --no-compact]

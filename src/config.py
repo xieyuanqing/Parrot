@@ -161,8 +161,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "maxTokens": 1,
         "bootstrapWhenUnknown": False,
         "claudeZeroUtilFallback": True,
-        "halfHourSlotFallback": True,
-        "halfHourSlotWindowSeconds": 120,
         "includeQuotaDisabledAfterReset": True,
         "providers": {"claude": True, "openai": True},
         "notify": False,

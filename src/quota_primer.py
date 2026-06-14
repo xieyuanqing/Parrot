@@ -45,8 +45,6 @@ def _cfg() -> dict:
         "maxTokens": 1,
         "bootstrapWhenUnknown": False,
         "claudeZeroUtilFallback": True,
-        "halfHourSlotFallback": True,
-        "halfHourSlotWindowSeconds": 120,
         "includeQuotaDisabledAfterReset": True,
         "providers": {"claude": True, "openai": True},
         "notify": False,
@@ -135,14 +133,6 @@ def _float_or_none(value: Any) -> float | None:
         return None
 
 
-def _near_half_hour_slot(now: float, window_seconds: int) -> bool:
-    if window_seconds <= 0:
-        return False
-    minute = int(now // 60)
-    seconds_into_half_hour = (minute % 30) * 60 + int(now % 60)
-    return seconds_into_half_hour <= window_seconds or seconds_into_half_hour >= 1800 - window_seconds
-
-
 def _recent_model_request(row: dict | None, now: float, min_interval: int) -> bool:
     last_model_at = _last_model_request_at(row)
     return last_model_at is not None and now - last_model_at < min_interval
@@ -188,15 +178,6 @@ def _due_reason(account_key: str, row: dict | None, acc: dict | None, cfg: dict,
             if _recent_model_request(row, now, min_interval):
                 return False, "skip:recent_model_request"
             return True, "zero_util_fallback"
-        # Last-resort observation-based fallback: Claude/ChatGPT subscription
-        # refreshes often happen around :00 / :30. Only use it near those slots
-        # and only when there has been no model request for nearly a full 5h.
-        if cfg.get("halfHourSlotFallback", True) and row is not None:
-            slot_window = max(0, int(cfg.get("halfHourSlotWindowSeconds", 120) or 120))
-            if _near_half_hour_slot(now, slot_window):
-                if _recent_model_request(row, now, min_interval):
-                    return False, "skip:recent_model_request"
-                return True, "half_hour_slot_fallback"
         if cfg.get("bootstrapWhenUnknown"):
             return True, "unknown_bootstrap"
         return False, "skip:no_known_reset"
