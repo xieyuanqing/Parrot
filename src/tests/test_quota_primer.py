@@ -72,6 +72,20 @@ class QuotaPrimerDueReasonTest(unittest.TestCase):
         cfg["bootstrapWhenUnknown"] = True
         self.assertEqual(self._due(row, cfg=cfg), (True, "unknown_bootstrap"))
 
+    def test_loop_sleep_seconds_applies_jitter(self):
+        with patch.object(quota_primer.random, "uniform", return_value=42.0):
+            self.assertEqual(
+                quota_primer._loop_sleep_seconds({"intervalSeconds": 600, "intervalJitterSeconds": 90}),
+                642.0,
+            )
+
+    def test_loop_sleep_seconds_has_floor(self):
+        with patch.object(quota_primer.random, "uniform", return_value=-90.0):
+            self.assertEqual(
+                quota_primer._loop_sleep_seconds({"intervalSeconds": 60, "intervalJitterSeconds": 90}),
+                30.0,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

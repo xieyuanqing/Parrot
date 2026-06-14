@@ -1,8 +1,8 @@
 server.py                      |   3 +-
- src/config.py                  |  17 +++
- src/quota_primer.py            | 333 +++++++++++++++++++++++++++++++++++++++++
- src/tests/test_quota_primer.py |  77 ++++++++++
- 4 files changed, 429 insertions(+), 1 deletion(-)
+ src/config.py                  |  18 +++
+ src/quota_primer.py            | 343 +++++++++++++++++++++++++++++++++++++++++
+ src/tests/test_quota_primer.py |  91 +++++++++++
+ 4 files changed, 454 insertions(+), 1 deletion(-)
 
 diff --git a/server.py b/server.py
 index 74e2faa..11b7a6a 100644
@@ -26,10 +26,10 @@ index 74e2faa..11b7a6a 100644
      _background_tasks.append(asyncio.create_task(status_monitor.monitor_loop()))
      _background_tasks.append(asyncio.create_task(network_monitor.monitor_loop()))
 diff --git a/src/config.py b/src/config.py
-index 61eb8f0..6fbe59c 100644
+index 61eb8f0..e13ba98 100644
 --- a/src/config.py
 +++ b/src/config.py
-@@ -148,6 +148,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
+@@ -148,6 +148,24 @@ DEFAULT_CONFIG: dict[str, Any] = {
          # enabled=True 时此节流忽略，刷新由 intervalSeconds 后台循环负责。
          "accessRefreshThrottleSeconds": 180,
      },
@@ -38,7 +38,8 @@ index 61eb8f0..6fbe59c 100644
 +    # 对 Claude/OpenAI OAuth 账号发一次最小请求，主动启动下一段滚动窗口。
 +    "quotaPrimer": {
 +        "enabled": False,
-+        "intervalSeconds": 60,
++        "intervalSeconds": 600,
++        "intervalJitterSeconds": 90,
 +        "initialDelaySeconds": 90,
 +        "graceSeconds": 60,
 +        "minIntervalSeconds": 17400,
@@ -55,10 +56,10 @@ index 61eb8f0..6fbe59c 100644
          "byChannel": {},
 diff --git a/src/quota_primer.py b/src/quota_primer.py
 new file mode 100644
-index 0000000..e8d9784
+index 0000000..e60ba6c
 --- /dev/null
 +++ b/src/quota_primer.py
-@@ -0,0 +1,333 @@
+@@ -0,0 +1,343 @@
 +"""OAuth quota rolling-window primer.
 +
 +Some subscription backends use a rolling 5h window that only starts on the first
@@ -80,6 +81,7 @@ index 0000000..e8d9784
 +import asyncio
 +import json
 +import os
++import random
 +import time
 +from datetime import datetime, timezone
 +from typing import Any
@@ -98,7 +100,8 @@ index 0000000..e8d9784
 +def _cfg() -> dict:
 +    base = {
 +        "enabled": False,
-+        "intervalSeconds": 60,
++        "intervalSeconds": 600,
++        "intervalJitterSeconds": 90,
 +        "initialDelaySeconds": 90,
 +        "graceSeconds": 60,
 +        "minIntervalSeconds": 17_400,  # 4h50m guard against bad/moving reset data
@@ -197,6 +200,14 @@ index 0000000..e8d9784
 +def _recent_model_request(row: dict | None, now: float, min_interval: int) -> bool:
 +    last_model_at = _last_model_request_at(row)
 +    return last_model_at is not None and now - last_model_at < min_interval
++
++
++def _loop_sleep_seconds(cfg: dict) -> float:
++    interval = int(cfg.get("intervalSeconds", 600) or 600)
++    jitter = max(0, int(cfg.get("intervalJitterSeconds", 0) or 0))
++    if jitter:
++        interval += random.uniform(-jitter, jitter)
++    return max(30.0, float(interval))
 +
 +
 +def _due_reason(account_key: str, row: dict | None, acc: dict | None, cfg: dict,
@@ -385,19 +396,19 @@ index 0000000..e8d9784
 +            cfg = _cfg()
 +            if cfg.get("enabled") and os.environ.get("PARROT_NO_PRIMER") != "1":
 +                await primer_once()
-+            interval = int(cfg.get("intervalSeconds", 60) or 60)
++            sleep_for = _loop_sleep_seconds(cfg)
 +        except asyncio.CancelledError:
 +            raise
 +        except Exception as exc:
 +            print(f"[quota_primer] loop iteration failed: {exc}")
-+            interval = 60
-+        await asyncio.sleep(max(30, interval))
++            sleep_for = 60
++        await asyncio.sleep(sleep_for)
 diff --git a/src/tests/test_quota_primer.py b/src/tests/test_quota_primer.py
 new file mode 100644
-index 0000000..6a46199
+index 0000000..80c5d47
 --- /dev/null
 +++ b/src/tests/test_quota_primer.py
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,91 @@
 +import unittest
 +from unittest.mock import patch
 +
@@ -472,6 +483,20 @@ index 0000000..6a46199
 +        cfg["bootstrapWhenUnknown"] = True
 +        self.assertEqual(self._due(row, cfg=cfg), (True, "unknown_bootstrap"))
 +
++    def test_loop_sleep_seconds_applies_jitter(self):
++        with patch.object(quota_primer.random, "uniform", return_value=42.0):
++            self.assertEqual(
++                quota_primer._loop_sleep_seconds({"intervalSeconds": 600, "intervalJitterSeconds": 90}),
++                642.0,
++            )
++
++    def test_loop_sleep_seconds_has_floor(self):
++        with patch.object(quota_primer.random, "uniform", return_value=-90.0):
++            self.assertEqual(
++                quota_primer._loop_sleep_seconds({"intervalSeconds": 60, "intervalJitterSeconds": 90}),
++                30.0,
++            )
++
 +
 +if __name__ == "__main__":
 +    unittest.main()
@@ -493,13 +518,14 @@ server.py
   +2 -1
 
 src/config.py
-  @@ -148,6 +148,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
+  @@ -148,6 +148,24 @@ DEFAULT_CONFIG: dict[str, Any] = {
   +    # ─── OAuth 5h 滚动窗口启动器 ─────────────────────────────────
   +    # 默认关闭。开启后，当已知 5h reset 时间过去且账号在 reset 后没有真实模型请求时，
   +    # 对 Claude/OpenAI OAuth 账号发一次最小请求，主动启动下一段滚动窗口。
   +    "quotaPrimer": {
   +        "enabled": False,
-  +        "intervalSeconds": 60,
+  +        "intervalSeconds": 600,
+  +        "intervalJitterSeconds": 90,
   +        "initialDelaySeconds": 90,
   +        "graceSeconds": 60,
   +        "minIntervalSeconds": 17400,
@@ -514,10 +540,10 @@ src/config.py
        "contentBlacklist": {
            "default": [],
            "byChannel": {},
-  +17 -0
+  +18 -0
 
 src/quota_primer.py
-  @@ -0,0 +1,333 @@
+  @@ -0,0 +1,343 @@
   +"""OAuth quota rolling-window primer.
   +
   +Some subscription backends use a rolling 5h window that only starts on the first
@@ -539,6 +565,7 @@ src/quota_primer.py
   +import asyncio
   +import json
   +import os
+  +import random
   +import time
   +from datetime import datetime, timezone
   +from typing import Any
@@ -557,7 +584,8 @@ src/quota_primer.py
   +def _cfg() -> dict:
   +    base = {
   +        "enabled": False,
-  +        "intervalSeconds": 60,
+  +        "intervalSeconds": 600,
+  +        "intervalJitterSeconds": 90,
   +        "initialDelaySeconds": 90,
   +        "graceSeconds": 60,
   +        "minIntervalSeconds": 17_400,  # 4h50m guard against bad/moving reset data
@@ -616,13 +644,11 @@ src/quota_primer.py
   +
   +
   +def _save_state(account_key: str, patch: dict) -> dict:
-  +    data = _load_state(account_key)
-  +    data.update(patch)
-  ... (233 lines truncated)
-  +333 -0
+  ... (243 lines truncated)
+  +343 -0
 
 src/tests/test_quota_primer.py
-  @@ -0,0 +1,77 @@
+  @@ -0,0 +1,91 @@
   +import unittest
   +from unittest.mock import patch
   +
@@ -697,8 +723,22 @@ src/tests/test_quota_primer.py
   +        cfg["bootstrapWhenUnknown"] = True
   +        self.assertEqual(self._due(row, cfg=cfg), (True, "unknown_bootstrap"))
   +
+  +    def test_loop_sleep_seconds_applies_jitter(self):
+  +        with patch.object(quota_primer.random, "uniform", return_value=42.0):
+  +            self.assertEqual(
+  +                quota_primer._loop_sleep_seconds({"intervalSeconds": 600, "intervalJitterSeconds": 90}),
+  +                642.0,
+  +            )
+  +
+  +    def test_loop_sleep_seconds_has_floor(self):
+  +        with patch.object(quota_primer.random, "uniform", return_value=-90.0):
+  +            self.assertEqual(
+  +                quota_primer._loop_sleep_seconds({"intervalSeconds": 60, "intervalJitterSeconds": 90}),
+  +                30.0,
+  +            )
+  +
   +
   +if __name__ == "__main__":
   +    unittest.main()
-  +77 -0
+  +91 -0
 [full diff: rtk git diff --no-compact]

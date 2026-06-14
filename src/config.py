@@ -153,7 +153,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # 对 Claude/OpenAI OAuth 账号发一次最小请求，主动启动下一段滚动窗口。
     "quotaPrimer": {
         "enabled": False,
-        "intervalSeconds": 60,
+        "intervalSeconds": 600,
+        "intervalJitterSeconds": 90,
         "initialDelaySeconds": 90,
         "graceSeconds": 60,
         "minIntervalSeconds": 17400,

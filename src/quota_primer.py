@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -37,7 +38,8 @@ _STATE_PREFIX = "quota_primer:"
 def _cfg() -> dict:
     base = {
         "enabled": False,
-        "intervalSeconds": 60,
+        "intervalSeconds": 600,
+        "intervalJitterSeconds": 90,
         "initialDelaySeconds": 90,
         "graceSeconds": 60,
         "minIntervalSeconds": 17_400,  # 4h50m guard against bad/moving reset data
@@ -136,6 +138,14 @@ def _float_or_none(value: Any) -> float | None:
 def _recent_model_request(row: dict | None, now: float, min_interval: int) -> bool:
     last_model_at = _last_model_request_at(row)
     return last_model_at is not None and now - last_model_at < min_interval
+
+
+def _loop_sleep_seconds(cfg: dict) -> float:
+    interval = int(cfg.get("intervalSeconds", 600) or 600)
+    jitter = max(0, int(cfg.get("intervalJitterSeconds", 0) or 0))
+    if jitter:
+        interval += random.uniform(-jitter, jitter)
+    return max(30.0, float(interval))
 
 
 def _due_reason(account_key: str, row: dict | None, acc: dict | None, cfg: dict,
@@ -324,10 +334,10 @@ async def primer_loop() -> None:
             cfg = _cfg()
             if cfg.get("enabled") and os.environ.get("PARROT_NO_PRIMER") != "1":
                 await primer_once()
-            interval = int(cfg.get("intervalSeconds", 60) or 60)
+            sleep_for = _loop_sleep_seconds(cfg)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             print(f"[quota_primer] loop iteration failed: {exc}")
-            interval = 60
-        await asyncio.sleep(max(30, interval))
+            sleep_for = 60
+        await asyncio.sleep(sleep_for)
