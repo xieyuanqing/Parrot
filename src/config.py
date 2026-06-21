@@ -150,7 +150,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     # ─── OAuth 5h 滚动窗口启动器 ─────────────────────────────────
     # 默认关闭。开启后，当已知 5h reset 时间过去且账号在 reset 后没有真实模型请求时，
-    # 对 Claude/OpenAI OAuth 账号发一次最小请求，主动启动下一段滚动窗口。
+    # 对 Claude/OpenAI OAuth 账号发一次普通短请求，主动启动下一段滚动窗口。
     "quotaPrimer": {
         "enabled": False,
         "intervalSeconds": 600,
@@ -159,7 +159,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "graceSeconds": 60,
         "minIntervalSeconds": 17400,
         "timeoutSeconds": 20,
-        "maxTokens": 1,
         "bootstrapWhenUnknown": False,
         "claudeZeroUtilFallback": True,
         "includeQuotaDisabledAfterReset": True,

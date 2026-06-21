@@ -258,7 +258,8 @@ class OpenAIOAuthChannel(Channel):
         副作用：成功时更新 oauth_quota_cache。
 
         成本提示：上游会产生少量 output token（几到几十），计入 Codex 配额；
-        用户主动触发，知情同意。
+        用户主动触发，知情同意。探测不设置人工 max_tokens 上限，避免极低输出上限
+        被上游当作非正常用量而不刷新窗口。
         """
         # 延迟 import 以免循环依赖
         from .. import oauth_manager, state_db
@@ -281,14 +282,15 @@ class OpenAIOAuthChannel(Channel):
             return {"ok": True, "reason": "mock"}
 
 
-        # 构造最小探测请求体。走 build_upstream_request 能顺带用到 codex
-        # transform（store=false / stream=true / 模型规范化 / instructions 兜底 / ...）
+        # 构造普通短探测请求体。走 build_upstream_request 能顺带用到 codex
+        # transform（store=false / stream=true / 模型规范化 / instructions 兜底 / ...）。
+        # 不设置 max_tokens；用简单 hello 请求并完整消费响应，避免极低输出上限
+        # 或过早断流导致上游不把它算作正常窗口启动请求。
         probe_model = self.models[0] if self.models else "gpt-5.2"
         test_body = {
             "model": probe_model,
-            "input": "1",
-            # 极短 instructions，减少 input token
-            "instructions": "reply ok",
+            "input": "hello",
+            "instructions": "Reply with a short hello.",
             # 不设 stream 让 transform 强制 stream=true
         }
         try:
@@ -306,14 +308,17 @@ class OpenAIOAuthChannel(Channel):
                 proxy_channel=self.key,
                 proxy_model=probe_model,
             ) as client:
-                # stream 模式：拿到响应头即可，不消费 body 直接关流
-                # （上游会继续生成一小段 token 直到发现连接关闭，算作探测成本）
+                # stream 模式：完整消费一个普通短响应，确保上游把它当作正常模型请求。
                 async with client.stream(
                     "POST", req.url,
                     headers=req.headers, content=req.body,
                 ) as resp:
                     status = resp.status_code
                     headers_snapshot = dict(resp.headers)
+                    try:
+                        await resp.aread()
+                    except Exception:
+                        pass
         except httpx.TimeoutException:
             return {"ok": False, "reason": f"timeout > {timeout_s}s"}
         except Exception as exc:

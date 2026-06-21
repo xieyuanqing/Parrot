@@ -1,7 +1,10 @@
+import asyncio
 import unittest
+from typing import Any, cast
 from unittest.mock import patch
 
 from src import quota_primer
+from src.channel.base import UpstreamRequest
 
 
 class QuotaPrimerDueReasonTest(unittest.TestCase):
@@ -85,6 +88,53 @@ class QuotaPrimerDueReasonTest(unittest.TestCase):
                 quota_primer._loop_sleep_seconds({"intervalSeconds": 60, "intervalJitterSeconds": 90}),
                 30.0,
             )
+
+    def test_prime_claude_uses_plain_hello_without_artificial_token_cap(self):
+        class FakeChannel:
+            key = "oauth:claude:a@example.com"
+            account_key = "claude:a@example.com"
+            email = "a@example.com"
+            models = ["claude-test"]
+
+            async def build_upstream_request(self, body, model, *, ingress_protocol="anthropic"):
+                self.seen_body = body
+                self.seen_model = model
+                self.seen_ingress = ingress_protocol
+                return UpstreamRequest(url="https://example.test/v1/messages", headers={}, body=b"{}")
+
+        class FakeResponse:
+            status_code = 200
+            headers = {}
+
+        class FakeClient:
+            def __init__(self):
+                self.post_called = False
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, *, headers=None, content=None):
+                self.post_called = True
+                self.url = url
+                self.headers = headers
+                self.content = content
+                return FakeResponse()
+
+        ch = FakeChannel()
+        client = FakeClient()
+        with patch.object(quota_primer.network, "async_client", return_value=client):
+            result = asyncio.run(quota_primer._prime_claude(cast(Any, ch), timeout_s=1))
+
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(ch.seen_ingress, "anthropic")
+        self.assertEqual(ch.seen_model, "claude-test")
+        self.assertEqual(ch.seen_body["messages"], [{"role": "user", "content": "hello"}])
+        self.assertEqual(ch.seen_body["stream"], False)
+        self.assertNotIn("max_tokens", ch.seen_body)
+        self.assertTrue(client.post_called)
 
 
 if __name__ == "__main__":

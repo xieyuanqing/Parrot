@@ -2,8 +2,8 @@
 
 Some subscription backends use a rolling 5h window that only starts on the first
 model request after the previous window refreshes. This module can send one
-minimal request after a known 5h reset time has passed so the next rolling window
-starts even if no user traffic arrives immediately.
+ordinary short request after a known 5h reset time has passed so the next rolling
+window starts even if no user traffic arrives immediately.
 
 Safety defaults:
 - disabled by default;
@@ -44,7 +44,6 @@ def _cfg() -> dict:
         "graceSeconds": 60,
         "minIntervalSeconds": 17_400,  # 4h50m guard against bad/moving reset data
         "timeoutSeconds": 20,
-        "maxTokens": 1,
         "bootstrapWhenUnknown": False,
         "claudeZeroUtilFallback": True,
         "includeQuotaDisabledAfterReset": True,
@@ -206,13 +205,12 @@ def _due_reason(account_key: str, row: dict | None, acc: dict | None, cfg: dict,
     return True, "reset_due"
 
 
-async def _prime_claude(ch: OAuthChannel, *, timeout_s: float, max_tokens: int) -> dict:
+async def _prime_claude(ch: OAuthChannel, *, timeout_s: float) -> dict:
     model = ch.models[0] if ch.models else "claude-sonnet-4-5"
     body = {
         "model": model,
-        "max_tokens": max(1, int(max_tokens or 1)),
-        "stream": True,
-        "messages": [{"role": "user", "content": "."}],
+        "stream": False,
+        "messages": [{"role": "user", "content": "hello"}],
     }
     req = await ch.build_upstream_request(body, model, ingress_protocol="anthropic")
     try:
@@ -222,16 +220,13 @@ async def _prime_claude(ch: OAuthChannel, *, timeout_s: float, max_tokens: int) 
             proxy_channel=ch.key,
             proxy_model=model,
         ) as client:
-            async with client.stream("POST", req.url, headers=req.headers, content=req.body) as resp:
-                status = resp.status_code
-                headers_snapshot = dict(resp.headers)
-                # Consume at most one chunk so the upstream sees a normal tiny request,
-                # then close. max_tokens=1 keeps spend minimal.
-                try:
-                    async for _chunk in resp.aiter_bytes():
-                        break
-                except Exception:
-                    pass
+            # Do not set an artificial max_tokens cap. Some upstream quota
+            # backends do not treat max_tokens=1 requests as normal usage. Use a
+            # short hello prompt and let the response complete so the request is
+            # observed as an ordinary model call.
+            resp = await client.post(req.url, headers=req.headers, content=req.body)
+            status = resp.status_code
+            headers_snapshot = dict(resp.headers)
     except httpx.TimeoutException:
         return {"ok": False, "reason": f"timeout > {timeout_s}s", "model": model}
     except Exception as exc:
@@ -272,7 +267,6 @@ async def primer_once() -> dict[str, str]:
 
     providers = cfg.get("providers") or {}
     timeout_s = float(cfg.get("timeoutSeconds", 20) or 20)
-    max_tokens = int(cfg.get("maxTokens", 1) or 1)
     out: dict[str, str] = {}
 
     for ch in registry.all_channels():
@@ -293,7 +287,7 @@ async def primer_once() -> dict[str, str]:
             if isinstance(ch, OpenAIOAuthChannel):
                 result = await _prime_openai(ch, timeout_s=timeout_s)
             else:
-                result = await _prime_claude(ch, timeout_s=timeout_s, max_tokens=max_tokens)
+                result = await _prime_claude(ch, timeout_s=timeout_s)
         except Exception as exc:
             result = {"ok": False, "reason": str(exc)[:200], "model": ""}
 
