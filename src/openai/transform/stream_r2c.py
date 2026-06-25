@@ -25,6 +25,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
 
+from ...protocols import errors as protocol_errors
+
 
 def _gen_id(prefix: str) -> str:
     return f"{prefix}{uuid.uuid4().hex[:24]}"
@@ -89,7 +91,8 @@ def _mk_chunk(state: R2CState, *, delta: Optional[dict] = None,
               finish_reason: Optional[str] = None,
               usage: Optional[dict] = None,
               include_choice: bool = True,
-              is_final_usage_chunk: bool = False) -> bytes:
+              is_final_usage_chunk: bool = False,
+              logprobs: Optional[dict] = None) -> bytes:
     obj: dict[str, Any] = {
         "id": state.chunk_id,
         "object": "chat.completion.chunk",
@@ -102,7 +105,7 @@ def _mk_chunk(state: R2CState, *, delta: Optional[dict] = None,
             "index": 0,
             "delta": delta or {},
             "finish_reason": finish_reason,
-            "logprobs": None,
+            "logprobs": logprobs,
         }]
     # 02-bug-findings #43: include_usage=true 时 OpenAI chat 协议要求每个 chunk
     # 都带 usage 字段，中间 chunk 为 null，最后一帧才是真值。某些 SDK
@@ -275,7 +278,11 @@ class StreamTranslator:
             return
         self.state.chat_text_parts.append(text)
         yield from self._ensure_role_sent()
-        yield _mk_chunk(self.state, delta={"content": text})
+        yield _mk_chunk(
+            self.state,
+            delta={"content": text},
+            logprobs=_responses_delta_logprobs_to_chat(data.get("logprobs"), "content"),
+        )
 
     def _on_refusal_delta(self, data: dict) -> Iterator[bytes]:
         text = data.get("delta")
@@ -283,7 +290,11 @@ class StreamTranslator:
             return
         self.state.chat_refusal_parts.append(text)
         yield from self._ensure_role_sent()
-        yield _mk_chunk(self.state, delta={"refusal": text})
+        yield _mk_chunk(
+            self.state,
+            delta={"refusal": text},
+            logprobs=_responses_delta_logprobs_to_chat(data.get("logprobs"), "refusal"),
+        )
 
     def _on_reasoning_delta(self, data: dict) -> Iterator[bytes]:
         # drop 模式：丢弃 reasoning 文本（usage.reasoning_tokens 不受影响）
@@ -342,14 +353,30 @@ class StreamTranslator:
         self.state.usage = resp.get("usage") if isinstance(resp.get("usage"), dict) else None
         incomplete = resp.get("incomplete_details") or {}
         reason = incomplete.get("reason") if isinstance(incomplete, dict) else None
-        if reason == "max_output_tokens":
-            self.state.finish_reason = "length"
+        if protocol_errors.is_responses_max_output_incomplete(data, "response.incomplete"):
+            msg = protocol_errors.responses_max_output_context_error_message(reason)
+            self.state.terminal_status = "error"
+            self.state.terminal_error = {
+                "message": msg,
+                "detail": {
+                    "type": "invalid_request_error",
+                    "code": protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE,
+                    "param": None,
+                },
+            }
+            self.state.terminal_emitted = True
+            yield _mk_error_chunk(
+                self.state,
+                message=msg,
+                err_type="invalid_request_error",
+                code=protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE,
+                param=None,
+            )
+            yield _DONE
         elif reason == "content_filter":
             self.state.finish_reason = "content_filter"
         else:
             self.state.finish_reason = "stop"
-        return
-        yield
 
     def get_downstream_chat_assistant(self) -> dict:
         """累积至今的下游 chat `assistant` message 快照。
@@ -451,3 +478,14 @@ def _usage_resps_to_chat_stream(u: dict) -> dict:
         reasoning_tokens=reasoning,
         total_tokens=total,
     )
+
+
+def _responses_delta_logprobs_to_chat(raw: Any, key: str) -> Optional[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return None
+    clean = [item for item in raw if isinstance(item, dict)]
+    if not clean:
+        return None
+    if key == "refusal":
+        return {"content": None, "refusal": clean}
+    return {"content": clean, "refusal": None}

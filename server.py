@@ -17,24 +17,30 @@
 import asyncio
 import os
 import json
+import signal
+import threading
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 import uvicorn
+from uvicorn.server import HANDLED_SIGNALS
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 
 from src import (
-    __version__,
-    affinity, auth, config, cooldown, errors, failover,
-    fingerprint, image_db, log_db, model_mapping, network, network_monitor, notifier, oauth_manager, probe,
-    public_ip, quota_primer, scheduler, scorer, state_db, status_monitor, translation, update_checker, updater, upstream,
+    __version__, drain,
+    affinity, auth, compact_rescue, config, cooldown, errors, failover,
+    fingerprint, image_db, log_db, model_mapping, model_metadata, network,
+    network_monitor, notifier, oauth_manager, probe, public_ip, quota_primer,
+    scheduler, scorer, state_db, status_monitor, token_counter, translation,
+    update_checker, updater, upstream,
 )
 from src.channel import registry
 from src.client_ip import get_client_ip
 from datetime import datetime, timezone
 from src.telegram import bot as tgbot
+from src.protocols import errors as protocol_errors
 from src.transform.cc_mimicry import (
     DEVICE_ID,
     PARROT_DOWNSTREAM_BETAS_KEY,
@@ -259,6 +265,11 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        drain.begin("lifespan_shutdown")
+        timeout = drain.shutdown_timeout_seconds()
+        drained = await drain.wait_for_zero(timeout)
+        if not drained:
+            print(f"[drain] lifespan shutdown timeout active={drain.active_count()} timeout={timeout}s")
         for t in _background_tasks:
             t.cancel()
         await asyncio.gather(*_background_tasks, return_exceptions=True)
@@ -276,6 +287,46 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def _drain_http_middleware(request: Request, call_next):
+    """Reject new work while draining and keep active bodies counted.
+
+    The active lease is held until the response body iterator finishes.  That
+    matters for StreamingResponse/SSE because the route handler returns before
+    the chunked body is done.
+    """
+
+    path = request.url.path
+    if drain.is_draining() and not drain.allow_path_during_drain(path):
+        return drain.reject_response()
+
+    # Health checks must not keep a draining process alive.
+    if drain.allow_path_during_drain(path):
+        return await call_next(request)
+
+    lease = await drain.enter(f"http {request.method} {path}")
+    try:
+        response = await call_next(request)
+    except BaseException:
+        await lease.aclose()
+        raise
+
+    body_iterator = getattr(response, "body_iterator", None)
+    if body_iterator is None:
+        await lease.aclose()
+        return response
+
+    async def _wrapped_body_iterator():
+        try:
+            async for chunk in body_iterator:
+                yield chunk
+        finally:
+            await lease.aclose()
+
+    response.body_iterator = _wrapped_body_iterator()
+    return response
+
+
 def _model_never_supported(model: str) -> bool:
     """model 在当前任何渠道（包括已禁用）里都不可能被路由 → True。
     用于把"模型不存在"与"模型存在但全都冷却"区分开。"""
@@ -283,6 +334,59 @@ def _model_never_supported(model: str) -> bool:
         if ch.supports_model(model):
             return False
     return True
+
+
+def _first_route_channel_and_model(result) -> tuple[object | None, str | None]:
+    for ch, resolved in list(getattr(result, "candidates", []) or []) + list(getattr(result, "saturated", []) or []):
+        return ch, resolved
+    return None, None
+
+
+def _anthropic_to_openai_context_preflight(body: dict, result) -> dict | None:
+    """Return context overflow info for Anthropic→OpenAI cross-family calls.
+
+    Claude Code may believe a Claude-facing endpoint has a 1M context window even
+    when Parrot routes it to an OpenAI-family model with a smaller real window.
+    When model metadata is available, fail early with a Claude-Code-friendly
+    context_length_exceeded error so the client triggers its own autocompact.
+    """
+    if compact_rescue.is_claude_code_compact_request(body):
+        return None
+    ch, resolved_model = _first_route_channel_and_model(result)
+    if ch is None:
+        return None
+    if getattr(ch, "protocol", "anthropic") == "anthropic":
+        return None
+    model_candidates = []
+    for candidate in (resolved_model, body.get("model")):
+        name = str(candidate or "").strip()
+        if name and name not in model_candidates:
+            model_candidates.append(name)
+    metadata_model = ""
+    safe_limit = None
+    for name in model_candidates:
+        limit = model_metadata.safe_prompt_limit(name)
+        if limit is not None and limit > 0:
+            metadata_model = name
+            safe_limit = limit
+            break
+    if not metadata_model or safe_limit is None:
+        return None
+    prompt_tokens = token_counter.count_request_tokens(body, model=metadata_model)
+    if prompt_tokens <= safe_limit:
+        return None
+    msg = protocol_errors.context_length_error_message_for_claude_code(
+        "context_length_exceeded: Your input exceeds the context window of this model. "
+        "Please adjust your input and try again.",
+        actual_tokens=prompt_tokens,
+        max_tokens=safe_limit,
+    )
+    return {
+        "message": msg,
+        "model": metadata_model,
+        "prompt_tokens": prompt_tokens,
+        "safe_limit": safe_limit,
+    }
 
 
 def _sanitize_headers(headers: dict) -> dict:
@@ -330,7 +434,8 @@ async def health():
     oauth_count = len(cfg.get("oauthAccounts") or [])
     api_count = len(cfg.get("channels") or [])
     return {
-        "status": status,
+        "status": "draining" if drain.is_draining() else status,
+        "drain": drain.status_snapshot(),
         "channels": {
             "total": len(chs),
             "enabled": enabled_total,
@@ -349,23 +454,14 @@ async def list_models(request: Request):
     """Anthropic 标准 /v1/models：返回当前代理可见的模型清单。
 
     - 需要 API Key 验证（和 /v1/messages 一致）
-    - 若 Key 有 allowedProtocols，按家族过滤（解决两家族同名模型冲突，例：
-      openai 与 anthropic 都叫 claude-3.5）
-    - 若 Key 有 allowedModels 白名单，再和家族结果取交集
+    - 若 Key 有 allowedModels 白名单，再和全局模型列表取交集
     - 否则返回所有启用渠道聚合的去重模型列表
     """
     key_name, allowed_models, err = auth.validate(request.headers)
     if err:
         return errors.json_error_response(401, errors.ErrType.AUTH, err)
 
-    # 按 Key 的 allowedProtocols 推断家族。空/未设 = 全部家族。
-    allowed_protos = auth.get_allowed_protocols(key_name)
-    if allowed_protos:
-        families = {"anthropic" if p == "anthropic" else "openai" for p in allowed_protos}
-        all_models = registry.available_models_for_families(families)
-    else:
-        all_models = registry.available_models()
-        families = None
+    all_models = registry.available_models()
     if allowed_models:
         allowed_set = set(allowed_models)
         visible = [m for m in all_models if m in allowed_set]
@@ -373,15 +469,11 @@ async def list_models(request: Request):
         visible = all_models
 
     # 把 modelMapping 里的别名也当成可用模型暴露出去:
-    # 条件 = 别名所属 ingress line 的家族对该 Key 放行, 且别名指向的真实模型
-    # 也在 visible 集合里 (否则客户端调不通, 暴露就是坑)。
-    allowed_families = families  # None = 全放行
+    # 条件 = 别名指向的真实模型也在 visible 集合里 (否则客户端调不通,
+    # 暴露就是坑)。API Key 不再按协议入口过滤，模型权限仍由 allowedModels 控制。
     visible_set = set(visible)
     alias_seen: set[str] = set()
     for _line in model_mapping.INGRESS_LINES:
-        _fam = model_mapping.INGRESS_FAMILY[_line]
-        if allowed_families is not None and _fam not in allowed_families:
-            continue
         _mp = model_mapping.get_ingress_map(_line)
         for _alias, _real in _mp.items():
             if _alias in visible_set or _alias in alias_seen:
@@ -430,8 +522,12 @@ async def proxy_responses(request: Request):
 @app.websocket("/v1/responses")
 async def proxy_responses_websocket(websocket: WebSocket):
     """OpenAI/Codex Responses WebSocket 入口（非语音 Realtime）。"""
+    if drain.is_draining():
+        await websocket.close(code=1013, reason="Parrot is draining for graceful restart")
+        return
     from src.openai.responses_ws import handle_responses_ws
-    await handle_responses_ws(websocket)
+    async with drain.active("ws /v1/responses"):
+        await handle_responses_ws(websocket)
 
 
 @app.post("/v1/images/generate")
@@ -570,6 +666,14 @@ async def proxy_messages(request: Request):
         reasoning_effort=reasoning_effort,
     )
 
+    # Internal-only routing/cache hints for downstream channel builders.  These
+    # fields are stripped by provider allowlists and never sent upstream.
+    body["_parrot_api_key_name"] = key_name or ""
+    body["_parrot_client_ip"] = client_ip or ""
+    claude_session_id = str(request.headers.get("x-claude-code-session-id") or "").strip()
+    if claude_session_id:
+        body["_parrot_claude_code_session_id"] = claude_session_id
+
     # 5. 调度
     result = scheduler.schedule(body, api_key_name=key_name, client_ip=client_ip)
 
@@ -578,6 +682,18 @@ async def proxy_messages(request: Request):
         await asyncio.to_thread(log_db.update_pending, request_id, affinity_hit=1)
 
     if not result:
+        guard_msg = getattr(result, "guard_error", None)
+        if guard_msg:
+            msg = f"Request cannot be safely routed: {guard_msg}"
+            await asyncio.to_thread(
+                log_db.finish_error, request_id, msg, 0,
+                http_status=400, affinity_hit=(1 if result.affinity_hit else 0),
+                total_ms=int((time.time() - start_time) * 1000),
+            )
+            return errors.json_error_response(
+                400, errors.ErrType.INVALID_REQUEST, msg
+            )
+
         msg = f"No available upstream channels for model: {model}"
         await asyncio.to_thread(
             log_db.finish_error, request_id, msg, 0,
@@ -597,6 +713,29 @@ async def proxy_messages(request: Request):
         err_type = errors.ErrType.NOT_FOUND if _model_never_supported(model) else errors.ErrType.API
         status = 404 if err_type == errors.ErrType.NOT_FOUND else 503
         return errors.json_error_response(status, err_type, msg)
+
+    preflight = _anthropic_to_openai_context_preflight(body, result)
+    if preflight:
+        msg = preflight["message"]
+        await asyncio.to_thread(
+            log_db.finish_error,
+            request_id,
+            msg,
+            0,
+            http_status=400,
+            total_ms=int((time.time() - start_time) * 1000),
+            affinity_hit=(1 if result.affinity_hit else 0),
+        )
+        print(
+            f"[context-guard] {client_ip} {key_name} → {model} routed_model={preflight['model']} "
+            f"prompt_tokens≈{preflight['prompt_tokens']} safe_limit={preflight['safe_limit']}"
+        )
+        return errors.json_error_response(
+            400,
+            errors.ErrType.INVALID_REQUEST,
+            msg,
+            code=protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE,
+        )
 
     ts = time.strftime("%H:%M:%S", time.localtime(start_time))
     _first_list = result.candidates or result.saturated
@@ -629,15 +768,85 @@ async def proxy_messages(request: Request):
 
 # ─── 启动 ─────────────────────────────────────────────────────────
 
+
+class _DrainAwareServer(uvicorn.Server):
+    """Uvicorn server whose signals are routed through Parrot drain first.
+
+    Uvicorn 0.44 installs signal handlers through `capture_signals()`.  We
+    override that path rather than `install_signal_handlers()` (removed in newer
+    uvicorn) so SIGTERM/SIGINT first enters Parrot drain and only flips
+    `should_exit` after active requests have finished or timed out.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._drain_loop: asyncio.AbstractEventLoop | None = None
+        self._drain_shutdown_task: asyncio.Task | None = None
+
+    @contextmanager
+    def capture_signals(self):  # pragma: no cover - exercised by live process
+        if threading.current_thread() is not threading.main_thread():
+            yield
+            return
+        original_handlers = {sig: signal.signal(sig, self.handle_exit) for sig in HANDLED_SIGNALS}
+        try:
+            yield
+        finally:
+            for sig, handler in original_handlers.items():
+                signal.signal(sig, handler)
+
+    def handle_exit(self, sig: int, frame) -> None:  # pragma: no cover - exercised by live process
+        signame = signal.Signals(sig).name
+        if self._drain_shutdown_task is not None and not self._drain_shutdown_task.done():
+            print(f"[drain] received {signame} again; forcing immediate shutdown")
+            self.force_exit = True
+            self.should_exit = True
+            return
+        if self.should_exit:
+            self.force_exit = True
+            return
+        drain.begin(f"signal:{signame}")
+        loop = self._drain_loop
+        if loop is None or not loop.is_running():
+            self.should_exit = True
+            return
+        loop.call_soon_threadsafe(self._start_drain_shutdown_task, signame)
+
+    def _start_drain_shutdown_task(self, signame: str) -> None:
+        if self._drain_shutdown_task is not None and not self._drain_shutdown_task.done():
+            return
+        self._drain_shutdown_task = asyncio.create_task(self._stop_after_drain(signame))
+
+    async def _stop_after_drain(self, signame: str) -> None:
+        timeout = drain.shutdown_timeout_seconds()
+        active = drain.active_count()
+        if active:
+            print(f"[drain] received {signame}; waiting active={active} timeout={timeout}s")
+        drained = await drain.wait_for_zero(timeout)
+        if drained:
+            print(f"[drain] drained; stopping server signame={signame}")
+        else:
+            print(f"[drain] timeout; forcing server stop signame={signame} active={drain.active_count()}")
+        self.should_exit = True
+
+
+async def _serve_with_graceful_drain(server: uvicorn.Server) -> None:
+    if isinstance(server, _DrainAwareServer):
+        server._drain_loop = asyncio.get_running_loop()
+    await server.serve()
+
+
 def main() -> None:
     cfg = config.get()
-    uvicorn.run(
+    uvicorn_config = uvicorn.Config(
         app,
         host=cfg["listen"]["host"],
         port=cfg["listen"]["port"],
         log_level="warning",
         access_log=False,
     )
+    server = _DrainAwareServer(uvicorn_config)
+    asyncio.run(_serve_with_graceful_drain(server))
 
 
 if __name__ == "__main__":

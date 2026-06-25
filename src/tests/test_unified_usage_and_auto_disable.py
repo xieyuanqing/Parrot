@@ -1,20 +1,20 @@
-"""统一 OAuth 用量机制 + 响应头超限自动禁用测试（2026-04-20）。
+"""统一 OAuth 用量机制 + 响应头超限自动禁用测试(2026-04-20)。
 
-覆盖：
-  A. fetch_usage 按 provider 分派：
-     - Claude 走 /api/oauth/usage（_usage_sync）
+覆盖:
+  A. fetch_usage 按 provider 分派:
+     - Claude 走 /api/oauth/usage(_usage_sync)
      - OpenAI 主动刷新走 ChatGPT wham/usage
      - OpenAI 响应头实时额度仍由 failover 被动采样保存
      - 删除账户级联清历史 openai probe 桶
-  B. quota_monitor_once 对 OpenAI 账号不再 skip，走统一路径
-  C. 响应头超限自动禁用：
+  B. quota_monitor_once 对 OpenAI 账号不再 skip,走统一路径
+  C. 响应头超限自动禁用:
      - Anthropic surpassed-threshold=true → set_disabled_by_quota
      - Anthropic util>=1.0 → set_disabled_by_quota
      - 已 disabled 的账号不重复触发
      - auth_error / user 禁用不被覆盖
      - OpenAI primary/secondary used_percent >= threshold → 禁用
 
-运行：./venv/bin/python -m src.tests.test_unified_usage_and_auto_disable
+运行:./venv/bin/python -m src.tests.test_unified_usage_and_auto_disable
 """
 
 from __future__ import annotations
@@ -35,10 +35,11 @@ def _import_modules():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if root not in sys.path:
         sys.path.insert(0, root)
-    from src import config, oauth_manager, state_db, failover
+    from src import config, cooldown, oauth_manager, state_db, failover
     from src.channel import oauth_channel, openai_oauth_channel, registry
     return {
         "config": config,
+        "cooldown": cooldown,
         "oauth_manager": oauth_manager,
         "state_db": state_db,
         "failover": failover,
@@ -68,6 +69,8 @@ def _setup(m):
     m["failover"]._codex_snapshot_last.clear()
     m["failover"]._anthropic_snapshot_last.clear()
     m["oauth_manager"]._OPENAI_PROBE_LAST.clear()
+    m["cooldown"].init()
+    m["cooldown"].clear_all()
 
 
 def _add_openai(m, email="o@openai.test", plan_type="plus"):
@@ -97,7 +100,7 @@ class _FakeResp:
 # ==============================================================
 
 def test_fetch_usage_claude_goes_to_api(m):
-    """Claude 账号 fetch_usage → 走 _usage_sync，返回 mock 结构。"""
+    """Claude 账号 fetch_usage → 走 _usage_sync,返回 mock 结构。"""
     _setup(m)
     _add_claude(m, "ca@c.io")
     usage = asyncio.run(m["oauth_manager"].fetch_usage("claude:ca@c.io"))
@@ -108,7 +111,7 @@ def test_fetch_usage_claude_goes_to_api(m):
 
 
 def test_fetch_usage_openai_goes_to_wham(m):
-    """OpenAI 账号主动 fetch_usage → ChatGPT wham/usage，不发 Codex probe。"""
+    """OpenAI 账号主动 fetch_usage → ChatGPT wham/usage,不发 Codex probe。"""
     _setup(m)
     _add_openai(m, "oa@o.io")
     m["registry"].rebuild_from_config()
@@ -116,12 +119,13 @@ def test_fetch_usage_openai_goes_to_wham(m):
     assert usage["five_hour"]["utilization"] == 1.0
     assert usage["seven_day"]["utilization"] == 3.0
     assert usage.get("openai", {}).get("source") == "wham_usage"
+    assert usage.get("openai", {}).get("rate_limit_reset_credits", {}).get("available_count") == 2
     assert "openai:oa@o.io:acct-123" not in m["oauth_manager"]._OPENAI_PROBE_LAST
     print("  [PASS] fetch_usage(openai): calls wham/usage, returns normalized structure")
 
 
 def test_fetch_usage_openai_ignores_passive_fresh_for_active_refresh(m):
-    """OpenAI 主动 fetch_usage 即使有新鲜响应头缓存，也应拉 wham 作为主动额度源。"""
+    """OpenAI 主动 fetch_usage 即使有新鲜响应头缓存,也应拉 wham 作为主动额度源。"""
     _setup(m)
     _add_openai(m, "fresh@o.io")
     m["registry"].rebuild_from_config()
@@ -164,14 +168,14 @@ def test_delete_account_clears_openai_probe_bucket(m):
 # ==============================================================
 
 def test_quota_monitor_processes_openai_accounts(m):
-    """quota_monitor_once 现在对 OpenAI 账号也走流程（不再 skip）。"""
+    """quota_monitor_once 现在对 OpenAI 账号也走流程(不再 skip)。"""
     _setup(m)
     _add_openai(m, "mon@o.io")
     _add_claude(m, "mon@c.io")
     m["registry"].rebuild_from_config()
 
     outcomes = asyncio.run(m["oauth_manager"].quota_monitor_once())
-    # 两个账号都应被处理，不再出现 "skipped:openai_uses_headers"
+    # 两个账号都应被处理,不再出现 "skipped:openai_uses_headers"
     openai_outcome = outcomes.get("mon@o.io")
     claude_outcome = outcomes.get("mon@c.io")
     assert openai_outcome is not None
@@ -180,8 +184,37 @@ def test_quota_monitor_processes_openai_accounts(m):
     print(f"  [PASS] quota_monitor_once: processes both (openai={openai_outcome}, claude={claude_outcome})")
 
 
+def test_quota_monitor_resumes_openai_despite_old_passive_timestamp(m):
+    """后台主动 wham/usage 刷新不应被旧响应头采样时间戳误判为 stale。"""
+    _setup(m)
+    _add_openai(m, "resume-passive@o.io")
+    m["registry"].rebuild_from_config()
+    ak = "openai:resume-passive@o.io:acct-123"
+    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+    m["oauth_manager"].set_disabled_by_quota(ak, future)
+
+    m["state_db"].quota_patch_passive(ak, {
+        "five_hour_util": 10.0,
+        "seven_day_util": 20.0,
+    }, email="resume-passive@o.io")
+    old_ms = m["state_db"].now_ms() - 10 * 60 * 1000
+    conn = m["state_db"]._get_conn()
+    conn.execute(
+        "UPDATE oauth_quota_cache SET last_passive_update_at=? WHERE account_key=?",
+        (old_ms, ak),
+    )
+    conn.commit()
+
+    outcomes = asyncio.run(m["oauth_manager"].quota_monitor_once())
+    acc_after = m["oauth_manager"].get_account(ak)
+    assert outcomes.get("resume-passive@o.io") == "resumed", outcomes
+    assert acc_after.get("disabled_reason") is None
+    assert acc_after["enabled"] is True
+    print("  [PASS] quota_monitor_once: old passive timestamp does not block OpenAI resume")
+
+
 # ==============================================================
-# C. 响应头超限自动禁用 — Anthropic
+# C. 响应头超限自动禁用 - Anthropic
 # ==============================================================
 
 def test_anthropic_auto_disable_surpassed_threshold(m):
@@ -238,10 +271,10 @@ def test_anthropic_no_auto_disable_when_below_limit(m):
 
 
 def test_anthropic_auto_disable_idempotent_for_already_disabled(m):
-    """已 disabled_reason="quota" 的账号不重复触发（避免 disabled_until 被覆盖）。"""
+    """已 disabled_reason="quota" 的账号不重复触发(避免 disabled_until 被覆盖)。"""
     _setup(m)
     _add_claude(m, "dq@c.io")
-    # 预置：已经 disabled_reason=quota，disabled_until=一个固定值
+    # 预置:已经 disabled_reason=quota,disabled_until=一个固定值
     m["oauth_manager"].set_disabled_by_quota("claude:dq@c.io", "2099-01-01T00:00:00Z")
     acc = m["oauth_manager"].get_account("claude:dq@c.io")
     ch = m["OAuthChannel"](acc, [])
@@ -279,7 +312,7 @@ def test_anthropic_auth_error_not_touched(m):
 
 
 # ==============================================================
-# C2. 响应头超限自动禁用 — OpenAI
+# C2. 响应头超限自动禁用 - OpenAI
 # ==============================================================
 
 def test_openai_auto_disable_primary_over_threshold(m):
@@ -382,7 +415,30 @@ def test_openai_quota_disabled_not_resumed_from_unknown_usage(m):
     print("  [PASS] openai: quota-disabled account is not resumed from unknown usage")
 
 
-def test_openai_quota_disabled_waits_until_disabled_until_before_resume(m):
+def test_openai_cached_thirty_day_over_threshold_sets_disabled_until(m):
+    _setup(m)
+    _add_openai(m, "thirty-over@o.io")
+    ak = "openai:thirty-over@o.io:acct-123"
+    reset = "2026-07-19T21:23:07Z"
+    m["state_db"].quota_save(ak, {
+        "fetched_at": m["state_db"].now_ms(),
+        "five_hour_util": 1.0,
+        "seven_day_util": 2.0,
+        "thirty_day_util": 99.0,
+        "thirty_day_reset": reset,
+    }, email="thirty-over@o.io")
+
+    result = m["oauth_manager"].evaluate_and_toggle_by_cached_quota(ak, threshold=95)
+    acc_after = m["oauth_manager"].get_account(ak)
+    assert result["action"] == "disabled", result
+    assert result["hit_windows"] == ["30d"], result
+    assert result["disabled_until"] == reset, result
+    assert acc_after["disabled_reason"] == "quota"
+    assert acc_after["disabled_until"] == reset
+    print("  [PASS] openai: cached 30d over threshold carries disabled_until")
+
+
+def test_openai_quota_disabled_resumes_with_fresh_low_usage_before_disabled_until(m):
     _setup(m)
     _add_openai(m, "future@o.io")
     ak = "openai:future@o.io:acct-123"
@@ -392,16 +448,40 @@ def test_openai_quota_disabled_waits_until_disabled_until_before_resume(m):
     result = m["oauth_manager"].evaluate_and_toggle_by_usage(ak, {
         "five_hour": {"utilization": 10, "resets_at": None},
         "seven_day": {"utilization": 20, "resets_at": None},
+        "openai": {"thirty_day": {"utilization": 1, "resets_at": "2026-07-19T21:23:07Z"}},
         "seven_day_sonnet": {},
         "seven_day_opus": {},
         "extra_usage": {"is_enabled": False},
-    })
+    }, fresh=True)
 
     acc_after = m["oauth_manager"].get_account(ak)
-    assert result["action"] == "quota_waiting_reset", result
+    assert result["action"] == "resumed", result
+    assert acc_after.get("disabled_reason") is None
+    assert acc_after["enabled"] is True
+    print("  [PASS] openai: fresh low usage resumes before old disabled_until")
+
+
+def test_openai_quota_disabled_keeps_waiting_on_stale_low_usage(m):
+    _setup(m)
+    _add_openai(m, "stale@o.io")
+    ak = "openai:stale@o.io:acct-123"
+    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 600))
+    m["oauth_manager"].set_disabled_by_quota(ak, future)
+
+    result = m["oauth_manager"].evaluate_and_toggle_by_usage(ak, {
+        "five_hour": {"utilization": 10, "resets_at": None},
+        "seven_day": {"utilization": 20, "resets_at": None},
+        "openai": {"thirty_day": {"utilization": 1, "resets_at": "2026-07-19T21:23:07Z"}},
+        "seven_day_sonnet": {},
+        "seven_day_opus": {},
+        "extra_usage": {"is_enabled": False},
+    }, fresh=False)
+
+    acc_after = m["oauth_manager"].get_account(ak)
+    assert result["action"] == "quota_stale_keep_disabled", result
     assert acc_after["disabled_reason"] == "quota"
     assert acc_after["enabled"] is False
-    print("  [PASS] openai: quota-disabled account waits for disabled_until before resume")
+    print("  [PASS] openai: stale low usage does not resume quota-disabled account")
 
 
 def test_openai_quota_disabled_resumes_after_reset_with_fresh_low_usage(m):
@@ -425,6 +505,156 @@ def test_openai_quota_disabled_resumes_after_reset_with_fresh_low_usage(m):
     assert acc_after["enabled"] is True
     print("  [PASS] openai: quota-disabled account resumes after reset with fresh low usage")
 
+
+def test_openai_official_reset_credit_clears_local_quota_after_upstream_success(m):
+    _setup(m)
+    _add_openai(m, "official-reset@o.io")
+    ak = "openai:official-reset@o.io:acct-123"
+    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+    m["oauth_manager"].set_disabled_by_quota(ak, future)
+    m["state_db"].quota_save(ak, {
+        "fetched_at": m["state_db"].now_ms(),
+        "five_hour_util": 99.0,
+        "five_hour_reset": future,
+        "seven_day_util": 20.0,
+    }, email="official-reset@o.io")
+    m["cooldown"].record_error(f"oauth:{ak}", "gpt-5-codex", "quota", cooldown_until=m["state_db"].now_ms() + 600_000)
+
+    result = asyncio.run(m["oauth_manager"].redeem_openai_rate_limit_reset_credit(ak, idempotency_key="idem-1"))
+
+    acc_after = m["oauth_manager"].get_account(ak)
+    row = m["state_db"].quota_load(ak)
+    assert result["outcome"] == "reset", result
+    assert result.get("available_count") == 2, result
+    assert acc_after.get("disabled_reason") is None
+    assert acc_after["enabled"] is True
+    assert row is not None and row["five_hour_util"] == 1.0
+    assert not m["cooldown"].is_blocked(f"oauth:{ak}", "gpt-5-codex")
+    print("  [PASS] openai: official reset credit success clears local quota/cooldown and refetches usage")
+
+
+def test_openai_official_reset_keeps_quota_disabled_when_fresh_usage_still_over(m):
+    _setup(m)
+    _add_openai(m, "still-over@o.io")
+    ak = "openai:still-over@o.io:acct-123"
+    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+    m["oauth_manager"].set_disabled_by_quota(ak, future)
+    m["cooldown"].record_error(f"oauth:{ak}", "gpt-5-codex", "quota", cooldown_until=m["state_db"].now_ms() + 600_000)
+
+    orig_fetch = m["oauth_manager"].fetch_usage
+    async def _over_usage(_ak):
+        return {
+            "five_hour": {"utilization": 99, "resets_at": future},
+            "seven_day": {"utilization": 20, "resets_at": None},
+            "seven_day_sonnet": {},
+            "seven_day_opus": {},
+            "extra_usage": {"is_enabled": False},
+            "openai": {"rate_limit_reset_credits": {"available_count": 1}},
+        }
+    m["oauth_manager"].fetch_usage = _over_usage
+    try:
+        result = asyncio.run(m["oauth_manager"].redeem_openai_rate_limit_reset_credit(ak, idempotency_key="idem-over"))
+    finally:
+        m["oauth_manager"].fetch_usage = orig_fetch
+
+    acc_after = m["oauth_manager"].get_account(ak)
+    row = m["state_db"].quota_load(ak)
+    assert result["outcome"] == "reset", result
+    assert result["quota_action"]["action"] == "still_over_quota", result
+    assert acc_after["enabled"] is False and acc_after.get("disabled_reason") == "quota"
+    assert row is not None and row["five_hour_util"] == 99.0
+    assert m["cooldown"].is_blocked(f"oauth:{ak}", "gpt-5-codex")
+    print("  [PASS] openai: official reset keeps quota-disabled when fresh usage still over threshold")
+
+
+def test_openai_official_reset_keeps_quota_disabled_when_usage_refresh_fails(m):
+    _setup(m)
+    _add_openai(m, "refresh-fail@o.io")
+    ak = "openai:refresh-fail@o.io:acct-123"
+    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+    m["oauth_manager"].set_disabled_by_quota(ak, future)
+    m["cooldown"].record_error(f"oauth:{ak}", "gpt-5-codex", "quota", cooldown_until=m["state_db"].now_ms() + 600_000)
+    m["state_db"].quota_save(ak, {"fetched_at": m["state_db"].now_ms(), "five_hour_util": 99.0}, email="refresh-fail@o.io")
+
+    orig_fetch = m["oauth_manager"].fetch_usage
+    async def _boom(_ak):
+        raise RuntimeError("usage down")
+    m["oauth_manager"].fetch_usage = _boom
+    try:
+        result = asyncio.run(m["oauth_manager"].redeem_openai_rate_limit_reset_credit(ak, idempotency_key="idem-fail"))
+    finally:
+        m["oauth_manager"].fetch_usage = orig_fetch
+
+    acc_after = m["oauth_manager"].get_account(ak)
+    row = m["state_db"].quota_load(ak)
+    assert result["outcome"] == "reset", result
+    assert result.get("refresh_error"), result
+    assert result["quota_action"]["action"] == "refresh_failed_keep_disabled"
+    assert acc_after["enabled"] is False and acc_after.get("disabled_reason") == "quota"
+    assert row is not None and row["five_hour_util"] == 99.0
+    assert m["cooldown"].is_blocked(f"oauth:{ak}", "gpt-5-codex")
+    print("  [PASS] openai: official reset keeps quota-disabled when fresh usage refresh fails")
+
+
+def test_openai_metadata_refresh_updates_plan_without_rotating_tokens(m):
+    _setup(m)
+    _add_openai(m, "plan@o.io", plan_type="plus")
+    ak = "openai:plan@o.io:acct-123"
+    before = m["oauth_manager"].get_account(ak)
+    orig_fetch = m["oauth_manager"].openai_provider.fetch_accounts_check_sync
+    def _fake_accounts_check(access_token, *, org_id=None, workspace_id=None, email=None):
+        return {
+            "workspace_id": "acct-123",
+            "chatgpt_account_id": "acct-123",
+            "organization_id": "org-x",
+            "workspace_name": "Personal",
+            "workspace_type": "personal",
+            "plan_type": "pro",
+            "subscription_expires_at": "2026-07-01T00:00:00Z",
+            "email": "plan@o.io",
+        }
+    m["oauth_manager"].openai_provider.fetch_accounts_check_sync = _fake_accounts_check
+    try:
+        result = m["oauth_manager"].refresh_openai_metadata_sync(ak, force=True)
+    finally:
+        m["oauth_manager"].openai_provider.fetch_accounts_check_sync = orig_fetch
+
+    after = m["oauth_manager"].get_account(ak)
+    assert result["action"] == "updated", result
+    assert after["plan_type"] == "pro"
+    assert after["subscription_expires_at"] == "2026-07-01T00:00:00Z"
+    assert after["access_token"] == before["access_token"]
+    assert after["refresh_token"] == before["refresh_token"]
+    assert after["workspace_id"] == "acct-123"
+    assert after.get("last_metadata_refresh")
+    print("  [PASS] openai: metadata refresh updates plan without rotating tokens or changing identity")
+
+
+def test_manual_reset_quota_clears_local_quota_cache_and_cooldown(m):
+    _setup(m)
+    _add_openai(m, "manual-reset@o.io")
+    ak = "openai:manual-reset@o.io:acct-123"
+    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+    m["oauth_manager"].set_disabled_by_quota(ak, future)
+    m["state_db"].quota_save(ak, {
+        "fetched_at": m["state_db"].now_ms(),
+        "five_hour_util": 99.0,
+        "five_hour_reset": future,
+        "seven_day_util": 20.0,
+    }, email="manual-reset@o.io")
+    m["cooldown"].record_error(f"oauth:{ak}", "gpt-5-codex", "quota", cooldown_until=m["state_db"].now_ms() + 600_000)
+    assert m["cooldown"].is_blocked(f"oauth:{ak}", "gpt-5-codex")
+
+    result = m["oauth_manager"].reset_quota(ak)
+
+    acc_after = m["oauth_manager"].get_account(ak)
+    assert result["action"] == "reset", result
+    assert acc_after.get("disabled_reason") is None
+    assert acc_after["enabled"] is True
+    assert m["state_db"].quota_load(ak) is None
+    assert not m["cooldown"].is_blocked(f"oauth:{ak}", "gpt-5-codex")
+    print("  [PASS] openai: manual reset clears local quota-disabled/cache/cooldown state")
+
 # ==============================================================
 # main
 # ==============================================================
@@ -440,6 +670,7 @@ def main():
         test_delete_account_clears_openai_probe_bucket,
         # B. quota_monitor_once 对齐
         test_quota_monitor_processes_openai_accounts,
+        test_quota_monitor_resumes_openai_despite_old_passive_timestamp,
         # C. Anthropic 自动禁用
         test_anthropic_auto_disable_surpassed_threshold,
         test_anthropic_auto_disable_util_ge_one,
@@ -452,8 +683,15 @@ def main():
         test_openai_auto_disable_respects_custom_threshold,
         test_openai_user_disabled_not_touched,
         test_openai_quota_disabled_not_resumed_from_unknown_usage,
-        test_openai_quota_disabled_waits_until_disabled_until_before_resume,
+        test_openai_cached_thirty_day_over_threshold_sets_disabled_until,
+        test_openai_quota_disabled_resumes_with_fresh_low_usage_before_disabled_until,
+        test_openai_quota_disabled_keeps_waiting_on_stale_low_usage,
         test_openai_quota_disabled_resumes_after_reset_with_fresh_low_usage,
+        test_openai_official_reset_credit_clears_local_quota_after_upstream_success,
+        test_openai_official_reset_keeps_quota_disabled_when_fresh_usage_still_over,
+        test_openai_official_reset_keeps_quota_disabled_when_usage_refresh_fails,
+        test_openai_metadata_refresh_updates_plan_without_rotating_tokens,
+        test_manual_reset_quota_clears_local_quota_cache_and_cooldown,
     ]
     passed = 0
     failed = 0

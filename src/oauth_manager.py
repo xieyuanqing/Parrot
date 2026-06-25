@@ -23,6 +23,7 @@ import os
 import secrets
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -995,8 +996,13 @@ def latest_reset_iso(usage: dict) -> str | None:
     不合理情况。
     """
     candidates: list[datetime] = []
-    for key in ("five_hour", "seven_day", "seven_day_sonnet", "seven_day_opus"):
-        obj = usage.get(key) or {}
+    for obj in (
+        usage.get("five_hour") or {},
+        usage.get("seven_day") or {},
+        ((usage.get("openai") or {}).get("thirty_day") or {}),
+        usage.get("seven_day_sonnet") or {},
+        usage.get("seven_day_opus") or {},
+    ):
         dt = _parse_iso(obj.get("resets_at"))
         if dt is not None:
             candidates.append(dt)
@@ -1013,11 +1019,16 @@ def reset_iso_for_hit_windows(usage: dict, threshold: float) -> str | None:
     撞到的窗口都过去才恢复；但**不会**因为 5h 撞了而锁到 7d）。
 
     入参 usage：Anthropic 风格 JSON（`flatten_usage` 消费的那种），对 OpenAI
-    合成结构（只有 five_hour / seven_day）同样适用。
+    合成结构（five_hour / seven_day / openai.thirty_day）同样适用。
     """
     candidates: list[datetime] = []
-    for key in ("five_hour", "seven_day", "seven_day_sonnet", "seven_day_opus"):
-        obj = usage.get(key) or {}
+    for obj in (
+        usage.get("five_hour") or {},
+        usage.get("seven_day") or {},
+        ((usage.get("openai") or {}).get("thirty_day") or {}),
+        usage.get("seven_day_sonnet") or {},
+        usage.get("seven_day_opus") or {},
+    ):
         util = obj.get("utilization")
         if util is None:
             continue
@@ -1050,6 +1061,9 @@ def usage_from_quota_row(row: dict) -> dict:
     return {
         "five_hour": _block(row.get("five_hour_util"), row.get("five_hour_reset")),
         "seven_day": _block(row.get("seven_day_util"), row.get("seven_day_reset")),
+        "openai": {
+            "thirty_day": _block(row.get("thirty_day_util"), row.get("thirty_day_reset")),
+        },
         "seven_day_sonnet": _block(row.get("sonnet_util"), row.get("sonnet_reset")),
         "seven_day_opus": _block(row.get("opus_util"), row.get("opus_reset")),
         "extra_usage": {
@@ -1114,15 +1128,15 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
       • 所有窗口 util < threshold → 可用
           - OpenAI 账号若 usage 没有任何窗口指标，或这份 usage 不是本轮新鲜探测，
             不能作为恢复依据；保持原 quota 禁用状态，避免“未知=恢复”误判。
-          - OpenAI 账号若 disabled_until 仍在未来，也保持禁用，等窗口到期后再用
-            新鲜响应头/probe 数据恢复。
+          - OpenAI 账号若拿到新鲜有效 usage 且所有窗口均低于阈值，即使旧的
+            disabled_until 仍在未来，也恢复；真实用量优先于旧锁定时间。
           - 其他账号是 quota 禁用：set_enabled(True) 自动恢复。
           - 账号未禁用：无事发生
 
     返回: {
       "action": "noop_user"|"noop_auth_error"|"disabled"|"still_over_quota"|
                 "resumed"|"kept_enabled"|"disable_failed"|"resume_failed"|"noop_missing",
-      "utils": [5h, 7d, sonnet, opus],   # None 表示该指标缺失
+      "utils": [5h, 7d, 30d, sonnet, opus],   # None 表示该指标缺失
       "any_over": bool,
       "hit_windows": ["5h", "7d", ...],   # util ≥ threshold 的窗口标签
       "disabled_until": str|None,
@@ -1172,13 +1186,10 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
 
     # 全部窗口都可用。OpenAI 的 usage 来自响应头/最小 probe 的缓存合成，
     # 空缓存或被节流跳过的旧缓存不能证明额度恢复；尤其 quota 禁用账号不能
-    # 因 [None, None, None, None] 被误恢复。
+    # 因 [None, None, None, None] 被误恢复。若拿到新鲜有效 usage，则真实
+    # 低用量优先于旧 disabled_until，避免 30d 已重置仍卡在 quota 禁用。
     if reason == "quota":
         if provider_of(account_key) == "openai":
-            if _quota_disabled_until_still_future(acc):
-                return {"action": "quota_waiting_reset", "utils": utils,
-                        "any_over": False, "hit_windows": [],
-                        "disabled_until": acc.get("disabled_until")}
             if not _usage_has_any_quota_signal(usage):
                 return {"action": "quota_unknown_keep_disabled", "utils": utils,
                         "any_over": False, "hit_windows": [],
@@ -1677,6 +1688,249 @@ def set_disabled_by_quota(account_key: str, resets_at: str | None) -> None:
     set_enabled(account_key, False, reason="quota", disabled_until=resets_at)
 
 
+def _clear_oauth_runtime_state(canonical: str, *, clear_quota_cache: bool) -> dict:
+    """Clear local runtime state for one OAuth channel.
+
+    `clear_quota_cache=False` is used after an official OpenAI reset, because the
+    fresh quota row has just been saved and must remain visible/evaluable.
+    """
+    ch_key = f"oauth:{canonical}"
+    out = {"channel_key": ch_key, "quota_cache_cleared": False}
+    try:
+        from . import cooldown
+        cooldown.clear(ch_key, model=None)
+        out["cooldown_cleared"] = True
+    except Exception as exc:
+        out["cooldown_error"] = str(exc)
+        print(f"[oauth] runtime clear cooldown failed for {canonical}: {exc}")
+
+    if clear_quota_cache:
+        try:
+            state_db.quota_delete(canonical)
+            out["quota_cache_cleared"] = True
+        except Exception as exc:
+            out["quota_cache_error"] = str(exc)
+            print(f"[oauth] runtime clear quota cache failed for {canonical}: {exc}")
+
+    try:
+        from . import failover
+        failover.forget_codex_snapshot(canonical)
+        failover.forget_anthropic_snapshot(canonical)
+        out["snapshots_cleared"] = True
+    except Exception as exc:
+        out["snapshot_error"] = str(exc)
+        print(f"[oauth] runtime clear snapshot failed for {canonical}: {exc}")
+    forget_openai_probe(canonical)
+    return out
+
+
+def reset_quota(account_key: str) -> dict:
+    """Manually clear local quota/cooldown state for one OAuth account.
+
+    This mirrors CLIProxyAPI's ResetQuota semantics: it does not reset upstream
+    limits, but clears Parrot's local quota-disabled state and model cooldown so
+    the account can participate in routing again. User-disabled and auth_error
+    accounts are intentionally left untouched.
+    """
+    acc = get_account(account_key)
+    if acc is None:
+        return {"action": "noop_missing", "account_key": account_key}
+
+    canonical = _canonical_key(acc)
+    reason = acc.get("disabled_reason")
+    if reason in ("user", "auth_error"):
+        return {"action": f"noop_{reason}", "account_key": canonical,
+                "disabled_reason": reason}
+
+    action = "reset" if reason == "quota" else "cleared_runtime_state"
+    if reason == "quota":
+        set_enabled(canonical, True)
+
+    runtime = _clear_oauth_runtime_state(canonical, clear_quota_cache=True)
+    return {"action": action, "account_key": canonical,
+            "disabled_reason": reason, **runtime}
+
+
+async def redeem_openai_rate_limit_reset_credit(account_key: str,
+                                                *, idempotency_key: str | None = None) -> dict:
+    """Consume one official OpenAI/Codex banked reset credit for an account.
+
+    OpenAI Codex now exposes earned rate-limit reset credits via WHAM. This path
+    consumes an upstream credit first; only `reset` / `alreadyRedeemed` outcomes
+    clear Parrot's local quota-disabled/cooldown/cache state.
+    """
+    acc = get_account(account_key)
+    if acc is None:
+        return {"action": "noop_missing", "account_key": account_key}
+
+    canonical = _canonical_key(acc)
+    if provider_of(acc) != "openai":
+        return {"action": "not_openai", "account_key": canonical}
+    if acc.get("disabled_reason") == "user":
+        return {"action": "noop_user", "account_key": canonical}
+    if acc.get("disabled_reason") == "auth_error":
+        return {"action": "noop_auth_error", "account_key": canonical}
+
+    idem = idempotency_key or str(uuid.uuid4())
+    access_token = await ensure_valid_token(canonical)
+    account_id = _openai_workspace_id(acc) or None
+    response = await openai_provider.consume_rate_limit_reset_credit(
+        access_token, idempotency_key=idem, account_id=account_id,
+    )
+    outcome = response.get("outcome")
+    out = {
+        "action": "upstream_reset_result",
+        "account_key": canonical,
+        "outcome": outcome,
+        "idempotency_key": idem,
+        "windows_reset": response.get("windows_reset"),
+    }
+
+    if outcome not in ("reset", "alreadyRedeemed"):
+        return out
+
+    # Official Codex UI refetches rate limits after consuming a reset. Do the
+    # same before clearing any local quota restriction: fresh usage must prove
+    # the windows are below threshold before Parrot auto-resumes a quota-disabled
+    # account. If this fetch fails, keep the local restriction in place.
+    try:
+        usage = await fetch_usage(canonical)
+    except Exception as exc:
+        out["refresh_error"] = str(exc)
+        out["quota_action"] = {"action": "refresh_failed_keep_disabled"}
+        return out
+
+    state_db.quota_save(canonical, flatten_usage(usage), email=str(acc.get("email") or ""))
+    out["usage"] = usage
+    reset_credits = ((usage.get("openai") or {}).get("rate_limit_reset_credits") or {})
+    if isinstance(reset_credits, dict) and reset_credits.get("available_count") is not None:
+        out["available_count"] = reset_credits.get("available_count")
+
+    eval_result = evaluate_and_toggle_by_usage(canonical, usage, fresh=True)
+    out["quota_action"] = eval_result
+    if eval_result.get("action") in ("resumed", "kept_enabled") and not eval_result.get("any_over"):
+        out["runtime_clear"] = _clear_oauth_runtime_state(canonical, clear_quota_cache=False)
+    return out
+
+
+def _openai_metadata_new_fields(acc: dict, info: dict) -> dict:
+    fields: dict[str, str] = {}
+    for k in ("plan_type", "subscription_expires_at", "workspace_type", "organization_id"):
+        v = info.get(k)
+        if v not in (None, ""):
+            fields[k] = str(v)
+
+    incoming_name = str(info.get("workspace_name") or "").strip()
+    if incoming_name:
+        existing_name = str(acc.get("workspace_name") or "").strip()
+        existing_type = str(acc.get("workspace_type") or acc.get("plan_type") or "").lower()
+        if not (
+            incoming_name.lower() == "personal"
+            and "team" in existing_type
+            and existing_name
+            and existing_name.lower() not in {"personal", "workspace", "team"}
+        ):
+            fields["workspace_name"] = incoming_name
+    return fields
+
+
+def refresh_openai_metadata_sync(account_key: str, *,
+                                 force: bool = False,
+                                 min_interval_seconds: int = 3600) -> dict:
+    """Refresh OpenAI account plan/workspace metadata without rotating tokens."""
+    canonical = _resolve_existing_account_key(account_key)
+    if canonical:
+        account_key = canonical
+    acc = get_account(account_key)
+    if acc is None:
+        return {"action": "noop_missing", "account_key": account_key}
+    if provider_of(acc) != "openai":
+        return {"action": "noop_not_openai", "account_key": _canonical_key(acc)}
+
+    canonical = _canonical_key(acc)
+    if not force:
+        last = _parse_iso(acc.get("last_metadata_refresh"))
+        if last is not None:
+            age = (datetime.now(timezone.utc) - last.astimezone(timezone.utc)).total_seconds()
+            if age < max(0, int(min_interval_seconds)):
+                return {"action": "skipped_fresh", "account_key": canonical, "age_seconds": int(age)}
+
+    access_token = acc.get("access_token") or ""
+    if not access_token:
+        return {"action": "skipped_no_access_token", "account_key": canonical}
+    expired = _parse_iso(acc.get("expired"))
+    if expired is not None and (expired - datetime.now(timezone.utc)).total_seconds() <= 60:
+        return {"action": "skipped_token_expiring", "account_key": canonical}
+
+    info = openai_provider.fetch_accounts_check_sync(
+        access_token,
+        org_id=acc.get("organization_id") or None,
+        workspace_id=_openai_workspace_id(acc) or None,
+        email=str(acc.get("email") or "") or None,
+    )
+    if not info:
+        return {"action": "fetch_no_metadata", "account_key": canonical}
+
+    fields = _openai_metadata_new_fields(acc, info)
+    fields["last_metadata_refresh"] = _format_utc(datetime.now(timezone.utc))
+
+    def mutate(cfg):
+        for item in cfg.get("oauthAccounts", []):
+            if _canonical_key(item) == canonical:
+                item.update(fields)
+                return
+    config.update(mutate)
+    return {"action": "updated", "account_key": canonical, "fields": fields}
+
+
+async def ensure_openai_metadata_fresh(account_key: str, *,
+                                       force: bool = False,
+                                       min_interval_seconds: int = 3600,
+                                       timeout_s: float = 5.0) -> dict:
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                refresh_openai_metadata_sync, account_key,
+                force=force, min_interval_seconds=min_interval_seconds,
+            ),
+            timeout=timeout_s,
+        )
+    except asyncio.TimeoutError:
+        return {"action": "timeout", "account_key": account_key}
+    except Exception as exc:
+        return {"action": "error", "account_key": account_key, "error": str(exc)}
+
+
+async def ensure_openai_metadata_fresh_many(account_keys: list[str], *,
+                                            force: bool = False,
+                                            min_interval_seconds: int = 3600,
+                                            timeout_s: float = 5.0) -> list[dict]:
+    return await asyncio.gather(*[
+        ensure_openai_metadata_fresh(
+            k, force=force, min_interval_seconds=min_interval_seconds, timeout_s=timeout_s,
+        ) for k in account_keys
+    ])
+
+
+def ensure_openai_metadata_fresh_sync(account_keys: list[str] | str, *,
+                                      force: bool = False,
+                                      min_interval_seconds: int = 3600,
+                                      timeout_s: float = 5.0) -> None:
+    try:
+        if isinstance(account_keys, str):
+            asyncio.run(ensure_openai_metadata_fresh(
+                account_keys, force=force, min_interval_seconds=min_interval_seconds,
+                timeout_s=timeout_s,
+            ))
+        else:
+            asyncio.run(ensure_openai_metadata_fresh_many(
+                account_keys, force=force, min_interval_seconds=min_interval_seconds,
+                timeout_s=timeout_s,
+            ))
+    except Exception as exc:
+        print(f"[oauth] ensure_openai_metadata_fresh_sync error: {exc}")
+
+
 def update_models(account_key: str, models: list[str]) -> None:
     canonical = _resolve_existing_account_key(account_key)
     has_prov = ":" in account_key
@@ -1847,6 +2101,19 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
             out[email] = f"skipped:{acc['disabled_reason']}"
             continue
 
+        if provider_of(acc) == "openai":
+            try:
+                meta_interval = int(
+                    (config.get().get("oauth") or {}).get(
+                        "openaiMetadataRefreshIntervalSeconds", 6 * 3600,
+                    )
+                )
+                await ensure_openai_metadata_fresh(
+                    ak, min_interval_seconds=meta_interval, timeout_s=5.0,
+                )
+            except Exception as exc:
+                print(f"[oauth] openai metadata refresh failed for {ak}: {exc}")
+
         expired = _parse_iso(acc.get("expired"))
         if expired is None:
             out[email] = "skipped:no_expired"
@@ -1940,16 +2207,13 @@ async def quota_monitor_once() -> dict:
 
         state_db.quota_save(ak, flatten_usage(usage), email=email)
 
-        # OpenAI quota 恢复必须有本轮新鲜窗口数据；缓存合成/空 usage 不足以
-        # 证明恢复。Claude 仍沿用真实 usage API。
+        # OpenAI quota 恢复必须有本轮主动 fetch_usage 拿到的窗口数据；空 usage
+        # 不足以证明恢复。不要用 last_passive_update_at 判定这里的新鲜度：旧的
+        # 业务响应头采样时间戳可能早于本轮 wham/usage 主动刷新，误把新数据当 stale。
+        # Claude 仍沿用真实 usage API。
         fresh_for_resume = True
         if provider_of(ak) == "openai" and reason_before == "quota":
-            row = state_db.quota_load(ak) or {}
-            last_ms = int(row.get("last_passive_update_at") or row.get("fetched_at") or 0)
-            fresh_for_resume = bool(
-                last_ms and (state_db.now_ms() - last_ms) <= 120_000
-                and _usage_has_any_quota_signal(usage)
-            )
+            fresh_for_resume = _usage_has_any_quota_signal(usage)
 
         result = evaluate_and_toggle_by_usage(ak, usage, threshold=threshold, fresh=fresh_for_resume)
         utils = result["utils"]

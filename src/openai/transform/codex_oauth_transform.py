@@ -2,9 +2,9 @@
 
 调用位置：
   `OpenAIOAuthChannel.build_upstream_request` 里，输入已经是 Responses API
-  shape（责任方：passthrough 过 common.filter_responses_passthrough；或跨协议
-  先过 chat_to_responses.translate_request）。本模块负责把它打成 ChatGPT
-  internal codex 端点 (`/backend-api/codex/responses`) 能接受的样子：
+  shape（责任方：同协议 passthrough 过 provider adapter target allowlist；
+  或跨协议先过 chat_to_responses.translate_request）。本模块负责把它打成
+  ChatGPT internal codex 端点 (`/backend-api/codex/responses`) 能接受的样子：
 
   - `store=false` 强制（OAuth 上游对 store=true 报 400）
   - `stream=true` 强制（OAuth 上游仅支持流式 SSE）
@@ -16,7 +16,7 @@
     账号层 `supports_model` 已经用账号 `models` + `defaultModels` 做了白名单
     校验，进到这里的都是合法模型名；上游无论叫 gpt-5.1 / gpt-5.5 / 下个月出的
     gpt-5.6，都原样发出去。新家族只需在 TG 面板或
-    `config.oauth.providers.openai.defaultModels` 加一行，代码零改动。
+    `config.openaiOAuth.defaultModels` 加一行，代码零改动。
   - `instructions` 空 → 注入默认 "You are a helpful coding assistant."
   - legacy `functions` / `function_call` → `tools` / `tool_choice`
   - `input` 是字符串 → 包成 [{type:"message", role:"user", content:<str>}]
@@ -62,6 +62,9 @@ _STRIP_FIELDS_FOR_CODEX = (
     "metadata",
     "safety_identifier",
     "stream_options",
+    # `background=false` is semantically equivalent to the Codex synchronous
+    # stream path; `background=true` is rejected before this transform.
+    "background",
     # OAuth Codex 强制 store=false，不能把 Responses 持久化引用直传给上游。
     "previous_response_id",
 )
@@ -533,6 +536,7 @@ def apply_codex_oauth_transform(
     *,
     resolved_model: str | None = None,
     session_key: str | None = None,
+    default_instructions: str | None = None,
 ) -> dict:
     """就地改造 body，返回同一对象。
 
@@ -598,6 +602,10 @@ def apply_codex_oauth_transform(
 
     # 6) instructions 兜底（sub2api 行为：空 → 一行 fallback）
     if _is_empty_str(body.get("instructions")):
-        body["instructions"] = _DEFAULT_INSTRUCTIONS
+        body["instructions"] = (
+            default_instructions.strip()
+            if isinstance(default_instructions, str) and default_instructions.strip()
+            else _DEFAULT_INSTRUCTIONS
+        )
 
     return body

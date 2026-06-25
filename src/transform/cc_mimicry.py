@@ -25,6 +25,7 @@ import uuid
 
 import xxhash
 
+from .. import cache_hints
 from .. import config as _ap_config
 
 
@@ -179,7 +180,7 @@ def compute_fingerprint(messages):
 
 # ─── System prompt ───
 
-def build_system_blocks(messages, cache_ttl="1h"):
+def build_system_blocks(messages, cache_ttl="1h", *, inject_cache=True):
     fp = compute_fingerprint(messages)
     version = f"{CC_VERSION}.{fp}"
     cfg = load_config()
@@ -196,9 +197,10 @@ def build_system_blocks(messages, cache_ttl="1h"):
         blocks.append({"type": "text", "text": attribution})
     if include_claude_code_prompt:
         cc_block: dict = {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}
-        cc_cache_control = cache_control_for_ttl(cache_ttl)
-        if cc_cache_control:
-            cc_block["cache_control"] = cc_cache_control
+        if inject_cache:
+            cc_cache_control = cache_control_for_ttl(cache_ttl)
+            if cc_cache_control:
+                cc_block["cache_control"] = cc_cache_control
         blocks.append(cc_block)
     return blocks
 
@@ -428,7 +430,7 @@ def _is_anthropic_server_tool(tool):
     )
 
 
-def _normalize_anthropic_tool(tool):
+def _normalize_anthropic_tool(tool, *, preserve_cache_control=False):
     """Normalize one downstream Anthropic tool to the CC-compatible API shape.
 
     Mirrors Claude Code's toolToAPISchema choke point: standard custom tools are
@@ -439,9 +441,14 @@ def _normalize_anthropic_tool(tool):
     if not isinstance(tool, dict):
         return tool
     if _is_anthropic_server_tool(tool):
-        return dict(tool)
+        if preserve_cache_control:
+            return dict(tool)
+        return {k: v for k, v in tool.items() if k != "cache_control"}
 
-    normalized = {k: v for k, v in tool.items() if k in _ANTHROPIC_TOOL_ALLOWED_KEYS}
+    normalized = {
+        k: v for k, v in tool.items()
+        if k in _ANTHROPIC_TOOL_ALLOWED_KEYS and (preserve_cache_control or k != "cache_control")
+    }
 
     # OpenAI/chat-style compatibility: {type:function,function:{name,description,parameters}}
     fn = tool.get("function")
@@ -464,9 +471,9 @@ def _normalize_anthropic_tool(tool):
     return normalized
 
 
-def _strip_tool_cache_control(tools):
-    """规范化普通 client tools，并保留客户端提供的 cache_control。"""
-    return [_normalize_anthropic_tool(tool) for tool in tools]
+def _strip_tool_cache_control(tools, *, preserve_cache_control=False):
+    """按策略处理 tools 上的 cache_control，并规范化普通 client tools。"""
+    return [_normalize_anthropic_tool(tool, preserve_cache_control=preserve_cache_control) for tool in tools]
 
 
 def add_cache_breakpoints(messages, cache_ttl="1h"):
@@ -818,6 +825,8 @@ def apply_opus_adaptive_thinking(payload, model):
 
 def transform_request(body, email="", session_id=None, cache_ttl="1h"):
     cache_ttl = normalize_cache_ttl(cache_ttl)
+    explicit_cache_control = cache_hints.has_anthropic_cache_control(body)
+    preserve_downstream_cache = explicit_cache_control or cache_ttl == PASSTHROUGH_CACHE_TTL
     messages = body.get("messages", [])
     user_system = body.get("system")
     cfg = load_config()
@@ -830,7 +839,7 @@ def transform_request(body, email="", session_id=None, cache_ttl="1h"):
         messages = inject_user_system_to_messages(messages, None)
     messages = _normalize_messages_for_api(messages)
     messages = _strip_assistant_thinking_blocks(messages)
-    if cache_ttl == PASSTHROUGH_CACHE_TTL:
+    if preserve_downstream_cache:
         messages = _preserve_message_cache_control(messages)
     else:
         messages = _strip_message_cache_control(messages)
@@ -838,7 +847,7 @@ def transform_request(body, email="", session_id=None, cache_ttl="1h"):
             messages = add_silly_tavern_cache_breakpoints(messages, cache_ttl=cache_ttl)
         else:
             messages = add_cache_breakpoints(messages, cache_ttl=cache_ttl)
-    system_blocks = build_system_blocks(messages, cache_ttl=cache_ttl)
+    system_blocks = build_system_blocks(messages, cache_ttl=cache_ttl, inject_cache=not preserve_downstream_cache)
     if not include_claude_code_prompt:
         system_blocks.extend(_user_system_to_blocks(user_system))
     model = body.get("model", "claude-sonnet-4-20250514")
@@ -866,14 +875,22 @@ def transform_request(body, email="", session_id=None, cache_ttl="1h"):
         payload["system"] = system_blocks
 
     if body.get("tools"):
-        tools = _strip_tool_cache_control([dict(t) if isinstance(t, dict) else t for t in body["tools"]])
+        tools = _strip_tool_cache_control(
+            [dict(t) if isinstance(t, dict) else t for t in body["tools"]],
+            preserve_cache_control=preserve_downstream_cache,
+        )
         for t in tools:
             if isinstance(t, dict) and "name" in t:
                 t["name"] = _sanitize_tool_name(t["name"], dynamic_tool_map)
-        if cache_ttl != PASSTHROUGH_CACHE_TTL:
+        tool_cache_control = cache_control_for_ttl(cache_ttl)
+        if not preserve_downstream_cache and tool_cache_control:
             tools[-1] = dict(tools[-1])
-            tools[-1]["cache_control"] = cache_control_for_ttl(cache_ttl)
+            tools[-1]["cache_control"] = tool_cache_control
         payload["tools"] = tools
+
+    top_cache = cache_hints.top_level_cache_control(body)
+    if top_cache:
+        payload["cache_control"] = top_cache
 
     # tool_choice：CC 不"主动加"，但客户端显式传入时必须透传（含工具名混淆），
     # 否则会吞掉下游强制/禁用工具的意图。抓包未含此字段是会话未用到，非协议禁止。

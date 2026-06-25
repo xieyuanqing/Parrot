@@ -3,14 +3,15 @@
 对接 ChatGPT internal API `https://chatgpt.com/backend-api/codex/responses`。
 参考 sub2api 的 openai_gateway_service.buildUpstreamRequest（OAuth 分支）。
 
-仅服务本家族入口（openai-chat / openai-responses）；anthropic 入口被 scheduler
-按模型家族过滤掉（本类 list_client_models 都是 codex 家族模型）。
+默认服务本家族入口（openai-chat / openai-responses）；Phase 8 起，当
+ProtocolMatrix 判定请求能力可安全表达时，也允许 Anthropic 入口先翻译成
+Responses shape 再走 Codex 上游。
 
 运行期流程（每次请求独立，无并发共享状态）：
   1. oauth_manager.ensure_valid_token(email) 拿有效 access_token
      （内部已按 provider 分派到 src.oauth.openai.refresh_sync）
   2. 按 ingress_protocol 准备 Responses shape 请求体：
-     - responses ingress → filter_responses_passthrough
+     - responses ingress → provider adapter target allowlist
      - chat ingress      → chat_to_responses.translate_request
   3. codex_oauth_transform 对请求体做 codex 兼容改造（store=false / stream=true /
      删不支持字段 / 模型名规范化 / input 字符串包列表 / system 提 instructions
@@ -27,25 +28,47 @@ import hashlib
 import json
 from typing import Optional
 
-from .. import config, network, oauth_manager
+from .. import cache_hints, config, network, oauth_manager
+from ..providers import registry as provider_registry
+from ..openai import reasoning_replay
 from ..openai.transform import (
+    anthropic_to_responses,
     chat_to_responses,
     codex_oauth_transform,
-    common,
     guard,
 )
 from .base import Channel, ChannelDisplay, UpstreamRequest
 
 
 def _provider_cfg() -> dict:
-    """读取 config.oauth.providers.openai（缺省字段回退默认值）。"""
-    # 单测/局部配置可能用 config._cache 直接塞一份精简 cfg；因此这里自己
-    # 再兜一层 DEFAULT_CONFIG，避免 defaultModels / forceCodexCLI 等默认值丢失。
-    default = (((config.DEFAULT_CONFIG.get("oauth") or {}).get("providers") or {}).get("openai") or {})
-    cfg = (config.get().get("oauth") or {}).get("providers") or {}
-    current = cfg.get("openai") or {}
+    """读取 OpenAI OAuth 配置。
+
+    新入口：config.openaiOAuth。
+    旧入口：config.oauth.providers.openai 继续兼容；加载旧配置时 config.py 会
+    自动把旧值补齐到 openaiOAuth。这里仍保留运行时 fallback，照顾单测/局部配置。
+    """
+    default = config.DEFAULT_CONFIG.get("openaiOAuth") or {}
+    cfg = config.get()
+    legacy = (((cfg.get("oauth") or {}).get("providers") or {}).get("openai") or {})
+    current = cfg.get("openaiOAuth") or {}
+    default = default if isinstance(default, dict) else {}
+    legacy = legacy if isinstance(legacy, dict) else {}
+    current = current if isinstance(current, dict) else {}
+
     merged = dict(default)
-    merged.update(current)
+    # 运行时兼容：如果调用方仍只改旧路径，且 openaiOAuth 还等于默认值，
+    # 旧路径生效；一旦用户显式改了新入口，则新入口优先。
+    if legacy and current == default:
+        source = legacy
+    else:
+        source = current
+    for key, value in source.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            nested = dict(merged.get(key) or {})
+            nested.update(value)
+            merged[key] = nested
+        else:
+            merged[key] = value
     return merged
 
 
@@ -61,6 +84,16 @@ def _isolate_session_id(api_key_name: str, raw: str) -> str:
     return hashlib.sha256(material).hexdigest()[:16]
 
 
+def _request_api_key_name(body: dict) -> str:
+    """Return the downstream API key name for OpenAI and Anthropic ingress.
+
+    OpenAI handlers inject ``_api_key_name`` while the Anthropic /v1/messages
+    route injects ``_parrot_api_key_name``.  OAuth Codex session isolation and
+    cross-protocol prompt-cache keys must treat them equivalently.
+    """
+    return str(body.get("_api_key_name") or body.get("_parrot_api_key_name") or "")
+
+
 # ─── 常量 ────────────────────────────────────────────────────────
 
 CODEX_UPSTREAM_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -69,6 +102,73 @@ from ..openai.codex_constants import (
     CODEX_CLI_USER_AGENT,
     CODEX_ORIGINATOR,
 )
+
+_CODEX_UNSUPPORTED_STATEFUL_INPUT_TYPES = frozenset({
+    "web_search_call", "file_search_call", "computer_call",
+    "image_generation_call", "code_interpreter_call",
+    "mcp_call", "mcp_list_tools", "mcp_approval_request",
+    "mcp_approval_response",
+})
+
+_CODEX_UNSUPPORTED_HOSTED_TOOL_TYPES = frozenset({
+    "web_search_preview", "file_search", "computer_use_preview",
+    "code_interpreter", "image_generation", "mcp", "local_shell",
+    "web_search", "web_search_2025_08_26", "web_search_preview_2025_03_11",
+    "computer", "computer_use", "apply_patch", "function_shell",
+})
+
+
+def _codex_unsupported_state_label(body: dict) -> str | None:
+    if body.get("conversation"):
+        return "conversation"
+    if body.get("background") is True:
+        return "background"
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            if isinstance(tool, dict) and tool.get("type") in _CODEX_UNSUPPORTED_HOSTED_TOOL_TYPES:
+                return f"tools:{tool.get('type')}"
+    choice = body.get("tool_choice")
+    if isinstance(choice, dict):
+        typ = choice.get("type")
+        if typ in _CODEX_UNSUPPORTED_HOSTED_TOOL_TYPES:
+            return f"tool_choice:{typ}"
+        if typ == "allowed_tools":
+            nested = choice.get("tools")
+            if isinstance(nested, list):
+                for tool in nested:
+                    if isinstance(tool, dict) and tool.get("type") in _CODEX_UNSUPPORTED_HOSTED_TOOL_TYPES:
+                        return f"tool_choice:allowed_tools:{tool.get('type')}"
+    items: list = []
+    instructions = body.get("instructions")
+    if isinstance(instructions, list):
+        items.extend(instructions)
+    inp = body.get("input")
+    if isinstance(inp, list):
+        items.extend(inp)
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in _CODEX_UNSUPPORTED_STATEFUL_INPUT_TYPES:
+            return str(item.get("type"))
+        if item.get("type") == "input_image" and item.get("file_id") is not None:
+            return "input_image.file_id"
+        if item.get("type") == "input_file" and item.get("file_id") is not None:
+            return "input_file.file_id"
+        if item.get("type") == "input_audio":
+            return "input_audio"
+        content = item.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "input_audio":
+                    return "input_audio"
+                if part.get("type") == "input_image" and part.get("file_id") is not None:
+                    return "input_image.file_id"
+                if part.get("type") == "input_file" and part.get("file_id") is not None:
+                    return "input_file.file_id"
+    return None
 
 
 class OpenAIOAuthChannel(Channel):
@@ -120,7 +220,7 @@ class OpenAIOAuthChannel(Channel):
         # 账户 models 优先级：
         #   1) 账户 entry 自带 models（TG 面板里手动填的）
         #   2) 构造参数 default_models（registry 注入，向后兼容；当前为 None）
-        #   3) config.oauth.providers.openai.defaultModels（默认 4 个常用 codex 模型）
+        #   3) config.openaiOAuth.defaultModels（默认常用 codex 模型）
         # 上游 codex endpoint 只认规范名，transform 把别名映射过去；所以这里
         # 只要列出对外暴露的名字即可。
         models = account.get("models") or []
@@ -160,11 +260,10 @@ class OpenAIOAuthChannel(Channel):
         self, requested_body: dict, resolved_model: str,
         *, ingress_protocol: str = "responses",
     ) -> UpstreamRequest:
-        if ingress_protocol not in ("chat", "responses"):
+        if ingress_protocol not in ("anthropic", "chat", "responses"):
             raise ValueError(
-                "OpenAIOAuthChannel only serves openai-chat / openai-responses "
-                f"ingress; got {ingress_protocol!r}. Scheduler family filter "
-                "should have excluded this channel for anthropic ingress."
+                "OpenAIOAuthChannel only serves anthropic / openai-chat / openai-responses "
+                f"ingress; got {ingress_protocol!r}. ProtocolMatrix should have guarded this route."
             )
 
         # Step A: 准备 Responses shape
@@ -178,11 +277,22 @@ class OpenAIOAuthChannel(Channel):
                 "because upstream is forced to store=false; use prompt_cache_key/session_id "
                 "or route this request to an OpenAI API channel."
             )
+        if ingress_protocol == "responses":
+            unsupported_state = _codex_unsupported_state_label(requested_body)
+            if unsupported_state:
+                raise ValueError(
+                    f"{unsupported_state} is not supported on OpenAI OAuth Codex route; "
+                    "route this request to an OpenAI API Responses channel."
+                )
 
         if ingress_protocol == "responses":
-            payload = common.filter_responses_passthrough(requested_body)
-            translator_ctx = None      # 同协议透传，无需响应反向
-        else:
+            payload = provider_registry.filter_request_payload(
+                self,
+                requested_body,
+                protocol="openai-responses",
+            )
+            translator_ctx = None      # 同协议透传无需响应反向；replay scope 稍后会补进 ctx
+        elif ingress_protocol == "chat":
             # chat ingress → responses 上游（同家族跨变体）
             guard.guard_chat_to_responses(requested_body)
             payload = chat_to_responses.translate_request(requested_body)
@@ -199,16 +309,76 @@ class OpenAIOAuthChannel(Channel):
                 "model_for_response": resolved_model,
                 "include_usage": include_usage,
             }
+        else:
+            # anthropic ingress → responses 上游（跨家族，非流式下游）。Codex HTTP
+            # endpoint 仍会被 apply_codex_oauth_transform 强制 stream=true，由
+            # failover 的 upstream_stream_only 聚合路径再反向成 Anthropic message。
+            payload = anthropic_to_responses.translate_request(
+                requested_body,
+                target_model=resolved_model,
+                codex_oauth=True,
+            )
+            translator_ctx = {
+                "ingress": "anthropic",
+                "upstream_protocol": "openai-responses",
+                "response_translator": "anthropic_to_responses",
+                "model_for_response": resolved_model,
+                "request_body": requested_body,
+            }
 
         payload["model"] = resolved_model
-
-        # Step B: codex 兼容改造（store=false 等硬约束）。encrypted_content
-        # 只做透明透传，不由 Parrot 本地维护/回填。
-        payload = codex_oauth_transform.apply_codex_oauth_transform(
-            payload, resolved_model=resolved_model,
+        payload = provider_registry.filter_request_payload(
+            self,
+            payload,
+            protocol="openai-responses",
         )
 
-        # Step C: 拿 access_token（会在此触发 refresh if 过期）
+        codex_unsupported_state = _codex_unsupported_state_label(payload)
+        if codex_unsupported_state:
+            raise ValueError(
+                f"{codex_unsupported_state} is not supported on OpenAI OAuth Codex route; "
+                "route this request to an OpenAI API channel."
+            )
+
+        # Step B: Codex reasoning replay scope。必须在 codex transform 剥 metadata
+        # 等字段前计算 scope；没有 prompt_cache_key / metadata / Codex
+        # turn/window/session 锚点时不启用，避免跨会话串状态。
+        replay_scope = reasoning_replay.scope_from_payload(resolved_model, payload)
+
+        # Step B.5: Anthropic ingress 的 cache_control 在 Anthropic→Responses
+        # translator 中会被剥离；在进入 Codex transform 前补 OpenAI/Codex 可用
+        # 的 prompt_cache_key。放在 replay_scope 之后，避免改变既有 metadata
+        # session_id reasoning replay 作用域。
+        if ingress_protocol == "anthropic":
+            cache_hints.apply_anthropic_cache_to_openai_payload(
+                requested_body,
+                payload,
+                model=resolved_model,
+                api_key_name=_request_api_key_name(requested_body),
+                client_ip=requested_body.get("_parrot_client_ip"),
+            )
+
+        # Step C: codex 兼容改造（store=false 等硬约束）。带 encrypted_content 的
+        # replay reasoning 只做透明透传，非法/陈旧 EC 由 failover 清 scope 后降级重试。
+        payload = codex_oauth_transform.apply_codex_oauth_transform(
+            payload,
+            resolved_model=resolved_model,
+            default_instructions=_provider_cfg().get("defaultInstructions"),
+        )
+
+        # Step D: transform 后 input 已规范成 Responses list，再插入 replay items。
+        replay_injected = reasoning_replay.inject_replay_items(payload, replay_scope)
+        if replay_scope is not None:
+            if translator_ctx is None:
+                translator_ctx = {
+                    "ingress": ingress_protocol,
+                    "upstream_protocol": "openai-responses",
+                    "model_for_response": resolved_model,
+                }
+            translator_ctx["codex_reasoning_replay"] = replay_scope
+            translator_ctx["codex_reasoning_replay_injected"] = replay_injected
+
+        # Step E: 拿 access_token（会在此触发 refresh if 过期）
         access_token = await oauth_manager.ensure_valid_token(self.account_key)
 
         headers = self._build_headers(access_token)
@@ -216,7 +386,7 @@ class OpenAIOAuthChannel(Channel):
         # 派生，避免同 OAuth 账户下不同下游 API Key 之间会话粘性碰撞。
         prov_cfg = _provider_cfg()
         if prov_cfg.get("isolateSessionId", True):
-            api_key_name = str(requested_body.get("_api_key_name") or "")
+            api_key_name = _request_api_key_name(requested_body)
             prompt_cache_key = str(payload.get("prompt_cache_key") or "").strip()
             if api_key_name and prompt_cache_key:
                 iso = _isolate_session_id(api_key_name, prompt_cache_key)
@@ -228,7 +398,7 @@ class OpenAIOAuthChannel(Channel):
         headers.pop("conversation_id", None)
 
         return UpstreamRequest(
-            url=CODEX_UPSTREAM_URL,
+            url=str(_provider_cfg().get("codexUpstreamUrl") or CODEX_UPSTREAM_URL),
             headers=headers,
             body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             dynamic_tool_map=None,
@@ -284,13 +454,16 @@ class OpenAIOAuthChannel(Channel):
 
         # 构造普通短探测请求体。走 build_upstream_request 能顺带用到 codex
         # transform（store=false / stream=true / 模型规范化 / instructions 兜底 / ...）。
-        # 不设置 max_tokens；用简单 hello 请求并完整消费响应，避免极低输出上限
+        # 默认不设置 max_tokens；用简单完整请求并消费响应，避免极低输出上限
         # 或过早断流导致上游不把它算作正常窗口启动请求。
-        probe_model = self.models[0] if self.models else "gpt-5.2"
+        prov_cfg = _provider_cfg()
+        probe_cfg = prov_cfg.get("quotaProbe") if isinstance(prov_cfg.get("quotaProbe"), dict) else {}
+        fallback_model = str(probe_cfg.get("fallbackModel") or "gpt-5.2")
+        probe_model = self.models[0] if self.models else fallback_model
         test_body = {
             "model": probe_model,
-            "input": "hello",
-            "instructions": "Reply with a short hello.",
+            "input": str(probe_cfg.get("input") or "hello"),
+            "instructions": str(probe_cfg.get("instructions") or "Reply with a short hello."),
             # 不设 stream 让 transform 强制 stream=true
         }
         try:

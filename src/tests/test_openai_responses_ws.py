@@ -11,6 +11,7 @@ from src.tests import _isolation
 _isolation.isolate()
 
 import asyncio
+import base64
 import json
 import os
 import socket
@@ -22,6 +23,14 @@ from typing import Any
 import pytest
 
 
+def _valid_encrypted_content(seed: int = 1) -> str:
+    payload = bytearray(1 + 8 + 16 + 16 + 32)
+    payload[0] = 0x80
+    for i in range(9, len(payload)):
+        payload[i] = (seed + i) % 256
+    return base64.urlsafe_b64encode(bytes(payload)).decode("ascii").rstrip("=")
+
+
 def _import_modules():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if root not in sys.path:
@@ -31,7 +40,7 @@ def _import_modules():
     from src.openai.channel.registration import register_factories
     from src.openai.channel.api_channel import OpenAIApiChannel
     from src.channel.openai_oauth_channel import OpenAIOAuthChannel
-    from src.openai import responses_ws
+    from src.openai import responses_ws, reasoning_replay
     register_factories()
     return {
         "affinity": affinity,
@@ -47,6 +56,7 @@ def _import_modules():
         "OpenAIApiChannel": OpenAIApiChannel,
         "OpenAIOAuthChannel": OpenAIOAuthChannel,
         "responses_ws": responses_ws,
+        "reasoning_replay": reasoning_replay,
     }
 
 
@@ -65,6 +75,7 @@ def _setup(m):
     m["affinity"].client_init()
     m["cooldown"].init()
     m["scorer"].init()
+    m["reasoning_replay"].clear()
     cfg = {
         "apiKeys": {
             "ws-key": {
@@ -358,6 +369,21 @@ async def test_responses_ws_rejects_non_response_create_first_frame(m):
 
 
 @pytest.mark.asyncio
+async def test_responses_ws_rejects_background_true(m):
+    _setup(m)
+    _make_channel(m)
+    ws = FakeWebSocket({
+        "type": "response.create",
+        "model": "test-model",
+        "input": "hello",
+        "background": True,
+    })
+    await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+    assert ws.close_calls[-1][0] == 4400
+    assert "background" in ws.close_calls[-1][1]
+
+
+@pytest.mark.asyncio
 async def test_responses_ws_blacklist_before_first_visible_fails_over(monkeypatch, m):
     cfg = _setup(m)
     cfg["contentBlacklist"] = {"default": ["blocked-token"], "byChannel": {}}
@@ -608,7 +634,10 @@ def test_map_ws_create_frame_applies_model_guard_and_codex_transform(m):
         "model": "test-model",
         "input": "hello",
         "stream": True,
+        "generate": False,
         "background": False,
+        "unknown_provider_field": "drop",
+        "_api_key_name": "internal",
     }
     body = m["responses_ws"]._request_body_from_ws_create(obj)
     m["config"]._cache["apiKeys"]["ws-key"]["allowedModels"] = ["test-model"]
@@ -622,7 +651,10 @@ def test_map_ws_create_frame_applies_model_guard_and_codex_transform(m):
     mapped = m["responses_ws"]._map_ws_create_frame_for_upstream(obj, "real-model", channel=ch)
     assert mapped["type"] == "response.create"
     assert mapped["model"] == "real-model"
+    assert mapped["generate"] is False
     assert "background" not in mapped
+    assert "unknown_provider_field" not in mapped
+    assert "_api_key_name" not in mapped
 
     oauth = m["OpenAIOAuthChannel"]({
         "email": "x@example.com", "provider": "openai",
@@ -632,12 +664,17 @@ def test_map_ws_create_frame_applies_model_guard_and_codex_transform(m):
     })
     codex_mapped = m["responses_ws"]._map_ws_create_frame_for_upstream({
         "type": "response.create", "model": "test-model", "input": "hello",
-        "stream": True, "temperature": 1,
+        "stream": True, "generate": False, "temperature": 1, "background": False,
+        "unknown_provider_field": "drop", "_api_key_name": "internal",
     }, "test-model", channel=oauth)
     assert codex_mapped["store"] is False
     assert codex_mapped["stream"] is True
+    assert codex_mapped["generate"] is False
     assert codex_mapped["input"] == [{"type": "message", "role": "user", "content": "hello"}]
     assert "temperature" not in codex_mapped
+    assert "background" not in codex_mapped
+    assert "unknown_provider_field" not in codex_mapped
+    assert "_api_key_name" not in codex_mapped
 
 
 @pytest.mark.asyncio
@@ -1041,6 +1078,84 @@ async def test_http_responses_oauth_ws_stream_converts_frames_to_sse(monkeypatch
     assert row["http_status"] == 200
     assert row["upstream_protocol"] == "openai-responses"
     assert row["upstream_transport"] == "ws"
+
+
+@pytest.mark.asyncio
+async def test_http_responses_oauth_ws_invalid_replay_clears_scope_and_retries(monkeypatch, m):
+    cfg = _setup(m)
+    cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
+    cfg.setdefault("oauth", {})["providers"] = {"openai": {"isolateSessionId": True, "forceCodexCLI": True}}
+    ch = _make_oauth_channel_for_failover(m, name="replay-clear@example.com")
+    rr = m["reasoning_replay"]
+    encrypted_content = _valid_encrypted_content(11)
+    rr.cache_items(
+        "test-model",
+        "prompt-cache:anchor",
+        [{"type": "reasoning", "encrypted_content": encrypted_content}],
+    )
+
+    async def fake_token(account_key):
+        return "tok"
+
+    bad_ws = FakeOAuthHttpWs([
+        {"type": "error", "status": 400, "error": {
+            "code": "invalid_encrypted_content",
+            "message": (
+                "The encrypted content gAAA... could not be verified. "
+                "Reason: Encrypted content could not be decrypted or parsed."
+            ),
+        }},
+    ])
+    good_ws = FakeOAuthHttpWs([
+        {"type": "response.created", "response": {"id": "resp_retry"}},
+        {"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": "ok"},
+        {"type": "response.completed", "response": {
+            "id": "resp_retry",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+            "usage": {"input_tokens": 2, "output_tokens": 1},
+        }},
+    ])
+    attempts = [bad_ws, good_ws]
+
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+        return attempts.pop(0)
+
+    monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)
+    monkeypatch.setattr(m["failover"], "_connect_oauth_responses_ws", fake_connect)
+    body = {"model": "test-model", "stream": False, "input": "continue", "prompt_cache_key": "anchor"}
+    resp, rid = await _call_failover_responses(m, ch, body)
+
+    assert resp.status_code == 200
+    assert json.loads(resp.body)["output"][0]["content"][0]["text"] == "ok"
+    assert rr.get("test-model", "prompt-cache:anchor") == []
+    assert attempts == []
+
+    first_payload = json.loads(bad_ws.sent[0])
+    second_payload = json.loads(good_ws.sent[0])
+    assert first_payload["type"] == "response.create"
+    first_input = first_payload["input"]
+    assert [
+        item.get("encrypted_content")
+        for item in first_input
+        if isinstance(item, dict) and item.get("type") == "reasoning"
+    ] == [encrypted_content]
+    assert [
+        item
+        for item in first_input
+        if isinstance(item, dict)
+        and item.get("type") == "message"
+        and item.get("role") == "user"
+    ] == [{"type": "message", "role": "user", "content": "continue"}]
+    assert second_payload["type"] == "response.create"
+    assert second_payload["input"] == [
+        {"type": "message", "role": "user", "content": "continue"},
+    ]
+
+    detail = m["log_db"].log_detail(rid)
+    assert detail["log"]["status"] == "success", detail["log"]
+    assert detail["log"]["final_channel_key"] == ch.key
+    assert [item["outcome"] for item in detail["retry_chain"]] == ["request_invalid", "success"]
+    assert m["cooldown"].get_state(ch.key, "test-model") is None
 
 
 @pytest.mark.asyncio
