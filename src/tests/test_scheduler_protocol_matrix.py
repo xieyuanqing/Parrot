@@ -221,8 +221,77 @@ def test_responses_allowed_tools_with_hosted_nested_tool_keeps_anthropic_fallbac
         "OpenAI Responses→Chat hosted/stateful tools are not enabled yet: tool_choice:allowed_tools:web_search",
     ]
 
+def test_responses_tool_search_routes_only_to_explicit_codex_oauth_native(monkeypatch):
+    channels = [
+        _ch("oauth-r", "openai-responses", type="oauth"),
+        _ch("api-r", "openai-responses", type="api"),
+    ]
+    monkeypatch.setattr(scheduler.registry, "all_channels", lambda: channels)
+    monkeypatch.setattr(scheduler.cooldown, "is_blocked", lambda *_: False)
+    monkeypatch.setattr(scheduler.concurrency, "is_saturated", lambda *_: False)
 
-def test_responses_encrypted_reasoning_keeps_native_candidate_only(monkeypatch):
+    body = {
+        "model": "m",
+        "input": "hi",
+        "tools": [{"type": "tool_search", "execution": "client"}],
+    }
+    available, saturated, plans, guards = scheduler._filter_candidates("m", "responses", body=body)
+
+    assert [ch.key for ch, _ in available] == ["oauth-r"]
+    assert saturated == []
+    assert plans[("oauth-r", "real")].cost == 0
+    assert ("api-r", "real") not in plans
+    assert guards == [
+        "OpenAI Responses native route does not support requested server-side state: tool_search",
+    ]
+
+
+def test_responses_tool_choice_tool_search_routes_to_codex_oauth(monkeypatch):
+    channels = [_ch("oauth-r", "openai-responses", type="oauth")]
+    monkeypatch.setattr(scheduler.registry, "all_channels", lambda: channels)
+    monkeypatch.setattr(scheduler.cooldown, "is_blocked", lambda *_: False)
+    monkeypatch.setattr(scheduler.concurrency, "is_saturated", lambda *_: False)
+
+    body = {
+        "model": "m",
+        "input": "hi",
+        "tools": [{"type": "tool_search", "execution": "client"}],
+        "tool_choice": {"type": "tool_search"},
+    }
+    available, saturated, plans, guards = scheduler._filter_candidates("m", "responses", body=body)
+
+    assert [ch.key for ch, _ in available] == ["oauth-r"]
+    assert saturated == []
+    assert plans[("oauth-r", "real")].cost == 0
+    assert guards == []
+
+
+def test_responses_codex_oauth_still_rejects_other_hosted_tools(monkeypatch):
+    channels = [
+        _ch("oauth-r", "openai-responses", type="oauth"),
+        _ch("api-r", "openai-responses", type="api"),
+    ]
+    monkeypatch.setattr(scheduler.registry, "all_channels", lambda: channels)
+    monkeypatch.setattr(scheduler.cooldown, "is_blocked", lambda *_: False)
+    monkeypatch.setattr(scheduler.concurrency, "is_saturated", lambda *_: False)
+
+    body = {
+        "model": "m",
+        "input": "hi",
+        "tools": [{"type": "tool_search"}, {"type": "web_search"}],
+    }
+    available, saturated, plans, guards = scheduler._filter_candidates("m", "responses", body=body)
+
+    assert [ch.key for ch, _ in available] == ["api-r"]
+    assert saturated == []
+    assert ("oauth-r", "real") not in plans
+    assert plans[("api-r", "real")].cost == 0
+    assert guards == [
+        "OpenAI Responses native route does not support requested server-side state: web_search",
+    ]
+
+
+def test_responses_include_only_encrypted_reasoning_can_fallback(monkeypatch):
     channels = [_ch("a", "anthropic"), _ch("c", "openai-chat"), _ch("r", "openai-responses")]
     monkeypatch.setattr(scheduler.registry, "all_channels", lambda: channels)
     monkeypatch.setattr(scheduler.cooldown, "is_blocked", lambda *_: False)
@@ -231,14 +300,30 @@ def test_responses_encrypted_reasoning_keeps_native_candidate_only(monkeypatch):
     body = {"model": "m", "input": "hi", "include": ["reasoning.encrypted_content"]}
     available, saturated, plans, guards = scheduler._filter_candidates("m", "responses", body=body)
 
-    assert [ch.key for ch, _ in available] == ["r"]
+    assert [ch.key for ch, _ in available] == ["a", "c", "r"]
+    assert saturated == []
+    assert ("a", "real") in plans
+    assert ("c", "real") in plans
+    assert ("r", "real") in plans
+    assert guards == []
+
+
+def test_responses_encrypted_reasoning_input_can_fallback_to_chat(monkeypatch):
+    channels = [_ch("a", "anthropic"), _ch("c", "openai-chat"), _ch("r", "openai-responses")]
+    monkeypatch.setattr(scheduler.registry, "all_channels", lambda: channels)
+    monkeypatch.setattr(scheduler.cooldown, "is_blocked", lambda *_: False)
+    monkeypatch.setattr(scheduler.concurrency, "is_saturated", lambda *_: False)
+
+    body = {"model": "m", "input": [{"type": "reasoning", "encrypted_content": "gAAAA"}]}
+    available, saturated, plans, guards = scheduler._filter_candidates("m", "responses", body=body)
+
+    assert [ch.key for ch, _ in available] == ["c", "r"]
     assert saturated == []
     assert ("r", "real") in plans
+    assert ("c", "real") in plans
     assert ("a", "real") not in plans
-    assert ("c", "real") not in plans
     assert guards == [
         "OpenAI Responses→Anthropic include reasoning.encrypted_content / encrypted reasoning replay is not enabled yet",
-        "OpenAI Responses→Chat include reasoning.encrypted_content / encrypted reasoning replay is not enabled yet",
     ]
 
 

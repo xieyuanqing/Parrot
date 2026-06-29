@@ -5,7 +5,7 @@
   - 超时 / 错误阶梯 输入：合法 / 非法
   - 评分参数：4 字段各自修改（范围校验）
   - 亲和参数：TTL 字段
-  - CCH：disabled/dynamic/static 切换 + static 值编辑（hex 校验）
+  - CCH / OAuth 配额监控入口已迁移到 OAuth 账户设置，不再出现在系统设置
   - channelSelection 旧入口兼容：smart/order/priority 切换
   - 首包黑名单：加/删默认 + 加渠道专属
   - 整路径路由 + /settings 命令
@@ -70,16 +70,20 @@ def test_main_page(m):
     m["system_menu"].show(42, 100, "cb")
     edit = rec.last("editMessageText")
     text = edit["text"]
-    # 主页应含所有项；渠道选择已迁移为负载均衡入口
-    for s in ("超时", "错误阶梯", "评分", "亲和", "CCH", "调度", "黑名单"):
+    # 主页应含系统项；渠道选择已迁移为负载均衡入口，CCH/配额监控迁移到 OAuth 账户设置。
+    for s in ("超时", "错误阶梯", "评分", "亲和", "调度", "黑名单"):
         assert s in text, s
+    assert "CCH" not in text
+    assert "配额监控" not in text
     btns = [b["callback_data"] for row in edit["reply_markup"]["inline_keyboard"]
             for b in row if "callback_data" in b]
     expected = {"sys:show:timeouts", "sys:show:errwin", "sys:show:scoring",
-                "sys:show:affinity", "sys:show:cch", "menu:loadbalancing",
+                "sys:show:affinity", "menu:loadbalancing", "sys:show:notif",
                 "sys:show:blacklist", "sys:show:ws_mode", "menu:main"}
     for e in expected:
         assert e in btns, f"missing btn {e}"
+    assert "sys:show:cch" not in btns
+    assert "sys:show:quota" not in btns
     print("  [PASS] main settings page")
 
 
@@ -176,7 +180,7 @@ def test_affinity_fields(m):
     print("  [PASS] affinity fields")
 
 
-def test_cch_mode_switch_and_static(m):
+def test_cch_mode_switch(m):
     _reset(m)
     rec = _install(m)
     sm = m["system_menu"]
@@ -186,27 +190,17 @@ def test_cch_mode_switch_and_static(m):
     sm._on_cch_set(42, 100, "cb", "dynamic")
     assert m["config"].get()["cchMode"] == "dynamic"
 
-    sm._on_cch_set(42, 100, "cb", "static")
-    assert m["config"].get()["cchMode"] == "static"
-
-    # 编辑静态值
-    sm._edit_cch_static(42, 100, "cb")
-    sm._on_cch_static_input(42, "bad")  # 太短
-    assert m["states"].get_state(42) is not None
-    sm._on_cch_static_input(42, "abcde1")  # 太长
-    assert m["states"].get_state(42) is not None
-    sm._on_cch_static_input(42, "ghhij")  # 非 hex
-    assert m["states"].get_state(42) is not None
-    sm._on_cch_static_input(42, "a1b2c")
-    assert m["config"].get()["cchStaticValue"] == "a1b2c"
-
     sm._on_cch_set(42, 100, "cb", "disabled")
+    assert m["config"].get()["cchMode"] == "disabled"
+
+    # static 是历史测试模式，新 UI 不再允许切换。
+    sm._on_cch_set(42, 100, "cb", "static")
     assert m["config"].get()["cchMode"] == "disabled"
 
     # 无效模式
     sm._on_cch_set(42, 100, "cb", "bogus")
     assert m["config"].get()["cchMode"] == "disabled"
-    print("  [PASS] CCH mode + static value")
+    print("  [PASS] CCH mode switch")
 
 
 def test_chsel_switch(m):
@@ -325,7 +319,7 @@ def test_router_dispatch(m):
 
     rec.clear()
     m["bot"]._handle_callback({
-        "id": "cb2", "message": {"chat": {"id": 42}, "message_id": 100}, "data": "sys:show:cch",
+        "id": "cb2", "message": {"chat": {"id": 42}, "message_id": 100}, "data": "sys:show:timeouts",
     })
     assert rec.last("editMessageText") is not None
 
@@ -360,7 +354,6 @@ def main():
         test_errwin_edit,
         test_scoring_fields,
         test_affinity_fields,
-        test_cch_mode_switch_and_static,
         test_chsel_switch,
         test_blacklist_default_add_and_remove,
         test_blacklist_by_channel,

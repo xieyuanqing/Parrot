@@ -22,6 +22,7 @@ import json
 import math
 import re
 import secrets
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -124,11 +125,7 @@ def _replace_last_with_oauth_error(
     ).splitlines()
 
 
-def _fetch_and_save_usage_sync(ak: str, *, email: str | None = None):
-    """同步拉 usage 并写 quota cache；返回 usage 或 Exception。"""
-    usage = _run_sync(oauth_manager.fetch_usage(ak))
-    if isinstance(usage, Exception):
-        return usage
+def _save_usage_to_quota_cache(ak: str, usage: dict, *, email: str | None = None):
     try:
         state_db.quota_save(
             ak, oauth_manager.flatten_usage(usage),
@@ -136,7 +133,69 @@ def _fetch_and_save_usage_sync(ak: str, *, email: str | None = None):
         )
     except Exception as exc:
         return exc
-    return usage
+    return None
+
+
+def _fetch_and_save_usage_result_sync(ak: str, *, email: str | None = None, on_stage=None) -> dict:
+    """同步拉 usage；OpenAI 再拉 reset-card 明细；写入同一份 quota cache。
+
+    on_stage(stage, payload) 用于进度面板：
+      - usage_start / usage_done
+      - reset_start / reset_done / reset_error
+    """
+    provider = oauth_manager.provider_of(ak)
+    details = None
+    detail_error = None
+
+    def _stage(name: str, payload=None) -> None:
+        if on_stage is None:
+            return
+        try:
+            on_stage(name, payload)
+        except Exception:
+            pass
+
+    _stage("usage_start")
+    usage = _run_sync(oauth_manager.fetch_usage(ak))
+    if isinstance(usage, Exception):
+        return {"error": usage}
+    save_err = _save_usage_to_quota_cache(ak, usage, email=email)
+    if save_err is not None:
+        return {"error": save_err}
+    _stage("usage_done", usage)
+
+    if provider == "openai":
+        count = _openai_reset_credit_count_from_usage(usage)
+        if count is None or count > 0:
+            _stage("reset_start", usage)
+            details = _run_sync(oauth_manager.fetch_openai_rate_limit_reset_credits(ak))
+            if isinstance(details, Exception):
+                detail_error = details
+                old_details = _openai_reset_credit_details_from_row(state_db.quota_load(ak))
+                if old_details is not None:
+                    usage = oauth_manager.attach_openai_reset_credit_details_to_usage(
+                        usage, old_details, sync_available_count=False,
+                    )
+                    save_err = _save_usage_to_quota_cache(ak, usage, email=email)
+                    if save_err is not None:
+                        return {"error": save_err}
+                _stage("reset_error", detail_error)
+            elif isinstance(details, dict):
+                usage = oauth_manager.attach_openai_reset_credit_details_to_usage(usage, details)
+                save_err = _save_usage_to_quota_cache(ak, usage, email=email)
+                if save_err is not None:
+                    return {"error": save_err}
+                _stage("reset_done", details)
+        else:
+            _stage("reset_done", {"available_count": count, "data": []})
+
+    return {"usage": usage, "reset_credit_details": details, "reset_credit_error": detail_error}
+
+
+def _fetch_and_save_usage_sync(ak: str, *, email: str | None = None):
+    """同步拉 usage 并写 quota cache；返回 usage 或 Exception。"""
+    result = _fetch_and_save_usage_result_sync(ak, email=email)
+    return result.get("error") or result.get("usage")
 
 
 def _evaluate_quota_action(ak: str, usage: dict) -> dict | None:
@@ -174,6 +233,29 @@ def _openai_reset_credit_count_from_row(row: dict | None) -> int | None:
     return _openai_reset_credit_count_from_usage(usage)
 
 
+def _openai_reset_credit_details_from_usage(usage: dict | None) -> dict | None:
+    if not isinstance(usage, dict):
+        return None
+    openai = usage.get("openai")
+    details = openai.get("rate_limit_reset_credit_details") if isinstance(openai, dict) else None
+    if not isinstance(details, dict):
+        details = usage.get("rate_limit_reset_credit_details")
+    return details if isinstance(details, dict) else None
+
+
+def _openai_reset_credit_details_from_row(row: dict | None) -> dict | None:
+    if not row:
+        return None
+    raw = row.get("raw_data")
+    if not raw:
+        return None
+    try:
+        usage = json.loads(raw)
+    except Exception:
+        return None
+    return _openai_reset_credit_details_from_usage(usage)
+
+
 def _openai_reset_credit_label_from_row(row: dict | None, *, show_zero: bool = True) -> str:
     count = _openai_reset_credit_count_from_row(row)
     if count is None:
@@ -183,10 +265,272 @@ def _openai_reset_credit_label_from_row(row: dict | None, *, show_zero: bool = T
     return f"{count} 次"
 
 
-def _ensure_openai_metadata_for_ui(account_keys: list[str] | str, *, force: bool = False) -> None:
-    oauth_manager.ensure_openai_metadata_fresh_sync(
-        account_keys, force=force, min_interval_seconds=3600, timeout_s=5.0,
-    )
+def _openai_reset_credit_count_from_details(details: dict | None) -> int | None:
+    if not isinstance(details, dict):
+        return None
+    try:
+        return int(details.get("available_count"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _fetch_openai_reset_credit_details_for_ui(account_key: str,
+                                              *, cached_count: int | None = None):
+    """Fetch reset-card details for detail page; skip known-zero accounts."""
+    if cached_count is not None and cached_count <= 0:
+        return None
+    return _run_sync(oauth_manager.fetch_openai_rate_limit_reset_credits(account_key))
+
+
+def _reset_credit_type_label(reset_type: str | None) -> str:
+    mapping = {
+        "codex_rate_limits": "Codex 额度重置",
+        "codexRateLimits": "Codex 额度重置",
+    }
+    raw = str(reset_type or "").strip()
+    return mapping.get(raw, raw or "重置卡")
+
+
+def _reset_credit_status_label(status: str | None) -> str:
+    mapping = {
+        "available": "可用",
+        "redeeming": "兑换中",
+        "redeemed": "已使用",
+    }
+    raw = str(status or "").strip()
+    return mapping.get(raw, raw or "未知状态")
+
+
+def _format_reset_credit_cards_block(details, *, cached_count: int | None = None,
+                                     available_count_override: int | None = None) -> str:
+    if details is None:
+        display_count = available_count_override if available_count_override is not None else cached_count
+        if display_count is None or display_count <= 0:
+            return ""
+        return (
+            "<b>♻️ 官方重置卡</b>\n"
+            f"当前可用 <code>{display_count} 次</code>；"
+            "卡片明细尚未缓存，正在后台刷新。也可以点「刷新用量/重置卡」立即拉取。"
+        )
+    if isinstance(details, Exception):
+        display_count = available_count_override if available_count_override is not None else cached_count
+        if display_count is None or display_count <= 0:
+            return ""
+        return "<b>♻️ 官方重置卡</b>\n" + _oauth_error_html(
+            details, provider="openai", operation="rate_limit_reset_credit_details",
+            indent="",
+        )
+    if not isinstance(details, dict):
+        return ""
+
+    available_count = _openai_reset_credit_count_from_details(details)
+    display_count = available_count_override if available_count_override is not None else available_count
+    data = details.get("data")
+    if not isinstance(data, list):
+        data = []
+    if (display_count is None or display_count <= 0) and not data:
+        return ""
+
+    lines = ["<b>♻️ 官方重置卡</b>"]
+    # 刚消耗 reset credit 后，wham/usage 的 available_count 是本次重绘的权威值。
+    # 如果卡片明细端点存在短暂同步延迟并返回了更大的旧 count，宁可提示稍后刷新，
+    # 不展示可能已经被消耗掉的旧卡片，避免 TG 详情页残留误导。
+    if (
+        available_count_override is not None
+        and available_count is not None
+        and available_count > available_count_override
+    ):
+        if available_count_override <= 0:
+            return ""
+        lines.append(
+            f"当前可用 <code>{available_count_override} 次</code>；"
+            "卡片明细仍在同步，稍后刷新可查看最新列表。"
+        )
+        return "\n".join(lines)
+
+    if not data:
+        count_text = "未获取" if display_count is None else f"{display_count} 次"
+        lines.append(f"当前可用 <code>{ui.escape_html(count_text)}</code>，上游未返回卡片明细。")
+        return "\n".join(lines)
+
+    for idx, item in enumerate(data, start=1):
+        if not isinstance(item, dict):
+            continue
+        status = ui.escape_html(_reset_credit_status_label(item.get("status")))
+        reset_type = ui.escape_html(_reset_credit_type_label(item.get("reset_type")))
+        lines.append(f"{idx}. {status} · {reset_type}")
+        granted_at = item.get("granted_at")
+        expires_at = item.get("expires_at")
+        if granted_at:
+            lines.append(f"   发放: <code>{_format_bjt(str(granted_at))}</code>")
+        if expires_at:
+            lines.append(f"   过期: <code>{_fmt_time_full(str(expires_at))}</code>")
+        else:
+            lines.append("   过期: <code>上游未返回</code>")
+
+    footer_count = display_count if display_count is not None else available_count
+    if footer_count is not None and footer_count > len(data):
+        lines.append(f"仅展示前 <code>{len(data)}</code> 张；当前共 <code>{footer_count}</code> 张可用。")
+    return "\n".join(lines)
+
+
+
+_BACKGROUND_REFRESH_LOCK = threading.Lock()
+_BACKGROUND_REFRESH_INFLIGHT: set[str] = set()
+_METADATA_REFRESH_LOCK = threading.Lock()
+_METADATA_REFRESH_INFLIGHT: set[str] = set()
+
+
+def _access_refresh_throttle_seconds_for_ui() -> int:
+    qm = config.get().get("quotaMonitor") or {}
+    try:
+        return int(qm.get("accessRefreshThrottleSeconds", 180))
+    except Exception:
+        return 180
+
+
+def _quota_monitor_enabled_for_ui() -> bool:
+    qm = config.get().get("quotaMonitor") or {}
+    return bool(qm.get("enabled", False))
+
+
+def _quota_cache_is_stale_for_ui(row: dict | None) -> bool:
+    if not row:
+        return True
+    try:
+        fetched_at_ms = int(row.get("fetched_at") or 0)
+    except Exception:
+        fetched_at_ms = 0
+    if fetched_at_ms <= 0:
+        return True
+    age_s = (state_db.now_ms() - fetched_at_ms) / 1000.0
+    return age_s >= _access_refresh_throttle_seconds_for_ui()
+
+
+def _quota_cache_has_usage_signal(row: dict | None) -> bool:
+    if not row:
+        return False
+    for key in (
+        "five_hour_util", "seven_day_util", "thirty_day_util",
+        "sonnet_util", "opus_util", "extra_util",
+    ):
+        if row.get(key) is not None:
+            return True
+    return False
+
+
+def _should_refresh_account_for_ui(acc: dict | None) -> bool:
+    if not acc or not acc.get("email"):
+        return False
+    # 用户手动禁用 / auth_error 不做自动远端刷新；quota 禁用需要刷新，
+    # 否则缺 cache 时会一直显示“尚未获取”，也无法自动恢复。
+    return acc.get("disabled_reason") not in ("user", "auth_error")
+
+
+def _refreshable_account_keys_for_ui(accounts: list[dict]) -> list[str]:
+    return [_account_key(a) for a in accounts if _should_refresh_account_for_ui(a)]
+
+
+def _needs_initial_oauth_cache_sync_for_ui(account_key: str, *, include_details: bool = False) -> bool:
+    # 首拉只解决“完全没有有效 usage cache”的空白页问题。已有 quota
+    # 窗口数据时，即使 OpenAI reset-card 明细缺失，也不能同步覆盖旧快照；
+    # 否则会把响应头实时采样的 85%/98% 等配额状态改写成 mock/新 usage，
+    # 影响禁用判断。缺失的 reset-card 明细交给后台刷新或手动刷新按钮。
+    row = state_db.quota_load(account_key)
+    return not _quota_cache_has_usage_signal(row)
+
+
+def _needs_oauth_cache_refresh_for_ui(account_key: str) -> bool:
+    row = state_db.quota_load(account_key)
+    prov = oauth_manager.provider_of(account_key)
+    if row is None:
+        return True
+
+    stale = _quota_cache_is_stale_for_ui(row)
+    if prov == "openai":
+        count = _openai_reset_credit_count_from_row(row)
+        details = _openai_reset_credit_details_from_row(row)
+        # 旧缓存或 quotaMonitor 刷出的 usage 可能只有次数，没有卡片明细。
+        # OpenAI 页进入时后台补齐 usage + reset-card，UI 当前仍只读缓存。
+        if count is None:
+            return True
+        if count > 0 and details is None:
+            return True
+        if stale:
+            return True
+
+    if _quota_monitor_enabled_for_ui():
+        return False
+    return stale
+
+
+def _schedule_openai_metadata_for_ui(account_keys: list[str] | str, *, force: bool = False) -> None:
+    if isinstance(account_keys, str):
+        keys = [account_keys]
+    else:
+        keys = list(account_keys or [])
+    keys = [k for k in keys if k and oauth_manager.provider_of(k) == "openai"]
+    if not keys:
+        return
+    with _METADATA_REFRESH_LOCK:
+        pending = [k for k in keys if force or k not in _METADATA_REFRESH_INFLIGHT]
+        for k in pending:
+            _METADATA_REFRESH_INFLIGHT.add(k)
+    if not pending:
+        return
+
+    def _worker() -> None:
+        try:
+            oauth_manager.ensure_openai_metadata_fresh_sync(
+                pending, force=force, min_interval_seconds=3600, timeout_s=5.0,
+            )
+        except Exception as exc:
+            print(f"[oauth_menu] background openai metadata refresh failed: {exc}")
+        finally:
+            with _METADATA_REFRESH_LOCK:
+                for k in pending:
+                    _METADATA_REFRESH_INFLIGHT.discard(k)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _schedule_oauth_cache_refresh_for_ui(account_keys: list[str] | str, *, force: bool = False) -> None:
+    if isinstance(account_keys, str):
+        keys = [account_keys]
+    else:
+        keys = list(account_keys or [])
+    pending: list[str] = []
+    with _BACKGROUND_REFRESH_LOCK:
+        for ak in keys:
+            if not ak:
+                continue
+            if not force and not _needs_oauth_cache_refresh_for_ui(ak):
+                continue
+            if ak in _BACKGROUND_REFRESH_INFLIGHT:
+                continue
+            _BACKGROUND_REFRESH_INFLIGHT.add(ak)
+            pending.append(ak)
+    if not pending:
+        return
+
+    def _worker() -> None:
+        for ak in pending:
+            try:
+                email = _account_email(ak)
+                result = _fetch_and_save_usage_result_sync(ak, email=email)
+                if result.get("error") is not None:
+                    print(f"[oauth_menu] background quota refresh failed for {ak}: {result.get('error')}")
+                    continue
+                usage = result.get("usage")
+                if isinstance(usage, dict):
+                    _evaluate_quota_action(ak, usage)
+            except Exception as exc:
+                print(f"[oauth_menu] background quota refresh error for {ak}: {exc}")
+            finally:
+                with _BACKGROUND_REFRESH_LOCK:
+                    _BACKGROUND_REFRESH_INFLIGHT.discard(ak)
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 # ─── 时间 / 用量格式化 ────────────────────────────────────────────
@@ -271,6 +615,44 @@ def _this_month_start_ts() -> float:
 _USAGE_DETAIL_INDENT_LIST = "\u00a0" * 7
 # 详情页主行是 "⏱ 5h"（无前导空格、emoji 不同），单独校准。
 _USAGE_DETAIL_INDENT_BLOCK = "\u00a0" * 7
+
+_USAGE_DISPLAY_USED = "used"
+_USAGE_DISPLAY_REMAINING = "remaining"
+
+
+def _usage_display_mode() -> str:
+    """OAuth 用量展示口径。配置只影响 UI 展示，不改变 quota cache 存储。"""
+    mode = str(config.get().get("oauthUsageDisplayMode") or _USAGE_DISPLAY_USED).strip().lower()
+    return _USAGE_DISPLAY_REMAINING if mode == _USAGE_DISPLAY_REMAINING else _USAGE_DISPLAY_USED
+
+
+def _usage_display_label(mode: str | None = None) -> str:
+    mode = _usage_display_mode() if mode is None else mode
+    return "剩余用量" if mode == _USAGE_DISPLAY_REMAINING else "已使用量"
+
+
+def _usage_display_percent(util) -> float:
+    """把 state_db 中的 used% 转成当前 UI 模式下应展示的百分比。"""
+    try:
+        used = float(util)
+    except (TypeError, ValueError):
+        return 0.0
+    used = max(0.0, min(100.0, used))
+    if _usage_display_mode() == _USAGE_DISPLAY_REMAINING:
+        return max(0.0, 100.0 - used)
+    return used
+
+
+def _format_usage_value_html(util, *, decimals: int = 0) -> str:
+    pct = _usage_display_percent(util)
+    label = "剩余" if _usage_display_mode() == _USAGE_DISPLAY_REMAINING else "已用"
+    return f"{label} <b>{pct:.{decimals}f}%</b>"
+
+
+def _format_usage_value_text(util, *, decimals: int = 0) -> str:
+    pct = _usage_display_percent(util)
+    label = "剩余" if _usage_display_mode() == _USAGE_DISPLAY_REMAINING else "已用"
+    return f"{label} {pct:.{decimals}f}%"
 
 
 def _quota_window_since_ts(reset_iso: str | None, window_seconds: int, *, now_ts: float | None = None) -> float:
@@ -376,14 +758,14 @@ def _format_account_block(acc: dict) -> str:
         sd_util = row.get("seven_day_util")
         if fh_util is not None:
             reset = row.get("five_hour_reset")
-            lines.append(f"📊 5h: <b>{fh_util:.0f}%</b> · 重置 <code>{_fmt_time_full(reset)}</code>")
+            lines.append(f"📊 5h: {_format_usage_value_html(fh_util)} · 重置 <code>{_fmt_time_full(reset)}</code>")
             since_ts = _quota_window_since_ts(reset, 5 * 3600, now_ts=_now_ts)
             _d = _window_usage_detail(ak, since_ts, _USAGE_DETAIL_INDENT_LIST)
             if _d:
                 lines.append(_d)
         if sd_util is not None:
             reset = row.get("seven_day_reset")
-            lines.append(f"📊 7d: <b>{sd_util:.0f}%</b> · 重置 <code>{_fmt_time_full(reset)}</code>")
+            lines.append(f"📊 7d: {_format_usage_value_html(sd_util)} · 重置 <code>{_fmt_time_full(reset)}</code>")
             since_ts = _quota_window_since_ts(reset, 7 * 86400, now_ts=_now_ts)
             _d = _window_usage_detail(ak, since_ts, _USAGE_DETAIL_INDENT_LIST)
             if _d:
@@ -391,7 +773,7 @@ def _format_account_block(acc: dict) -> str:
         td_util = row.get("thirty_day_util")
         if td_util is not None:
             reset = row.get("thirty_day_reset")
-            lines.append(f"📊 30d: <b>{td_util:.0f}%</b> · 重置 <code>{_fmt_time_full(reset)}</code>")
+            lines.append(f"📊 30d: {_format_usage_value_html(td_util)} · 重置 <code>{_fmt_time_full(reset)}</code>")
         if fh_util is None and sd_util is None and td_util is None:
             lines.append("📊 用量: <i>尚未获取</i>")
     else:
@@ -436,12 +818,12 @@ def _format_account_block(acc: dict) -> str:
 def _format_usage_block(account_key: str) -> str:
     row = state_db.quota_load(account_key)
     if not row:
-        return "尚未获取用量（点「刷新用量」试试）"
+        return "尚未获取用量（点「刷新用量/重置卡」试试）"
 
     def _line(label: str, util, reset) -> Optional[str]:
         if util is None:
             return None
-        return f"{label}: {util:.0f}% (重置: {_format_reset_text(reset)})"
+        return f"{label}: {_format_usage_value_text(util)} (重置: {_format_reset_text(reset)})"
 
     out = []
     _now_ts = time.time()
@@ -467,25 +849,15 @@ def _format_usage_block(account_key: str) -> str:
                 if _d:
                     out.append(_d)
 
-    # OpenAI Codex 原始窗口（primary/secondary）：用量值与上方 5h/7d 一致，但展示
-    # 原始窗口时长（分钟）让 admin 能看到源数据（例如 primary=10080min=7d，secondary=300min=5h）。
-    codex_primary_pct = row.get("codex_primary_used_pct")
-    codex_primary_win = row.get("codex_primary_window_min")
-    codex_secondary_pct = row.get("codex_secondary_used_pct")
-    codex_secondary_win = row.get("codex_secondary_window_min")
-    if codex_primary_pct is not None or codex_secondary_pct is not None:
-        out.append("")
-        out.append("Codex 原始窗口:")
-        if codex_primary_pct is not None and codex_primary_win:
-            out.append(f"  primary ({codex_primary_win}min): {codex_primary_pct:.0f}%")
-        if codex_secondary_pct is not None and codex_secondary_win:
-            out.append(f"  secondary ({codex_secondary_win}min): {codex_secondary_pct:.0f}%")
-
     ex_used = row.get("extra_used")
     ex_limit = row.get("extra_limit")
     ex_util = row.get("extra_util")
     if ex_limit and ex_limit > 0:
-        out.append(f"💰 额外: ${ex_used or 0:.2f} / ${ex_limit:.2f} ({ex_util or 0:.1f}%)")
+        if _usage_display_mode() == _USAGE_DISPLAY_REMAINING:
+            remaining = max(0.0, float(ex_limit) - float(ex_used or 0))
+            out.append(f"💰 额外: 剩余 ${remaining:.2f} / ${ex_limit:.2f} ({_usage_display_percent(ex_util):.1f}%)")
+        else:
+            out.append(f"💰 额外: 已用 ${ex_used or 0:.2f} / ${ex_limit:.2f} ({_usage_display_percent(ex_util):.1f}%)")
 
     fetched = row.get("fetched_at")
     if fetched:
@@ -508,6 +880,222 @@ _FILTER_LABELS = {
     _FILTER_QUOTA: "限额",
     _FILTER_INVALID: "失效",
 }
+
+
+def _default_models_for_settings(family: str) -> list[str]:
+    cfg = config.get()
+    if family == "openai":
+        raw = (cfg.get("openaiOAuth") or {}).get("defaultModels") or []
+    else:
+        raw = cfg.get("oauthDefaultModels") or []
+    if not isinstance(raw, list):
+        return []
+    return [str(x) for x in raw if str(x).strip()]
+
+
+def _quota_monitor_values() -> tuple[bool, int, float]:
+    qm = config.get().get("quotaMonitor") or {}
+    enabled = bool(qm.get("enabled", False))
+    interval = int(qm.get("intervalSeconds", 60) or 60)
+    threshold = float(qm.get("disableThresholdPercent", 95) or 95)
+    return enabled, interval, threshold
+
+
+def _cch_enabled() -> bool:
+    # 新 UI 只保留 disabled / dynamic；历史 static 不再作为可选模式展示。
+    return str(config.get().get("cchMode", "disabled")) == "dynamic"
+
+
+def _cch_status_label() -> str:
+    return "✅ 已启用" if _cch_enabled() else "🚫 已关闭"
+
+
+def _usage_toggle_target_label() -> str:
+    target = _USAGE_DISPLAY_USED if _usage_display_mode() == _USAGE_DISPLAY_REMAINING else _USAGE_DISPLAY_REMAINING
+    return _usage_display_label(target)
+
+
+def _settings_text_and_kb() -> tuple[str, dict]:
+    anthropic_models = _default_models_for_settings("anthropic")
+    openai_models = _default_models_for_settings("openai")
+    mode_label = _usage_display_label()
+    quota_enabled, quota_interval, quota_threshold = _quota_monitor_values()
+    quota_status = "✅ 已启用" if quota_enabled else "🚫 已停用"
+    cch_enabled = _cch_enabled()
+    cch_action = "关闭" if cch_enabled else "开启"
+
+    def _models_line(models: list[str]) -> str:
+        if not models:
+            return "<i>(空)</i>"
+        return ui.escape_html(", ".join(models))
+
+    text = "\n".join([
+        "⚙️ <b>OAuth 账户设置</b>",
+        "",
+        f"🅰️ <b>Anthropic 可用模型</b> ({len(anthropic_models)}):",
+        _models_line(anthropic_models),
+        "",
+        f"🅾️ <b>OpenAI 可用模型</b>({len(openai_models)}):",
+        _models_line(openai_models),
+        "",
+        "🎭 <b>CCH 模式（Claude Code 伪装）</b>",
+        f"当前模式: {_cch_status_label()}",
+        "",
+        "📊 <b>用量显示模式</b>",
+        f"当前模式: {mode_label}",
+        "",
+        "📈 <b>OAuth 配额监控</b>",
+        f"状态: {quota_status}",
+        f"检查间隔: <code>{quota_interval}s</code>",
+        f"禁用阈值: <code>{quota_threshold:.0f}%</code>",
+    ])
+    rows = [
+        [ui.btn("✏ 修改Anthropic模型", "odm:edit:anthropic"),
+         ui.btn("✏ 修改OpenAI模型", "odm:edit:openai")],
+        [ui.btn("🖼 图片生成设置", "img:show"),
+         ui.btn("📈 配额监控", "oa:quota")],
+        [ui.btn(f"🎭 CCH模式：{cch_action}", "oa:cch_toggle"),
+         ui.btn(f"📊 显示: {_usage_toggle_target_label()}", "oa:usage_mode:toggle")],
+        [ui.btn("🏠 返回主菜单", "menu:main"),
+         ui.btn("◀ 返回OAuth账户", "menu:oauth")],
+    ]
+    return text, ui.inline_kb(rows)
+
+
+def on_settings(chat_id: int, message_id: int, cb_id: Optional[str] = None) -> None:
+    if cb_id is not None:
+        ui.answer_cb(cb_id)
+    text, kb = _settings_text_and_kb()
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_toggle_usage_display_mode(chat_id: int, message_id: int, cb_id: str) -> None:
+    old_mode = _usage_display_mode()
+    new_mode = _USAGE_DISPLAY_REMAINING if old_mode == _USAGE_DISPLAY_USED else _USAGE_DISPLAY_USED
+
+    def _mutate(cfg: dict) -> None:
+        cfg["oauthUsageDisplayMode"] = new_mode
+
+    config.update(_mutate)
+    ui.answer_cb(cb_id, f"已切换为{_usage_display_label(new_mode)}")
+    text, kb = _settings_text_and_kb()
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_toggle_cch_mode(chat_id: int, message_id: int, cb_id: str) -> None:
+    new_mode = "disabled" if _cch_enabled() else "dynamic"
+    config.update(lambda c: c.__setitem__("cchMode", new_mode))
+    ui.answer_cb(cb_id, "CCH 已开启" if new_mode == "dynamic" else "CCH 已关闭")
+    text, kb = _settings_text_and_kb()
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def _quota_menu_text_and_kb() -> tuple[str, dict]:
+    enabled, interval, threshold = _quota_monitor_values()
+    status = "✅ 已启用" if enabled else "🚫 已停用"
+    toggle_label = "🚫 停用" if enabled else "✅ 启用"
+    text = "\n".join([
+        "📈 <b>OAuth 配额监控</b>",
+        "",
+        f"状态: <b>{status}</b>",
+        f"检查间隔: <code>{interval}s</code>",
+        f"禁用阈值: <code>{threshold:.0f}%</code>",
+        "",
+        "<b>说明：</b>",
+        "• 启用后，每 N 秒拉一次每个 OAuth 账号的 usage",
+        "• 任一指标（5h / 7d / Sonnet 7d / Opus 7d）≥ 阈值则自动禁用账号",
+        "• resets_at 过后 + 全部指标 &lt; 阈值 → 自动恢复",
+        "",
+        "<i>⚠ 频繁请求 /api/oauth/usage 可能被 Anthropic 风控盯上；建议保持 ≥60s 间隔。</i>",
+    ])
+    rows = [
+        [ui.btn(toggle_label, "oa:quota_toggle")],
+        [ui.btn("✏ 修改间隔（秒）", "oa:edit:quota_interval"),
+         ui.btn("✏ 修改阈值（%）", "oa:edit:quota_threshold")],
+        [ui.btn("🏠 返回主菜单", "menu:main"),
+         ui.btn("◀ 返回账户设置", "oa:settings")],
+    ]
+    return text, ui.inline_kb(rows)
+
+
+def on_quota_menu(chat_id: int, message_id: int, cb_id: Optional[str] = None) -> None:
+    if cb_id is not None:
+        ui.answer_cb(cb_id)
+    text, kb = _quota_menu_text_and_kb()
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_quota_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
+    cur = bool((config.get().get("quotaMonitor") or {}).get("enabled", False))
+    new_val = not cur
+    config.update(lambda c: c.setdefault("quotaMonitor", {}).__setitem__("enabled", new_val))
+    ui.answer_cb(cb_id, "已启用" if new_val else "已停用")
+    text, kb = _quota_menu_text_and_kb()
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_edit_quota_interval(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    states.set_state(chat_id, "oa_quota_interval")
+    ui.edit(
+        chat_id, message_id,
+        "请输入配额监控间隔（秒，正整数，建议 ≥ 60）：",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "oa:quota")]]),
+    )
+
+
+def on_quota_interval_input(chat_id: int, text: str) -> None:
+    try:
+        v = int((text or "").strip())
+    except ValueError:
+        ui.send(chat_id, "❌ 非法数字，请重新输入：")
+        return
+    if v < 10:
+        ui.send(chat_id, "❌ 间隔不能小于 10 秒，请重新输入（建议 ≥ 60s 避免被风控）：")
+        return
+    if v > 86400:
+        ui.send(chat_id, "❌ 间隔不能超过 86400 秒（1 天），请重新输入：")
+        return
+    config.update(lambda c: c.setdefault("quotaMonitor", {}).__setitem__("intervalSeconds", v))
+    states.pop_state(chat_id)
+    ui.send(
+        chat_id, f"✅ 配额监控间隔已更新为 <code>{v}s</code>",
+        reply_markup=ui.inline_kb([[ui.btn("🏠 返回主菜单", "menu:main"), ui.btn("◀ 返回账户设置", "oa:settings")]]),
+    )
+
+
+def on_edit_quota_threshold(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    states.set_state(chat_id, "oa_quota_threshold")
+    ui.edit(
+        chat_id, message_id,
+        "请输入禁用阈值（百分比，1-100）：\n"
+        "<i>任一指标到达阈值即禁用该账号。常见值：90 / 95 / 98 / 99</i>",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "oa:quota")]]),
+    )
+
+
+def on_quota_threshold_input(chat_id: int, text: str) -> None:
+    try:
+        v = float((text or "").strip().rstrip("%"))
+    except ValueError:
+        ui.send(chat_id, "❌ 非法数字，请重新输入（如 98）：")
+        return
+    if v < 1 or v > 100:
+        ui.send(chat_id, "❌ 阈值需在 1-100 之间，请重新输入：")
+        return
+
+    def _mutate(cfg: dict) -> None:
+        qm = cfg.setdefault("quotaMonitor", {})
+        qm["disableThresholdPercent"] = v
+        qm["resumeThresholdPercent"] = v
+
+    config.update(_mutate)
+    states.pop_state(chat_id)
+    ui.send(
+        chat_id, f"✅ 配额禁用阈值已更新为 <code>{v:.0f}%</code>",
+        reply_markup=ui.inline_kb([[ui.btn("🏠 返回主菜单", "menu:main"), ui.btn("◀ 返回账户设置", "oa:settings")]]),
+    )
 
 
 def _normalize_filter(value: str | None) -> str:
@@ -673,33 +1261,38 @@ def _maybe_suffix_status_banner(text: str) -> str:
 def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL) -> tuple[str, dict]:
     accounts_all = oauth_manager.list_accounts()
     filter_key = _normalize_filter(filter_key)
-    # 按访问节流刷新所有账户的 usage（quotaMonitor.enabled=True 时内部跳过）
-    account_keys = [
-        _account_key(a) for a in accounts_all
-        if a.get("email") and not a.get("disabled_reason")
-    ]
+    # 页面只读本地缓存；缓存过期走后台刷新。完全缺 OpenAI usage cache
+    # 的场景由 show/on_view 先切到进度面板，避免在这里卡住 callback。
+    account_keys = _refreshable_account_keys_for_ui(accounts_all)
     if account_keys:
-        oauth_manager.ensure_quota_fresh_sync(account_keys)
-        openai_keys = [
-            ak for ak in account_keys
-            if oauth_manager.provider_of(ak) == "openai"
-        ]
-        if openai_keys:
-            _ensure_openai_metadata_for_ui(openai_keys)
         # 如果缓存已经显示 >= quotaMonitor 阈值，立即收敛账号状态，
-        # 不等 600s 后台监控下一轮。
+        # 不等 600s 后台监控下一轮。页面渲染只读缓存，不等待远端刷新。
         for ak in account_keys:
             try:
                 oauth_manager.evaluate_and_toggle_by_cached_quota(ak)
             except Exception as exc:
                 print(f"[oauth_menu] cached quota evaluate failed for {ak}: {exc}")
         accounts_all = oauth_manager.list_accounts()
+        account_keys = _refreshable_account_keys_for_ui(accounts_all)
+        _schedule_oauth_cache_refresh_for_ui(account_keys)
+        openai_keys = [
+            ak for ak in account_keys
+            if oauth_manager.provider_of(ak) == "openai"
+        ]
+        if openai_keys:
+            _schedule_openai_metadata_for_ui(openai_keys)
     total_all = len(accounts_all)
     normal = sum(1 for a in accounts_all if a.get("enabled", True) and not a.get("disabled_reason"))
     quota_disabled = sum(1 for a in accounts_all if a.get("disabled_reason") == "quota")
     user_disabled = sum(1 for a in accounts_all if a.get("disabled_reason") == "user")
     auth_err = sum(1 for a in accounts_all if a.get("disabled_reason") == "auth_error")
-    accounts = [a for a in accounts_all if _filter_account(a, filter_key)]
+    # 只有总账户数超过一页时才需要筛选；一页内全部看得见，强制回到全部视图。
+    show_filter_row = total_all > _PAGE_SIZE
+    if not show_filter_row:
+        filter_key = _FILTER_ALL
+        accounts = list(accounts_all)
+    else:
+        accounts = [a for a in accounts_all if _filter_account(a, filter_key)]
     total = len(accounts)
 
     # 冷却统计：按 oauth:email 聚合；一个账号只要有任何模型处于冷却，就计数一次
@@ -771,43 +1364,77 @@ def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL) -> tuple[str
             row_btns.append(ui.btn(f"{num}. {tag} {email}", f"oa:view:{_callback_payload(short, page, filter_key)}"))
         rows.append(row_btns)
 
-    # 翻页
-    pag_row = _build_pagination_row(page, total_pages, filter_key)
-    if accounts_all:
-        pag_row.append(ui.btn("↕ 排序", f"oa:sort:{page}:{filter_key}"))
-    if pag_row:
-        rows.append(pag_row)
+    # 翻页/排序：当前列表只有一页时不显示。
+    if total_pages > 1:
+        pag_row = _build_pagination_row(page, total_pages, filter_key)
+        if accounts_all:
+            pag_row.append(ui.btn("↕ 排序", f"oa:sort:{page}:{filter_key}"))
+        if pag_row:
+            rows.append(pag_row)
 
-    # 过滤按钮
-    rows.append([
-        ui.btn(f"全部{'√' if filter_key == _FILTER_ALL else ''}", _page_callback(1, _FILTER_ALL)),
-        ui.btn(f"可用{'√' if filter_key == _FILTER_AVAILABLE else ''}", _page_callback(1, _FILTER_AVAILABLE)),
-        ui.btn(f"限额{'√' if filter_key == _FILTER_QUOTA else ''}", _page_callback(1, _FILTER_QUOTA)),
-        ui.btn(f"失效{'√' if filter_key == _FILTER_INVALID else ''}", _page_callback(1, _FILTER_INVALID)),
-    ])
+    # 过滤按钮：总账户数超过一页时才显示。
+    if show_filter_row:
+        rows.append([
+            ui.btn(f"全部{'√' if filter_key == _FILTER_ALL else ''}", _page_callback(1, _FILTER_ALL)),
+            ui.btn(f"可用{'√' if filter_key == _FILTER_AVAILABLE else ''}", _page_callback(1, _FILTER_AVAILABLE)),
+            ui.btn(f"限额{'√' if filter_key == _FILTER_QUOTA else ''}", _page_callback(1, _FILTER_QUOTA)),
+            ui.btn(f"失效{'√' if filter_key == _FILTER_INVALID else ''}", _page_callback(1, _FILTER_INVALID)),
+        ])
 
     # 操作按钮（每页都有）
+    refresh_cb = f"oa:refresh_all:{page}" if filter_key == _FILTER_ALL else f"oa:refresh_all:{page}:{filter_key}"
     rows.append([
         ui.btn("➕ 新增账户", "oa:add"),
-        ui.btn("🔄 刷新全部用量", f"oa:refresh_all:{page}" if filter_key == _FILTER_ALL else f"oa:refresh_all:{page}:{filter_key}"),
+        ui.btn("🧨 移除失效", "oa:invalid:list"),
+        ui.btn("🔄 刷新用量/重置卡", refresh_cb),
     ])
-    # 只有存在 OAuth 账号的冷却条目时才显示"清除所有错误"（避免空操作按钮）
-    if cd_keys_any:
-        clear_cb = f"oa:clear_all_errors:{page}" if filter_key == _FILTER_ALL else f"oa:clear_all_errors:{page}:{filter_key}"
-        rows.append([ui.btn(f"🧹 清除所有账户错误（{len(cd_keys_any)} 个）", clear_cb)])
-    rows.append([ui.btn("🖼 图片生成", "img:show"), ui.btn("🧨 移除失效", "oa:invalid:list")])
-    rows.append([ui.btn("🧩 OAuth 默认模型", "odm:show"), ui.btn("◀ 返回主菜单", "menu:main")])
+    rows.append([
+        ui.btn("⚙️ 账户设置", "oa:settings"),
+        ui.btn("◀ 返回主菜单", "menu:main"),
+    ])
     return ui.truncate(_maybe_suffix_status_banner(text)), ui.inline_kb(rows)
 
 
 def show(chat_id: int, message_id: int, cb_id: Optional[str] = None, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     if cb_id is not None:
         ui.answer_cb(cb_id)
+    accounts = oauth_manager.list_accounts()
+    initial_keys = _initial_update_keys_for_ui(accounts)
+    if initial_keys:
+        # 初次没有 usage cache 时，先把当前面板切成进度面板，后台逐账号更新；
+        # 这样 callback 立刻返回，不会因为账号多/接口慢导致 TG 超时。
+        keys = _refreshable_account_keys_for_ui(accounts) or initial_keys
+        initial_items = [
+            _progress_account_block(ak, idx, "  等待更新...")
+            for idx, ak in enumerate(keys, 1)
+        ]
+        ui.edit(chat_id, message_id, _build_oauth_update_panel(initial_items))
+        _start_oauth_update_panel(
+            chat_id, message_id, keys, page=page, filter_key=filter_key,
+            final_target_message_id=message_id, background=True,
+        )
+        return
     text, kb = _list_text_and_kb(page=page, filter_key=filter_key)
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
 def send_new(chat_id: int, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
+    accounts = oauth_manager.list_accounts()
+    initial_keys = _initial_update_keys_for_ui(accounts)
+    if initial_keys:
+        keys = _refreshable_account_keys_for_ui(accounts) or initial_keys
+        initial_items = [
+            _progress_account_block(ak, idx, "  等待更新...")
+            for idx, ak in enumerate(keys, 1)
+        ]
+        resp = ui.send(chat_id, _build_oauth_update_panel(initial_items))
+        mid = (resp.get("result") or {}).get("message_id") if resp and resp.get("ok") else None
+        if mid is not None:
+            _start_oauth_update_panel(
+                chat_id, int(mid), keys, page=page, filter_key=filter_key,
+                final_target_message_id=int(mid), background=True,
+            )
+            return
     text, kb = _list_text_and_kb(page=page, filter_key=filter_key)
     ui.send(chat_id, text, reply_markup=kb)
 
@@ -1147,33 +1774,48 @@ def _format_month_stats_block(account_key: str) -> str:
 
 
 def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILTER_ALL,
-                        *, refresh_quota: bool = True) -> tuple[Optional[str], Optional[dict]]:
+                        *, refresh_quota: bool = True,
+                        reset_credit_count_override: int | None = None) -> tuple[Optional[str], Optional[dict]]:
     acc = oauth_manager.get_account(account_key)
     if acc is None:
         return None, None
     email = acc.get("email", "?")
 
-    if refresh_quota and not acc.get("disabled_reason"):
-        oauth_manager.ensure_quota_fresh_sync(account_key)
+    if refresh_quota and _should_refresh_account_for_ui(acc):
         try:
             oauth_manager.evaluate_and_toggle_by_cached_quota(account_key)
         except Exception as exc:
             print(f"[oauth_menu] cached quota evaluate failed for {account_key}: {exc}")
         acc = oauth_manager.get_account(account_key) or acc
+        if _should_refresh_account_for_ui(acc):
+            _schedule_oauth_cache_refresh_for_ui(account_key)
     if oauth_manager.provider_of(acc) == "openai":
-        _ensure_openai_metadata_for_ui(account_key)
+        _schedule_openai_metadata_for_ui(account_key)
         acc = oauth_manager.get_account(account_key) or acc
 
     icon = _status_icon(acc)
     reason = acc.get("disabled_reason") or "—"
     prov = oauth_manager.provider_of(acc)
+    quota_row = state_db.quota_load(account_key)
+    reset_credit_cached_count = _openai_reset_credit_count_from_row(quota_row) if prov == "openai" else None
+    reset_credit_effective_count = (
+        reset_credit_count_override
+        if reset_credit_count_override is not None else reset_credit_cached_count
+    )
+    reset_credit_details = _openai_reset_credit_details_from_row(quota_row) if prov == "openai" else None
     provider_line = ""
     if prov == "openai":
         plan = acc.get("plan_type") or "?"
         workspace = _openai_workspace_label(acc, force=True)
         ws_suffix = f"（{ui.escape_html(workspace)}）" if workspace and _openai_same_email_count(acc) > 1 else ""
         provider_line = f"🏷️ 套餐: <code>{ui.escape_html(plan)}{ws_suffix}</code>\n"
-        reset_label = _openai_reset_credit_label_from_row(state_db.quota_load(account_key), show_zero=True)
+        detail_count = _openai_reset_credit_count_from_details(reset_credit_details)
+        if reset_credit_effective_count is not None:
+            reset_label = f"{reset_credit_effective_count} 次"
+        elif detail_count is not None:
+            reset_label = f"{detail_count} 次"
+        else:
+            reset_label = _openai_reset_credit_label_from_row(quota_row, show_zero=True)
         provider_line += f"♻️ 官方重置次数: <code>{ui.escape_html(reset_label)}</code>\n"
         sub_exp = acc.get("subscription_expires_at") or ""
         if sub_exp:
@@ -1203,6 +1845,16 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         f"🔄 刷新: <code>{_format_bjt(acc.get('last_refresh'))}</code>\n\n"
         f"<b>📊 使用量</b>\n{_format_usage_block(account_key)}"
     )
+    reset_cards_block = (
+        _format_reset_credit_cards_block(
+            reset_credit_details,
+            cached_count=reset_credit_effective_count,
+            available_count_override=reset_credit_effective_count,
+        ) if prov == "openai" else ""
+    )
+    if reset_cards_block:
+        text += "\n\n" + reset_cards_block
+
     month_block = _format_month_stats_block(account_key)
     if month_block:
         text += "\n" + month_block
@@ -1230,7 +1882,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
     payload = _callback_payload(short, page, filter_key)
     rows = [
         [ui.btn("🔄 刷新 Token", f"oa:refresh_token:{payload}"),
-         ui.btn("📊 刷新用量",   f"oa:refresh_usage:{payload}")],
+         ui.btn("📊 刷新用量/重置卡",   f"oa:refresh_usage:{payload}")],
     ]
     if prov == "openai":
         rows.append([
@@ -1260,6 +1912,16 @@ def on_view(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1
         show(chat_id, message_id, page=page, filter_key=filter_key)
         return
     ui.answer_cb(cb_id)
+    acc = oauth_manager.get_account(ak)
+    if acc and _should_refresh_account_for_ui(acc) and oauth_manager.provider_of(acc) == "openai" and _needs_initial_oauth_cache_sync_for_ui(ak):
+        ui.edit(chat_id, message_id, _build_oauth_update_panel([
+            _progress_account_block(ak, 1, "  等待更新...")
+        ]))
+        _start_oauth_update_panel(
+            chat_id, message_id, [ak], page=page, filter_key=filter_key,
+            final_target_message_id=message_id, final_detail_account_key=ak, background=True,
+        )
+        return
     text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
     if text is None:
         _, email = _split_ak(ak)
@@ -1301,7 +1963,7 @@ def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str, page
                 reply_markup=kb)
 
 
-# ─── 刷新用量 ─────────────────────────────────────────────────────
+# ─── 刷新用量 / 重置卡 ─────────────────────────────────────────────
 
 def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     ak = _resolve_to_account_key(ui.resolve_code(short))
@@ -1311,15 +1973,20 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
     email = _account_email(ak)
     provider = oauth_manager.provider_of(ak)
     if provider == "openai":
-        ui.answer_cb(cb_id, "拉取 OpenAI 用量...")
+        ui.answer_cb(cb_id, "拉取 OpenAI 用量/重置卡...")
     else:
         ui.answer_cb(cb_id, "拉取中...")
 
-    usage_result = _fetch_and_save_usage_sync(ak, email=email)
-    if isinstance(usage_result, Exception):
+    refresh_result = _fetch_and_save_usage_result_sync(ak, email=email)
+    if refresh_result.get("error") is not None:
+        err = refresh_result["error"]
         ui.send(chat_id, _oauth_error_html(
-            usage_result, provider=provider, operation="fetch_usage",
+            err, provider=provider, operation="fetch_usage",
         ))
+        return
+    usage_result = refresh_result.get("usage")
+    if not isinstance(usage_result, dict):
+        ui.send(chat_id, "❌ 用量刷新失败：上游未返回有效数据")
         return
     quota_action = _evaluate_quota_action(ak, usage_result)
     metadata_action = None
@@ -1328,14 +1995,16 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
             ak, force=True, min_interval_seconds=0, timeout_s=5.0,
         ))
 
-    text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
+    text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key, refresh_quota=False)
     if not text:
         return
     if provider == "openai":
-        head = "✅ 已更新用量（wham/usage）"
+        head = "✅ 已更新用量/重置卡（wham/usage + reset-card）"
         reset_credit_count = _openai_reset_credit_count_from_usage(usage_result)
         if reset_credit_count is not None:
             head += f"\n♻️ 官方重置次数: <code>{reset_credit_count}</code>"
+        if refresh_result.get("reset_credit_error") is not None:
+            head += "\n⚠️ 重置卡明细刷新失败，已更新用量；稍后可再点「刷新用量/重置卡」。"
         if isinstance(metadata_action, dict) and metadata_action.get("action") == "updated":
             fields = metadata_action.get("fields") or {}
             if fields.get("plan_type"):
@@ -1489,7 +2158,16 @@ def on_reset_quota(chat_id: int, message_id: int, cb_id: str, short: str, page: 
             ))
             return
         outcome = result.get("outcome")
-        text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key, refresh_quota=False)
+        reset_credit_count_override = None
+        if outcome in ("reset", "alreadyRedeemed") and result.get("available_count") is not None:
+            try:
+                reset_credit_count_override = int(result.get("available_count"))
+            except (TypeError, ValueError):
+                reset_credit_count_override = None
+        text, kb = _detail_text_and_kb(
+            ak, page=page, filter_key=filter_key, refresh_quota=False,
+            reset_credit_count_override=reset_credit_count_override,
+        )
         if not text:
             return
         if outcome in ("reset", "alreadyRedeemed"):
@@ -1499,7 +2177,7 @@ def on_reset_quota(chat_id: int, message_id: int, cb_id: str, short: str, page: 
             quota_action = result.get("quota_action") or {}
             action = quota_action.get("action")
             if result.get("refresh_error"):
-                prefix += "⚠️ 最新额度刷新失败，未自动解除本地 quota 限制；请稍后点「刷新用量」重新确认。\n"
+                prefix += "⚠️ 最新额度刷新失败，未自动解除本地 quota 限制；请稍后点「刷新用量/重置卡」重新确认。\n"
             elif action == "resumed":
                 prefix += "✅ 已刷新最新额度，确认低于阈值；已自动解除 quota 禁用并清理模型冷却。\n"
             elif action == "kept_enabled":
@@ -1633,7 +2311,209 @@ def on_delete_exec(chat_id: int, message_id: int, cb_id: str, short: str, page: 
     show(chat_id, message_id, page=page, filter_key=filter_key)
 
 
-# ─── 刷新全部用量 ─────────────────────────────────────────────────
+def _initial_update_keys_for_ui(accounts: list[dict]) -> list[str]:
+    keys: list[str] = []
+    for acc in accounts:
+        if not _should_refresh_account_for_ui(acc):
+            continue
+        ak = _account_key(acc)
+        # 当前卡死问题来自 OpenAI 的 wham/reset-card 慢接口；只有完全没有
+        # OpenAI usage cache 时才切进度面板。已有缓存则直接显示旧值、后台刷新。
+        if oauth_manager.provider_of(acc) == "openai" and _needs_initial_oauth_cache_sync_for_ui(ak):
+            keys.append(ak)
+    return keys
+
+
+def _progress_account_block(account_key: str, idx: int, status_line: str | None = None) -> str:
+    acc = oauth_manager.get_account(account_key) or {"email": _account_email(account_key)}
+    block = _format_account_block(acc)
+    first, _, rest = block.partition("\n")
+    lines = [f"{idx}. {first}"]
+    if rest:
+        lines.append(rest)
+    if status_line:
+        lines.append(status_line)
+    return "\n".join(lines)
+
+
+def _build_oauth_update_panel(items: list[str], *, done: bool = False,
+                              success_count: int = 0, fail_count: int = 0,
+                              final_hint: str = "") -> str:
+    title = "✅ <b>OAuth账户信息更新完成</b>" if done else "🔄 <b>正在更新OAuth账户信息</b>"
+    lines = [title, ""]
+    lines.extend(items or ["暂无需要更新的账户。"])
+    if done:
+        lines.extend(["", f"📢 用量刷新完成 / 重置卡刷新完成：成功 {success_count} 个，失败 {fail_count} 个。"])
+        if final_hint:
+            lines.append(final_hint)
+    return ui.truncate("\n".join(lines))
+
+
+def _run_oauth_update_panel(chat_id: int, progress_mid: int, account_keys: list[str],
+                            *, page: int = 1, filter_key: str = _FILTER_ALL,
+                            final_target_message_id: int | None = None,
+                            final_detail_account_key: str | None = None,
+                            delete_progress_later: bool = False,
+                            send_fallback_summary: bool = False,
+                            show_transition_hint: bool = True) -> None:
+    account_keys = [ak for ak in account_keys if ak]
+    items = [
+        _progress_account_block(ak, idx, "  等待更新...")
+        for idx, ak in enumerate(account_keys, 1)
+    ]
+    success_count = 0
+    fail_count = 0
+
+    def _flush(done: bool = False, final_hint: str = "") -> None:
+        text = _build_oauth_update_panel(
+            items, done=done, success_count=success_count,
+            fail_count=fail_count, final_hint=final_hint,
+        )
+        if progress_mid == -1:
+            return
+        try:
+            ui.edit(chat_id, progress_mid, text)
+        except Exception:
+            pass
+
+    def _set_item(idx0: int, ak: str, status_line: str | None) -> None:
+        items[idx0] = _progress_account_block(ak, idx0 + 1, status_line)
+        _flush()
+
+    _flush()
+    for idx0, ak in enumerate(account_keys):
+        provider = oauth_manager.provider_of(ak)
+        acquired = False
+        with _BACKGROUND_REFRESH_LOCK:
+            if ak not in _BACKGROUND_REFRESH_INFLIGHT:
+                _BACKGROUND_REFRESH_INFLIGHT.add(ak)
+                acquired = True
+        if not acquired:
+            _set_item(idx0, ak, "  ⌛ 已有更新任务进行中，等待结果...")
+            deadline = time.time() + 120
+            while time.time() < deadline:
+                with _BACKGROUND_REFRESH_LOCK:
+                    busy = ak in _BACKGROUND_REFRESH_INFLIGHT
+                if not busy:
+                    break
+                time.sleep(0.5)
+            if _quota_cache_has_usage_signal(state_db.quota_load(ak)):
+                success_count += 1
+                _set_item(idx0, ak, "  ✅ 刷新成功")
+            else:
+                fail_count += 1
+                _set_item(idx0, ak, "  ⚠ 等待已有更新任务超时，稍后可重试")
+            continue
+
+        def _stage(stage: str, payload=None) -> None:
+            if stage == "usage_start":
+                _set_item(idx0, ak, "  ⌛ 正在更新用量数据...")
+            elif stage == "usage_done":
+                if provider == "openai":
+                    _set_item(idx0, ak, "  ⌛ 正在更新重置卡数据...")
+                else:
+                    _set_item(idx0, ak, "  ✅ 刷新成功")
+            elif stage == "reset_start":
+                _set_item(idx0, ak, "  ⌛ 正在更新重置卡数据...")
+            elif stage == "reset_done":
+                _set_item(idx0, ak, "  ✅ 刷新成功")
+            elif stage == "reset_error":
+                _set_item(idx0, ak, "  ⚠ 重置卡明细更新失败，已保留用量结果")
+
+        try:
+            result = _fetch_and_save_usage_result_sync(ak, email=_account_email(ak), on_stage=_stage)
+            if result.get("error") is not None:
+                fail_count += 1
+                err = _oauth_error_html(result["error"], provider=provider, operation="fetch_usage", indent="  ")
+                items[idx0] = _progress_account_block(ak, idx0 + 1) + "\n" + err
+                _flush()
+                continue
+            usage = result.get("usage")
+            if isinstance(usage, dict):
+                _evaluate_quota_action(ak, usage)
+            success_count += 1
+            if result.get("reset_credit_error") is not None and provider == "openai":
+                _set_item(idx0, ak, "  ⚠ 重置卡明细更新失败，已保留用量结果")
+            else:
+                _set_item(idx0, ak, "  ✅ 刷新成功")
+        except Exception as exc:
+            fail_count += 1
+            items[idx0] = _progress_account_block(ak, idx0 + 1, f"  ❌ 更新异常: <code>{ui.escape_html(str(exc))[:120]}</code>")
+            _flush()
+        finally:
+            with _BACKGROUND_REFRESH_LOCK:
+                _BACKGROUND_REFRESH_INFLIGHT.discard(ak)
+
+    final_hint = ""
+    if show_transition_hint:
+        final_hint = "正在打开 OAuth 列表..." if final_detail_account_key is None else "正在打开账户详情..."
+    _flush(done=True, final_hint=final_hint)
+
+    target_mid = final_target_message_id or progress_mid
+    try:
+        if final_detail_account_key:
+            text, kb = _detail_text_and_kb(
+                final_detail_account_key, page=page, filter_key=filter_key,
+                refresh_quota=False,
+            )
+        else:
+            text, kb = _list_text_and_kb(page=page, filter_key=filter_key)
+        if text and target_mid != -1:
+            ui.edit(chat_id, target_mid, text, reply_markup=kb)
+    except Exception as exc:
+        print(f"[oauth_menu] final panel render failed: {exc}")
+
+    if send_fallback_summary:
+        ui.send(chat_id, _build_oauth_update_panel(
+            items, done=True, success_count=success_count,
+            fail_count=fail_count, final_hint="",
+        ))
+
+    if delete_progress_later and progress_mid != -1:
+        def _delete_later():
+            try:
+                ui.delete_message(chat_id, progress_mid)
+            except Exception:
+                pass
+        threading.Timer(300.0, _delete_later).start()
+
+
+def _start_oauth_update_panel(chat_id: int, progress_mid: int, account_keys: list[str],
+                              *, page: int = 1, filter_key: str = _FILTER_ALL,
+                              final_target_message_id: int | None = None,
+                              final_detail_account_key: str | None = None,
+                              delete_progress_later: bool = False,
+                              send_fallback_summary: bool = False,
+                              show_transition_hint: bool = True,
+                              background: bool = True) -> None:
+    if not background:
+        _run_oauth_update_panel(
+            chat_id, progress_mid, account_keys,
+            page=page, filter_key=filter_key,
+            final_target_message_id=final_target_message_id,
+            final_detail_account_key=final_detail_account_key,
+            delete_progress_later=delete_progress_later,
+            send_fallback_summary=send_fallback_summary,
+            show_transition_hint=show_transition_hint,
+        )
+        return
+    threading.Thread(
+        target=_run_oauth_update_panel,
+        args=(chat_id, progress_mid, account_keys),
+        kwargs={
+            "page": page,
+            "filter_key": filter_key,
+            "final_target_message_id": final_target_message_id,
+            "final_detail_account_key": final_detail_account_key,
+            "delete_progress_later": delete_progress_later,
+            "send_fallback_summary": send_fallback_summary,
+            "show_transition_hint": show_transition_hint,
+        },
+        daemon=True,
+    ).start()
+
+
+# ─── 刷新全部用量 / 重置卡 ─────────────────────────────────────────────
 #
 # 交互：不覆盖原 OAuth 面板，而是新发一条「进度消息」追加式展示：
 #   ⌛ 正在刷新 xxx 账户用量...
@@ -1650,127 +2530,36 @@ def on_delete_exec(chat_id: int, message_id: int, cb_id: str, short: str, page: 
 # 5 分钟后后台 Timer 删除进度消息（失败静默）。
 
 def on_refresh_all(chat_id: int, message_id: int, cb_id: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
-    ui.answer_cb(cb_id, "开始刷新...")
+    ui.answer_cb(cb_id, "开始刷新用量/重置卡...")
     accounts = oauth_manager.list_accounts()
-    if not accounts:
-        ui.send(chat_id, "❌ 当前无 OAuth 账户可刷新")
+    account_keys = _refreshable_account_keys_for_ui(accounts)
+    if not account_keys:
+        ui.send(chat_id, "❌ 当前无可刷新的 OAuth 账户")
         return
 
-    lines: list[str] = ["🔄 <b>批量刷新 OAuth 用量</b>", ""]
-    success_count = 0
-    fail_count = 0
-    resp = ui.send(chat_id, "\n".join(lines + ["⌛ 初始化..."]))
+    initial_items = [
+        _progress_account_block(ak, idx, "  等待更新...")
+        for idx, ak in enumerate(account_keys, 1)
+    ]
+    resp = ui.send(chat_id, _build_oauth_update_panel(initial_items))
     if not resp or not resp.get("ok"):
         ui.send(chat_id, "❌ 无法创建进度消息")
         return
     progress_mid = (resp.get("result") or {}).get("message_id")
     if progress_mid is None:
-        # 测试 / 无真实 TG 响应时走纯 send 摘要模式（不 edit、不自删）
         progress_mid = -1
 
-    def _flush() -> None:
-        if progress_mid == -1:
-            return  # 无真实消息 id，不做中间态刷新（避免测试里刷屏）
-        try:
-            ui.edit(chat_id, progress_mid, "\n".join(lines))
-        except Exception:
-            pass
-
-    def _labels_for(usage: dict) -> str:
-        utils = oauth_manager.extract_utils_percent(usage)
-        tags = ["5h", "7d", "30d", "sonnet", "opus"]
-        parts = [f"{t} {u:.0f}%" for t, u in zip(tags, utils) if u is not None]
-        return " / ".join(parts) if parts else "无数据"
-
-    for idx, acc in enumerate(accounts, 1):
-        email = acc.get("email")
-        if not email:
-            continue
-        ak = _account_key(acc)
-        prov = oauth_manager.provider_of(acc)
-        prov_tag = "🅾 OpenAI" if prov == "openai" else "🅰 Claude"
-        ek = ui.escape_html(email)
-
-        lines.append(f"<b>{idx}. {ek}</b> · {prov_tag}")
-        lines.append(f"  ⌛ 正在刷新用量...")
-        _flush()
-
-        usage = None
-        # ─ 拉 usage ─
-        # OpenAI 用量刷新只需要 ensure_valid_token + wham/usage；不要在这里
-        # 无条件 force_refresh。refresh_token 即使失效，也不代表当前
-        # access_token 不能继续调用/拉用量，强刷会把“用量刷新”误报成 401。
-        result = _fetch_and_save_usage_sync(ak, email=email)
-        if isinstance(result, Exception):
-            fail_count += 1
-            _replace_last_with_oauth_error(
-                lines, result, provider=prov, operation="fetch_usage",
-            )
-            lines.append("")
-            _flush()
-            continue
-        usage = result
-
-        # ─ 写入进度 + 评估禁用/恢复 ─
-        success_count += 1
-        usage_str = _labels_for(usage)
-        lines[-1] = f"  ✅ 刷新成功: {usage_str}"
-
-        try:
-            res = oauth_manager.evaluate_and_toggle_by_usage(ak, usage)
-        except Exception as exc:
-            lines.append(f"  ⚠ 状态评估异常: <code>{ui.escape_html(str(exc))[:120]}</code>")
-            lines.append("")
-            _flush()
-            continue
-
-        action = res.get("action")
-        if action == "disabled":
-            hit = " / ".join(res.get("hit_windows") or []) or "?"
-            lines.append(f"  🔒 触发自动禁用（超限窗口: <code>{hit}</code>）")
-        elif action == "still_over_quota":
-            hit = " / ".join(res.get("hit_windows") or []) or "?"
-            lines.append(f"  ⚠ 仍未恢复，维持禁用（超限: <code>{hit}</code>）")
-        elif action == "resumed":
-            lines.append("  ♻ 额度已恢复，已自动解除禁用")
-        elif action == "noop_user":
-            lines.append("  🚫 手动禁用中（不自动恢复）")
-        elif action == "noop_auth_error":
-            lines.append("  ⚠ auth_error（不自动恢复，需重新登录）")
-        elif action == "disable_failed":
-            lines.append("  ❌ 自动禁用写入失败，见 systemd 日志")
-        elif action == "resume_failed":
-            lines.append("  ❌ 自动解禁写入失败，见 systemd 日志")
-        # "kept_enabled" / "noop_missing" 不追加额外行
-
-        lines.append("")
-        _flush()
-
-    lines.append(
-        f"📢 用量刷新完成：成功 {success_count} 个，失败 {fail_count} 个。"
+    # 真实 TG 有 message_id：后台刷新，避免 callback 长时间占住。
+    # 测试/降级无 message_id：同步跑完并追加一条最终摘要，保持可断言。
+    _start_oauth_update_panel(
+        chat_id, int(progress_mid), account_keys,
+        page=page, filter_key=filter_key,
+        final_target_message_id=message_id,
+        delete_progress_later=True,
+        send_fallback_summary=(progress_mid == -1),
+        show_transition_hint=False,
+        background=(progress_mid != -1),
     )
-    lines.append("本消息 5 分钟后自动销毁。")
-    _flush()
-
-    # ─ 刷新原始 OAuth 列表面板，让用户无需离开再进来 ─
-    try:
-        list_text, list_kb = _list_text_and_kb(page=page, filter_key=filter_key)
-        if list_text:
-            ui.edit(chat_id, message_id, list_text, reply_markup=list_kb)
-    except Exception:
-        pass
-
-    if progress_mid != -1:
-        import threading as _t
-        def _delete_later():
-            try:
-                ui.delete_message(chat_id, progress_mid)
-            except Exception:
-                pass
-        _t.Timer(300.0, _delete_later).start()
-    else:
-        # 降级路径：无法 edit 时用一条摘要消息兜底（保留老测试可见性）
-        ui.send(chat_id, "\n".join(lines))
 
 
 # ─── 新增账户：入口 ──────────────────────────────────────────────
@@ -2806,6 +3595,27 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data == "menu:oauth":
         show(chat_id, message_id, cb_id)
         return True
+    if data == "oa:settings":
+        on_settings(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:usage_mode:toggle":
+        on_toggle_usage_display_mode(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:cch_toggle":
+        on_toggle_cch_mode(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:quota":
+        on_quota_menu(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:quota_toggle":
+        on_quota_toggle(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:edit:quota_interval":
+        on_edit_quota_interval(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:edit:quota_threshold":
+        on_edit_quota_threshold(chat_id, message_id, cb_id)
+        return True
     if data == "oa:refresh_all" or data.startswith("oa:refresh_all:"):
         page, filter_key = _parse_page_filter(data[len("oa:refresh_all:"):] if data.startswith("oa:refresh_all:") else "")
         on_refresh_all(chat_id, message_id, cb_id, page=page, filter_key=filter_key)
@@ -2956,6 +3766,12 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
         return True
     if action == "oa_emax":
         on_edit_max_concurrent_input(chat_id, text)
+        return True
+    if action == "oa_quota_interval":
+        on_quota_interval_input(chat_id, text)
+        return True
+    if action == "oa_quota_threshold":
+        on_quota_threshold_input(chat_id, text)
         return True
     return False
 

@@ -70,6 +70,12 @@ def _setup(m):
     def _reset(c):
         c.setdefault("oauth", {})["mockMode"] = True
         c["oauthAccounts"] = []
+        c["oauthUsageDisplayMode"] = "used"
+        c["cchMode"] = "disabled"
+        c.setdefault("quotaMonitor", {})["enabled"] = False
+        c.setdefault("quotaMonitor", {})["intervalSeconds"] = 60
+        c.setdefault("quotaMonitor", {})["disableThresholdPercent"] = 95
+        c.setdefault("quotaMonitor", {})["resumeThresholdPercent"] = 95
     m["config"].update(_reset)
     # 清 quota 缓存 / 模型冷却
     for row in m["state_db"].quota_load_all():
@@ -174,17 +180,19 @@ def test_list_empty_and_populated(m):
     kb = last["reply_markup"]["inline_keyboard"]
     flat = [b["callback_data"] for row in kb for b in row if "callback_data" in b]
     assert "oa:add" in flat
+    assert "oa:invalid:list" in flat
     assert "oa:refresh_all:1" in flat
+    assert "oa:settings" in flat
     assert "menu:main" in flat
-    assert "oa:page:1" in flat
-    assert "oa:page:1:available" in flat
-    assert "oa:page:1:quota" in flat
-    assert "oa:page:1:invalid" in flat
+    assert "oa:page:1" not in flat
+    assert "oa:page:1:available" not in flat
+    assert "oa:page:1:quota" not in flat
+    assert "oa:page:1:invalid" not in flat
     texts = [b["text"] for row in kb for b in row if "text" in b]
-    assert "全部√" in texts
-    assert "可用" in texts
-    assert "限额" in texts
-    assert "失效" in texts
+    assert "➕ 新增账户" in texts
+    assert "🧨 移除失效" in texts
+    assert "🔄 刷新用量/重置卡" in texts
+    assert "⚙️ 账户设置" in texts
 
     # 添加两个账户后再渲染
     _add_fake_account(m, "user1@x.com")
@@ -200,7 +208,7 @@ def test_list_empty_and_populated(m):
     assert "缓存 50 (31.2%)" in last["text"]
     assert "⏳ Token" not in last["text"]
     flat = [b["callback_data"] for row in last["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
-    assert "oa:sort:1:all" in flat
+    assert "oa:sort:1:all" not in flat
     # 每个账户一个按钮
     email_btns = [
         b for row in last["reply_markup"]["inline_keyboard"]
@@ -280,8 +288,8 @@ def test_view_detail_with_quota_cache(m):
     m["oauth_menu"].on_view(42, 100, "cb", short)
     last = rec.last("editMessageText")
     assert last and "alice@x.com" in last["text"]
-    assert "5h: 12%" in last["text"]
-    assert "7d: 45%" in last["text"]
+    assert "5h: 已用 12%" in last["text"]
+    assert "7d: 已用 45%" in last["text"]
     assert "缓存 50 (31.2%)" in last["text"]
     assert "↑ 160 · ↓ 20" in last["text"]
     # 详情按钮
@@ -309,18 +317,120 @@ def test_missing_reset_shows_upstream_not_returned(m):
     rec = _install_recorder(m)
     m["oauth_menu"].show(42, 100)
     list_text = rec.last("editMessageText")["text"]
-    assert "📊 5h: <b>0%</b> · 重置 <code>?</code>" in list_text
-    assert "📊 7d: <b>45%</b> · 重置 <code>?</code>" in list_text
+    assert "📊 5h: 已用 <b>0%</b> · 重置 <code>?</code>" in list_text
+    assert "📊 7d: 已用 <b>45%</b> · 重置 <code>?</code>" in list_text
 
     rec.clear()
     short = m["ui"].register_code("missing-reset@x.com")
     m["oauth_menu"].on_view(42, 100, "cb", short)
     detail_text = rec.last("editMessageText")["text"]
-    assert "⏱ 5h: 0% (重置: 上游未返回)" in detail_text
-    assert "📅 7d: 45% (重置: 上游未返回)" in detail_text
-    assert "🤖 Sonnet 7d: 0% (重置: 上游未返回)" in detail_text
-    assert "🧠 Opus 7d: 0% (重置: 上游未返回)" in detail_text
+    assert "⏱ 5h: 已用 0% (重置: 上游未返回)" in detail_text
+    assert "📅 7d: 已用 45% (重置: 上游未返回)" in detail_text
+    assert "🤖 Sonnet 7d: 已用 0% (重置: 上游未返回)" in detail_text
+    assert "🧠 Opus 7d: 已用 0% (重置: 上游未返回)" in detail_text
     print("  [PASS] missing reset renders current list fallback + 上游未返回 in detail")
+
+
+def test_settings_usage_display_mode_toggle(m):
+    _setup(m)
+    _add_fake_account(m, "mode@x.com")
+    m["state_db"].quota_save("mode@x.com", {
+        "fetched_at": m["state_db"].now_ms(),
+        "five_hour_util": 20.0, "five_hour_reset": None,
+        "seven_day_util": 60.0, "seven_day_reset": None,
+        "raw_data": "{}",
+    })
+    rec = _install_recorder(m)
+
+    m["oauth_menu"].on_settings(42, 100, "cb-settings")
+    settings = rec.last("editMessageText")
+    assert settings and "OAuth 账户设置" in settings["text"]
+    assert "Anthropic 可用模型" in settings["text"]
+    assert "OpenAI 可用模型" in settings["text"]
+    assert "📊 <b>用量显示模式</b>" in settings["text"]
+    assert "当前模式: 已使用量" in settings["text"]
+    assert "CCH 模式（Claude Code 伪装）" in settings["text"]
+    assert "当前模式: 🚫 已关闭" in settings["text"]
+    assert "OAuth 配额监控" in settings["text"]
+    assert "状态: 🚫 已停用" in settings["text"]
+    texts = [b["text"] for row in settings["reply_markup"]["inline_keyboard"] for b in row]
+    assert "✏ 修改Anthropic模型" in texts
+    assert "✏ 修改OpenAI模型" in texts
+    assert "🖼 图片生成设置" in texts
+    assert "📈 配额监控" in texts
+    assert "🎭 CCH模式：开启" in texts
+    assert "📊 显示: 剩余用量" in texts
+
+    rec.clear()
+    assert m["oauth_menu"].handle_callback(42, 100, "cb-toggle", "oa:usage_mode:toggle") is True
+    assert m["config"].get()["oauthUsageDisplayMode"] == "remaining"
+    toggled = rec.last("editMessageText")
+    assert toggled and "当前模式: 剩余用量" in toggled["text"]
+    texts = [b["text"] for row in toggled["reply_markup"]["inline_keyboard"] for b in row]
+    assert "📊 显示: 已使用量" in texts
+
+    rec.clear()
+    m["oauth_menu"].show(42, 100)
+    list_text = rec.last("editMessageText")["text"]
+    assert "📊 5h: 剩余 <b>80%</b>" in list_text
+    assert "📊 7d: 剩余 <b>40%</b>" in list_text
+
+    rec.clear()
+    short = m["ui"].register_code("mode@x.com")
+    m["oauth_menu"].on_view(42, 100, "cb", short)
+    detail_text = rec.last("editMessageText")["text"]
+    assert "⏱ 5h: 剩余 80%" in detail_text
+    assert "📅 7d: 剩余 40%" in detail_text
+    print("  [PASS] OAuth settings toggles usage display mode and persists config")
+
+
+def test_settings_cch_and_quota_monitor_controls(m):
+    _setup(m)
+    rec = _install_recorder(m)
+    om = m["oauth_menu"]
+
+    assert om.handle_callback(42, 100, "cb-cch", "oa:cch_toggle") is True
+    assert m["config"].get()["cchMode"] == "dynamic"
+    text = rec.last("editMessageText")["text"]
+    assert "当前模式: ✅ 已启用" in text
+    texts = [b["text"] for row in rec.last("editMessageText")["reply_markup"]["inline_keyboard"] for b in row]
+    assert "🎭 CCH模式：关闭" in texts
+
+    rec.clear()
+    assert om.handle_callback(42, 100, "cb-quota", "oa:quota") is True
+    quota = rec.last("editMessageText")
+    assert quota and "OAuth 配额监控" in quota["text"]
+    flat = [b["callback_data"] for row in quota["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
+    assert "oa:quota_toggle" in flat
+    assert "oa:edit:quota_interval" in flat
+    assert "oa:edit:quota_threshold" in flat
+    assert "oa:settings" in flat and "menu:main" in flat
+
+    rec.clear()
+    assert om.handle_callback(42, 100, "cb-quota-toggle", "oa:quota_toggle") is True
+    assert m["config"].get()["quotaMonitor"]["enabled"] is True
+    assert "状态: <b>✅ 已启用</b>" in rec.last("editMessageText")["text"]
+
+    rec.clear()
+    assert om.handle_callback(42, 100, "cb-edit-int", "oa:edit:quota_interval") is True
+    assert m["states"].get_state(42)["action"] == "oa_quota_interval"
+    om.handle_text_state(42, "oa_quota_interval", "600")
+    assert m["states"].get_state(42) is None
+    assert m["config"].get()["quotaMonitor"]["intervalSeconds"] == 600
+    result = rec.last("sendMessage")
+    assert result and "600s" in result["text"]
+    btns = [b["callback_data"] for row in result["reply_markup"]["inline_keyboard"] for b in row]
+    assert btns == ["menu:main", "oa:settings"]
+
+    rec.clear()
+    assert om.handle_callback(42, 100, "cb-edit-th", "oa:edit:quota_threshold") is True
+    assert m["states"].get_state(42)["action"] == "oa_quota_threshold"
+    om.handle_text_state(42, "oa_quota_threshold", "98")
+    assert m["states"].get_state(42) is None
+    qm = m["config"].get()["quotaMonitor"]
+    assert qm["disableThresholdPercent"] == 98.0
+    assert qm["resumeThresholdPercent"] == 98.0
+    print("  [PASS] OAuth settings CCH toggle + quota monitor submenu")
 
 
 def test_refresh_token_updates_access_and_usage(m):
@@ -444,7 +554,19 @@ def test_openai_reset_credit_count_display_in_list_and_detail(m):
         "five_hour_reset": "2026-06-25T13:30:00Z",
         "seven_day_util": 44.0,
         "seven_day_reset": "2026-06-28T10:00:00Z",
-        "raw_data": json.dumps({"openai": {"rate_limit_reset_credits": {"available_count": 2}}}),
+        "raw_data": json.dumps({"openai": {
+            "rate_limit_reset_credits": {"available_count": 2},
+            "rate_limit_reset_credit_details": {
+                "available_count": 2,
+                "data": [{
+                    "id": "card-1",
+                    "reset_type": "codex_rate_limits",
+                    "status": "available",
+                    "granted_at": "2026-06-17T00:00:00Z",
+                    "expires_at": "2026-07-17T00:00:00Z",
+                }],
+            },
+        }}),
     }, email="show-reset@x.com")
 
     rec = _install_recorder(m)
@@ -457,6 +579,10 @@ def test_openai_reset_credit_count_display_in_list_and_detail(m):
     m["oauth_menu"].on_view(42, 100, "cb", short)
     detail = rec.last("editMessageText")
     assert detail and "♻️ 官方重置次数: <code>2 次</code>" in detail["text"]
+    assert "♻️ 官方重置卡" in detail["text"]
+    assert "Codex 额度重置" in detail["text"]
+    assert "发放:" in detail["text"] and "过期:" in detail["text"]
+    assert "Codex 原始窗口" not in detail["text"]
     detail_rows = detail["reply_markup"]["inline_keyboard"]
     action_row = next(row for row in detail_rows if any(b.get("callback_data", "").startswith("oa:reset_quota_ask:") for b in row))
     assert [b["text"] for b in action_row] == ["⚡ 并发上限", "♻️ 重置次数"]
@@ -515,7 +641,77 @@ def test_openai_reset_credit_count_display_in_list_and_detail(m):
     m["oauth_menu"].on_view(42, 100, "cb", short0)
     detail0 = rec.last("editMessageText")
     assert detail0 and "♻️ 官方重置次数: <code>0 次</code>" in detail0["text"]
+    assert "♻️ 官方重置卡" not in detail0["text"]
     print("  [PASS] openai reset credits shown in list/detail; list hides 0")
+
+
+def test_quota_disabled_openai_missing_cache_sync_fetches_usage_and_reset_cards(m):
+    _setup(m)
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _add_openai_fake_account(m, "missing-cache@x.com", enabled=False, disabled_reason="quota", disabled_until=future)
+    ak = _account_key_for(m, "missing-cache@x.com")
+    assert m["state_db"].quota_load(ak) is None
+
+    rec = _install_recorder(m)
+    m["oauth_menu"].show(42, 100)
+
+    row = None
+    for _ in range(20):
+        row = m["state_db"].quota_load(ak)
+        if row is not None:
+            break
+        import time as _time
+        _time.sleep(0.05)
+    assert row is not None
+    assert row.get("five_hour_util") is not None
+    raw = json.loads(row.get("raw_data") or "{}")
+    openai = raw.get("openai") or {}
+    assert (openai.get("rate_limit_reset_credits") or {}).get("available_count") == 2
+    assert (openai.get("rate_limit_reset_credit_details") or {}).get("data")
+    text = rec.last("editMessageText")["text"]
+    assert "missing-cache@x.com" in text
+    assert "尚未获取" not in text
+    assert "官方重置次数" in text
+    print("  [PASS] quota-disabled OpenAI missing cache gets initial usage/reset-card sync")
+
+
+def test_openai_reset_credit_cards_block_uses_post_consume_count_override(m):
+    _setup(m)
+    block = m["oauth_menu"]._format_reset_credit_cards_block(
+        {
+            "available_count": 2,
+            "data": [
+                {
+                    "id": "old-card-1",
+                    "reset_type": "codex_rate_limits",
+                    "status": "available",
+                    "granted_at": "2026-06-17T00:00:00Z",
+                    "expires_at": "2026-07-17T00:00:00Z",
+                },
+                {
+                    "id": "old-card-2",
+                    "reset_type": "codex_rate_limits",
+                    "status": "available",
+                    "granted_at": "2026-06-18T00:00:00Z",
+                    "expires_at": "2026-07-18T00:00:00Z",
+                },
+            ],
+        },
+        cached_count=1,
+        available_count_override=1,
+    )
+    assert "当前可用 <code>1 次</code>" in block
+    assert "仍在同步" in block
+    assert "old-card" not in block
+    assert "发放:" not in block
+
+    hidden = m["oauth_menu"]._format_reset_credit_cards_block(
+        {"available_count": 1, "data": [{"status": "available"}]},
+        cached_count=0,
+        available_count_override=0,
+    )
+    assert hidden == ""
+    print("  [PASS] reset-card post-consume count override avoids stale card list")
 
 
 def test_openai_official_reset_credit_ask_and_confirm(m):
@@ -523,6 +719,25 @@ def test_openai_official_reset_credit_ask_and_confirm(m):
     future = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     _add_openai_fake_account(m, "quota-openai@x.com", enabled=False, disabled_reason="quota", disabled_until=future)
     ak = _account_key_for(m, "quota-openai@x.com")
+    m["state_db"].quota_save(ak, {
+        "fetched_at": m["state_db"].now_ms(),
+        "five_hour_util": 99.0,
+        "five_hour_reset": future,
+        "seven_day_util": 20.0,
+        "raw_data": json.dumps({"openai": {
+            "rate_limit_reset_credits": {"available_count": 2},
+            "rate_limit_reset_credit_details": {
+                "available_count": 2,
+                "data": [{
+                    "id": "card-1",
+                    "reset_type": "codex_rate_limits",
+                    "status": "available",
+                    "granted_at": "2026-06-17T00:00:00Z",
+                    "expires_at": "2026-07-17T00:00:00Z",
+                }],
+            },
+        }}),
+    }, email="quota-openai@x.com")
     m["cooldown"].record_error(
         f"oauth:{ak}", "gpt-5-codex", "quota",
         cooldown_until=m["state_db"].now_ms() + 600_000,
@@ -626,7 +841,7 @@ def test_refresh_all_usage(m):
     final = sent[-1] if sent else ""
     assert "u1@x.com" in final and "u2@x.com" in final, final[:500]
     assert final.count("✅ 刷新成功") >= 2, final[:500]
-    assert "用量刷新完成" in final, final[:500]
+    assert "用量刷新完成 / 重置卡刷新完成" in final, final[:500]
     print("  [PASS] refresh_all 两个账户都写入了 quota 缓存")
 
 
@@ -760,6 +975,7 @@ def test_oauth_filter_preserved_through_detail(m):
     _setup(m)
     _add_fake_account(m, "ok1@x.com")
     _add_fake_account(m, "ok2@x.com")
+    _add_fake_account(m, "ok3@x.com")
     _add_fake_account(m, "quota@x.com", enabled=False, disabled_reason="quota")
     _add_fake_account(m, "bad@x.com", enabled=False, disabled_reason="auth_error")
     rec = _install_recorder(m)
@@ -912,12 +1128,15 @@ def main():
         test_list_empty_and_populated,
         test_oauth_sort_reorders_accounts,
         test_view_detail_with_quota_cache,
+        test_settings_usage_display_mode_toggle,
+        test_settings_cch_and_quota_monitor_controls,
         test_refresh_token_updates_access_and_usage,
         test_refresh_usage_only,
         test_toggle_disable_then_enable,
         test_reset_quota_button_and_callback,
         test_quota_window_since_uses_reset_minus_window_with_fallback,
         test_openai_reset_credit_count_display_in_list_and_detail,
+        test_openai_reset_credit_cards_block_uses_post_consume_count_override,
         test_openai_official_reset_credit_ask_and_confirm,
         test_delete_flow,
         test_refresh_all_usage,

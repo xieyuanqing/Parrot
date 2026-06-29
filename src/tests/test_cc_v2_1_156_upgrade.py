@@ -131,6 +131,7 @@ def test_cch_seed_canonical_6of6(name):
 # ─────────────────────────── BETAS (§6) ───────────────────────────
 
 def test_betas_added_new():
+    assert "fast-mode-2026-02-01" in m.BETAS
     assert "context-1m-2025-08-07" in m.BETAS
     assert "mid-conversation-system-2026-04-07" in m.BETAS
 
@@ -187,6 +188,29 @@ def test_context_1m_default_disabled_and_explicit_signal_still_works():
         assert "context-1m-2025-08-07" not in h["anthropic-beta"].split(",")
     finally:
         m._ap_config.update(lambda cfg: cfg.setdefault("customSettings", {}).__setitem__("enableDefaultContext1m", False))
+
+
+def test_fast_mode_request_signals_and_header_gate():
+    assert m.request_wants_fast_mode({"speed": "fast"})
+    assert m.request_wants_fast_mode({}, downstream_betas="fast-mode-2026-02-01")
+    assert m.request_wants_fast_mode({"betas": ["fast-mode-2026-02-01"]})
+    assert m.request_wants_fast_mode({m.PARROT_WANTS_FAST_MODE_KEY: True})
+    assert not m.request_wants_fast_mode({"speed": "standard"})
+
+    h = m.build_upstream_headers(
+        "tok", session_id="s", model="claude-sonnet-4-6",
+        payload={"model": "claude-sonnet-4-6", "messages": [], "speed": "fast"},
+    )
+    assert "fast-mode-2026-02-01" in h["anthropic-beta"].split(",")
+
+    h = m.build_upstream_headers(
+        "tok", session_id="s", model="claude-sonnet-4-6",
+        downstream_betas=["fast-mode-2026-02-01"],
+    )
+    assert "fast-mode-2026-02-01" in h["anthropic-beta"].split(",")
+
+    h = m.build_upstream_headers("tok", session_id="s", model="claude-sonnet-4-6")
+    assert "fast-mode-2026-02-01" not in h["anthropic-beta"].split(",")
 
 
 def test_context_1m_request_signals():
@@ -370,6 +394,22 @@ def test_session_id_linked_header_and_body():
 
 
 # ─────────────────────────── transform_request body (§15) ───────────────────────────
+
+def test_transform_request_sets_speed_for_fast_mode():
+    payload, _ = m.transform_request({
+        "model": "claude-sonnet-4",
+        "messages": [{"role": "user", "content": "hi"}],
+        "speed": "fast",
+    }, session_id="s")
+    assert payload["speed"] == "fast"
+
+    payload, _ = m.transform_request({
+        "model": "claude-sonnet-4",
+        "messages": [{"role": "user", "content": "hi"}],
+        m.PARROT_WANTS_FAST_MODE_KEY: True,
+    }, session_id="s")
+    assert payload["speed"] == "fast"
+
 
 def test_body_wire_order():
     body = {
