@@ -93,7 +93,7 @@ def _problem_channels() -> list[str]:
         cd_map.setdefault(e["channel_key"], []).append(e)
 
     for ch in chs:
-        short = ui.escape_html(ch.display_name)
+        short = ui.escape_html(ui.channel_display_name(ch.key, with_family=False))
         icon = "🔐" if ch.type == "oauth" else "🔀"
         if not ch.enabled or ch.disabled_reason == "user":
             out.append(f"• {icon} {short} — 手动禁用")
@@ -177,6 +177,7 @@ def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
     account_keys = [
         _account_key(a) for a in cfg.get("oauthAccounts", [])
         if a.get("email") and not a.get("disabled_reason")
+        and oauth_manager.provider_of(a) in ("claude", "openai", "xai")
     ]
     if account_keys:
         oauth_manager.ensure_quota_fresh_sync(account_keys)
@@ -202,8 +203,7 @@ def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
                 "Primary": row.get("codex_primary_used_pct"),
                 "Secondary": row.get("codex_secondary_used_pct"),
             }
-            family_prefix = "🅾 "
-        else:
+        elif provider == "claude":
             # Anthropic: 5h / 7d / Sonnet / Opus（原行为）
             utils = {
                 "5h": row.get("five_hour_util"),
@@ -211,11 +211,15 @@ def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
                 "Sonnet": row.get("sonnet_util"),
                 "Opus": row.get("opus_util"),
             }
-            family_prefix = "🅰 "
+        elif provider == "xai":
+            # Grok/xAI: 官方 billing 月度额度百分比映射到通用 30d 列。
+            utils = {"月度": row.get("thirty_day_util")}
+        else:
+            continue
         hot = [(k, v) for k, v in utils.items() if v is not None and v >= threshold_pct]
         if hot:
             parts = " | ".join(f"{k} {v:.0f}%" for k, v in hot)
-            out.append(f"⚠ {family_prefix}<code>{ui.escape_html(email)}</code> — {parts}")
+            out.append(f"⚠ {ui.provider_tag(provider)} <code>{ui.escape_html(email)}</code> — {parts}")
     return out
 
 
@@ -452,10 +456,10 @@ def _compose() -> tuple[str, dict]:
     if (anth_today.get("total") or 0) > 0 or (oai_today.get("total") or 0) > 0:
         # 名称一行 + 数据一行，防长行折行（跟长邮箱渠道一致的处理原则）
         if (anth_today.get("total") or 0) > 0:
-            lines.append(f"🅰 Anthropic:")
+            lines.append(f"{ui.provider_tag('claude')}:" )
             lines.append(f"  {_fmt_today_family(anth_today)}")
         if (oai_today.get("total") or 0) > 0:
-            lines.append(f"🅾 OpenAI:")
+            lines.append(f"{ui.family_tag('openai')}:")
             lines.append(f"  {_fmt_today_family(oai_today)}")
     else:
         lines.append("暂无请求")

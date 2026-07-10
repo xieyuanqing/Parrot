@@ -10,6 +10,9 @@ callback_data 前缀：`oa:...`
   - `oa_openai_rt`            ：等待用户粘贴 refresh_token 字符串
   - `oa_openai_import`        ：等待用户上传/粘贴 Sub2API / CPA 导出内容
   - `oa_openai_import_confirm`：等待用户确认批量导入
+状态机 action（xAI）：
+  - `oa_xai_code`             ：等待用户粘贴 xAI / Grok OAuth 回调 URL
+  - `oa_xai_rt`               ：等待用户粘贴 refresh_token 字符串
 
 注意：本模块所有 OAuth 远端交互都走 `oauth_manager` / `src.oauth.*`，已经有
 mockMode 保护（`config.oauth.mockMode=true` 或 env DISABLE_OAUTH_NETWORK_CALLS=1）。
@@ -31,7 +34,7 @@ from urllib.parse import parse_qs, urlparse
 
 from ... import affinity, config, cooldown, load_balancing, log_db, oauth_errors, oauth_manager, state_db
 from ...oauth_ids import account_key as _account_key, openai_account_identity_parts as _openai_identity_parts, openai_workspace_id as _openai_workspace_id, split_account_key as _split_ak
-from ...oauth import openai as openai_provider
+from ...oauth import openai as openai_provider, xai as xai_provider
 from ...oauth.openai_import import OpenAIImportParseError, parse_openai_import_payload
 from .. import states, ui
 from . import main as main_menu
@@ -447,6 +450,8 @@ def _needs_oauth_cache_refresh_for_ui(account_key: str) -> bool:
         return True
 
     stale = _quota_cache_is_stale_for_ui(row)
+    if prov == "xai" and not _quota_cache_has_usage_signal(row):
+        return True
     if prov == "openai":
         count = _openai_reset_credit_count_from_row(row)
         details = _openai_reset_credit_details_from_row(row)
@@ -600,6 +605,18 @@ def _status_icon(acc: dict) -> str:
     return "✅"
 
 
+def _provider_tag(provider: str | None, *, full: bool = False, rich: bool = True) -> str:
+    return ui.provider_tag(provider, full=full, rich=rich)
+
+
+def _provider_icon(provider: str | None) -> str:
+    return ui.provider_icon(provider)
+
+
+def _provider_label(provider: str | None, *, full: bool = False) -> str:
+    return ui.provider_label(provider, full=full)
+
+
 def _this_month_start_ts() -> float:
     """北京时间本月 00:00:00 的时间戳。"""
     now = datetime.now(_BJT)
@@ -682,6 +699,221 @@ def _quota_window_since_ts(reset_iso: str | None, window_seconds: int, *, now_ts
     return reset_ts - window_seconds
 
 
+def _fmt_usd(v: float | int | None) -> str:
+    try:
+        x = float(v or 0)
+    except (TypeError, ValueError):
+        x = 0.0
+    if x <= 0:
+        return "$0.00"
+    if x < 0.01:
+        return f"${x:.6f}"
+    if x < 1:
+        return f"${x:.4f}"
+    return f"${x:.2f}"
+
+
+def _fmt_credit_amount(v) -> str:
+    if v is None:
+        return "?"
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return "?"
+    if abs(x - int(x)) < 1e-9:
+        return f"{int(x):,}"
+    return f"{x:,.2f}".rstrip("0").rstrip(".")
+
+
+def _xai_raw_from_row(row: dict | None) -> dict:
+    if not row or not row.get("raw_data"):
+        return {}
+    try:
+        raw = json.loads(row.get("raw_data") or "{}")
+    except Exception:
+        return {}
+    xai = raw.get("xai") if isinstance(raw, dict) else None
+    return xai if isinstance(xai, dict) else {}
+
+
+def _xai_raw(account_key: str) -> dict:
+    return _xai_raw_from_row(state_db.quota_load(account_key))
+
+
+def _xai_tier_label(xai: dict) -> str:
+    user = xai.get("user") if isinstance(xai.get("user"), dict) else {}
+    settings = xai.get("settings") if isinstance(xai.get("settings"), dict) else {}
+    vals = []
+    for v in (user.get("subscription_tier"), settings.get("subscription_tier_display")):
+        s = str(v or "").strip()
+        if s and s not in vals:
+            vals.append(s)
+    return " / ".join(vals)
+
+
+def _xai_access_parts(xai: dict) -> list[str]:
+    user = xai.get("user") if isinstance(xai.get("user"), dict) else {}
+    settings = xai.get("settings") if isinstance(xai.get("settings"), dict) else {}
+    blocked = bool(user.get("blocked") or user.get("user_blocked_reason") or user.get("team_blocked_reasons"))
+    allow_access = settings.get("allow_access")
+    has_code = user.get("has_grok_code_access")
+    parts = []
+    if blocked:
+        parts.append("⚠ 账号受限")
+    elif allow_access is False:
+        parts.append("⚠ 访问受限")
+    elif allow_access is True or has_code is True:
+        parts.append("✅ 访问正常")
+    if has_code is True:
+        parts.append("Grok Code 可用")
+    elif has_code is False:
+        parts.append("Grok Code 不可用")
+    return parts
+
+
+def _format_xai_provider_line(account_key: str, *, detail: bool = False) -> str:
+    xai = _xai_raw(account_key)
+    if not xai or xai.get("source") == "unsupported":
+        return ""
+    lines: list[str] = []
+    tier = _xai_tier_label(xai)
+    access = _xai_access_parts(xai)
+    if tier:
+        if detail:
+            lines.append(f"🏷 套餐: <code>{ui.escape_html(tier)}</code>")
+        else:
+            code_part = " · ✅ Grok Code 可用" if "Grok Code 可用" in access else ""
+            lines.append(f"🏷 套餐: {ui.escape_html(tier)}{code_part}")
+    if detail and access:
+        icon = "⚠" if any(str(x).startswith("⚠") for x in access) else "✅"
+        lines.append(f"{icon} 访问: <code>{ui.escape_html(' · '.join(access))}</code>")
+    return "\n".join(lines) + ("\n" if lines and detail else "")
+
+
+def _format_xai_official_block(account_key: str, *, detail: bool = False) -> str:
+    row = state_db.quota_load(account_key)
+    xai = _xai_raw_from_row(row)
+    if not xai or xai.get("source") == "unsupported":
+        return "📊 官方额度: <i>尚未获取</i>" if not detail else "<b>📊 官方账单</b>\n尚未获取（点「刷新账单」拉取）"
+
+    billing = xai.get("billing") if isinstance(xai.get("billing"), dict) else {}
+    settings = xai.get("settings") if isinstance(xai.get("settings"), dict) else {}
+    used = billing.get("used")
+    limit = billing.get("monthly_limit")
+    remaining = billing.get("remaining")
+    pct = billing.get("used_percent")
+    period_end = billing.get("billing_period_end")
+
+    def _pct_text(value) -> str:
+        try:
+            return f"{float(value):.2f}%"
+        except (TypeError, ValueError):
+            return "?"
+
+    if not detail:
+        if limit not in (None, "") and used not in (None, ""):
+            reset = _format_bjt(period_end) if period_end else "?"
+            return (
+                f"📊 额度: 剩余 {_fmt_credit_amount(remaining)} / "
+                f"{_fmt_credit_amount(limit)} · 已用 {_pct_text(pct)} · "
+                f"重置 {ui.escape_html(reset)}"
+            )
+        return "📊 额度: <i>上游未返回月额度</i>"
+
+    lines = ["<b>📊 官方账单</b>"]
+    if limit not in (None, "") and used not in (None, ""):
+        lines.append(
+            f"月额度: <code>{_fmt_credit_amount(used)} / {_fmt_credit_amount(limit)}</code> credits"
+            f"（剩 {_fmt_credit_amount(remaining)}，已用 {_pct_text(pct)}）"
+        )
+    else:
+        lines.append("月额度: <i>上游未返回</i>")
+    start = billing.get("billing_period_start")
+    end = billing.get("billing_period_end")
+    if start or end:
+        lines.append(f"账期: <code>{_format_bjt(start)}</code> → <code>{_format_bjt(end)}</code>")
+    if billing.get("on_demand_cap") is not None or billing.get("on_demand_used") is not None:
+        lines.append(
+            f"按需: 上限 <code>{_fmt_credit_amount(billing.get('on_demand_cap'))}</code>"
+            f" · 已用 <code>{_fmt_credit_amount(billing.get('on_demand_used'))}</code>"
+        )
+    if billing.get("prepaid_balance") is not None:
+        lines.append(f"预付余额: <code>{_fmt_credit_amount(billing.get('prepaid_balance'))}</code>")
+    if billing.get("is_unified_billing_user") is not None:
+        lines.append("统一计费: <code>是</code>" if billing.get("is_unified_billing_user") else "统一计费: <code>否</code>")
+    if settings.get("default_model"):
+        lines.append(f"默认模型: <code>{ui.escape_html(str(settings.get('default_model')))}</code>")
+    comp_parts = []
+    if settings.get("compaction_mode"):
+        comp_parts.append(str(settings.get("compaction_mode")))
+    if settings.get("flush_soft_threshold_tokens") is not None:
+        comp_parts.append(f"flush {settings.get('flush_soft_threshold_tokens')} tokens")
+    if comp_parts:
+        lines.append(f"Compaction: <code>{ui.escape_html(' · '.join(comp_parts))}</code>")
+    errors = xai.get("errors") if isinstance(xai.get("errors"), dict) else {}
+    if errors:
+        lines.append("⚠ 部分补充接口刷新失败，已保留主账单数据。")
+    if row and row.get("fetched_at"):
+        dt = datetime.fromtimestamp(int(row.get("fetched_at")) / 1000, tz=_BJT)
+        lines.append(f"<i>更新于 {dt.strftime('%H:%M:%S')}</i>")
+    return "\n".join(lines)
+
+
+def _format_xai_spend_block(account_key: str, *, detail: bool = False) -> str:
+    """Grok/xAI OAuth 本地花费块。
+
+    只展示 Parrot 本地响应日志累计到的真实 cost/token，不做预算、进度条或
+    百分比，避免被误读为 xAI 官方额度/余额。
+    """
+    ck = f"oauth:{account_key}"
+    since_ts = _this_month_start_ts()
+    try:
+        month = log_db.xai_cost_for_channel(ck, since_ts=since_ts)
+    except Exception as exc:
+        print(f"[oauth_menu] xai month spend lookup failed for {account_key}: {exc}")
+        month = {}
+
+    cost = float(month.get("cost_usd") or 0.0)
+    bill_count = int(month.get("cost_rows") or 0)
+    prompt = ui.prompt_total(month.get("input") or 0, month.get("cache_creation") or 0, month.get("cache_read") or 0)
+    output = int(month.get("output") or 0)
+    cache_read = int(month.get("cache_read") or 0)
+
+    money_line = f"💵 本地计费: {_fmt_usd(cost)}"
+    if bill_count > 0:
+        money_line += f" · {bill_count} 笔计费"
+
+    usage_line = f"💎 本地月度: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(output)}"
+    if cache_read > 0:
+        usage_line += f" · {ui.fmt_cache_phrase(cache_read, prompt)}"
+
+    lines = ["<b>💵 Parrot 本地计费</b>"] if detail else []
+    lines.extend([money_line, usage_line])
+    if month.get("avg_tps") is not None:
+        lines.append(
+            f"⚡️ TPS: 平均 {ui.fmt_tps(month.get('avg_tps'))} · "
+            f"峰值 {ui.fmt_tps(month.get('max_tps'))} · "
+            f"最低 {ui.fmt_tps(month.get('min_tps'))}"
+        )
+
+    tier_counts = month.get("service_tier_counts") or {}
+    if isinstance(tier_counts, dict) and tier_counts:
+        parts = []
+        for key in ("priority", "default"):
+            n = int(tier_counts.get(key) or 0)
+            if n > 0:
+                parts.append(f"{key} {n} 次")
+        for key in sorted(k for k in tier_counts.keys() if k not in {"priority", "default"}):
+            try:
+                n = int(tier_counts.get(key) or 0)
+            except (TypeError, ValueError):
+                n = 0
+            if n > 0:
+                parts.append(f"{ui.escape_html(str(key))} {n} 次")
+        if parts:
+            lines.append("🚀 服务层级: " + " · ".join(parts))
+    return "\n".join(lines)
+
 def _window_usage_detail(account_key: str, since_ts: float, indent: str) -> Optional[str]:
     """某 OAuth 账号在 [since_ts, now] 窗口内、经 Parrot 的本地请求用量明细行。
 
@@ -725,7 +957,7 @@ def _format_account_block(acc: dict) -> str:
         tag = " [认证失败]"
 
     # 第一行：icon + email + provider
-    prov_tag = " 🅾️ OpenAI" if prov == "openai" else (" 🅰️ Claude" if prov == "claude" else "")
+    prov_tag = " " + _provider_tag(prov) if prov else ""
     lines = [f"{icon} <code>{ui.escape_html(email)}</code>{prov_tag}{tag}"]
     row = state_db.quota_load(ak)
 
@@ -749,11 +981,18 @@ def _format_account_block(acc: dict) -> str:
         cl_label = oauth_manager.claude_plan_label(acc)
         if cl_label:
             lines.append(f"🏷️ 套餐: <code>{ui.escape_html(cl_label)}</code>")
+    elif prov == "xai":
+        plan_line = _format_xai_provider_line(ak, detail=False)
+        if plan_line:
+            lines.extend(plan_line.splitlines())
 
-    # 用量（5h / 7d）。百分比来自上游全局配额；其下明细行是「走 Parrot 的
-    # 本地请求」在该窗口内的 tokens/缓存/平均 TPS（口径不同，仅本地流量）。
+    # 用量（5h / 7d）。Claude/OpenAI 百分比来自上游全局配额；Grok
+    # 展示官方月度额度 + Parrot 本地累计金额/token。
     _now_ts = time.time()
-    if row:
+    if prov == "xai":
+        lines.extend(_format_xai_official_block(ak, detail=False).splitlines())
+        lines.extend(_format_xai_spend_block(ak, detail=False).splitlines())
+    elif row:
         fh_util = row.get("five_hour_util")
         sd_util = row.get("seven_day_util")
         if fh_util is not None:
@@ -775,9 +1014,15 @@ def _format_account_block(acc: dict) -> str:
             reset = row.get("thirty_day_reset")
             lines.append(f"📊 30d: {_format_usage_value_html(td_util)} · 重置 <code>{_fmt_time_full(reset)}</code>")
         if fh_util is None and sd_util is None and td_util is None:
-            lines.append("📊 用量: <i>尚未获取</i>")
+            if prov == "xai":
+                lines.append("📊 官方额度: <i>尚未获取</i>")
+            else:
+                lines.append("📊 用量: <i>尚未获取</i>")
     else:
-        lines.append("📊 用量: <i>尚未获取</i>")
+        if prov == "xai":
+            lines.append("📊 官方额度: <i>尚未获取</i>")
+        else:
+            lines.append("📊 用量: <i>尚未获取</i>")
 
     # 月度统计
     try:
@@ -785,7 +1030,7 @@ def _format_account_block(acc: dict) -> str:
         ts = log_db.tokens_for_channel(f"oauth:{ak}", since_ts=since_ts)
     except Exception:
         ts = None
-    if ts and ts["total"] > 0:
+    if prov != "xai" and ts and ts["total"] > 0:
         prompt = ui.prompt_total(ts["input"], ts["cache_creation"], ts["cache_read"])
         stat_line = f"💎 月度: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(ts['output'])}"
         if (ts.get("cache_read") or 0) > 0:
@@ -816,6 +1061,9 @@ def _format_account_block(acc: dict) -> str:
 
 
 def _format_usage_block(account_key: str) -> str:
+    provider = oauth_manager.provider_of(account_key)
+    if provider == "xai":
+        return _format_xai_official_block(account_key, detail=True) + "\n\n" + _format_xai_spend_block(account_key, detail=True)
     row = state_db.quota_load(account_key)
     if not row:
         return "尚未获取用量（点「刷新用量/重置卡」试试）"
@@ -886,6 +1134,8 @@ def _default_models_for_settings(family: str) -> list[str]:
     cfg = config.get()
     if family == "openai":
         raw = (cfg.get("openaiOAuth") or {}).get("defaultModels") or []
+    elif family == "xai":
+        raw = (cfg.get("xaiOAuth") or {}).get("defaultModels") or []
     else:
         raw = cfg.get("oauthDefaultModels") or []
     if not isinstance(raw, list):
@@ -918,6 +1168,7 @@ def _usage_toggle_target_label() -> str:
 def _settings_text_and_kb() -> tuple[str, dict]:
     anthropic_models = _default_models_for_settings("anthropic")
     openai_models = _default_models_for_settings("openai")
+    xai_models = _default_models_for_settings("xai")
     mode_label = _usage_display_label()
     quota_enabled, quota_interval, quota_threshold = _quota_monitor_values()
     quota_status = "✅ 已启用" if quota_enabled else "🚫 已停用"
@@ -932,11 +1183,14 @@ def _settings_text_and_kb() -> tuple[str, dict]:
     text = "\n".join([
         "⚙️ <b>OAuth 账户设置</b>",
         "",
-        f"🅰️ <b>Anthropic 可用模型</b> ({len(anthropic_models)}):",
+        f"{_provider_tag('claude')} <b>可用模型</b> ({len(anthropic_models)}):",
         _models_line(anthropic_models),
         "",
-        f"🅾️ <b>OpenAI 可用模型</b>({len(openai_models)}):",
+        f"{_provider_tag('openai')} <b>可用模型</b> ({len(openai_models)}):",
         _models_line(openai_models),
+        "",
+        f"{_provider_tag('xai')} <b>可用模型</b> ({len(xai_models)}):",
+        _models_line(xai_models),
         "",
         "🎭 <b>CCH 模式（Claude Code 伪装）</b>",
         f"当前模式: {_cch_status_label()}",
@@ -950,8 +1204,9 @@ def _settings_text_and_kb() -> tuple[str, dict]:
         f"禁用阈值: <code>{quota_threshold:.0f}%</code>",
     ])
     rows = [
-        [ui.btn("✏ 修改Anthropic模型", "odm:edit:anthropic"),
-         ui.btn("✏ 修改OpenAI模型", "odm:edit:openai")],
+        [ui.btn("✏ Claude 模型", "odm:edit:anthropic"),
+         ui.btn("✏ OpenAI 模型", "odm:edit:openai"),
+         ui.btn("✏ Grok 模型", "odm:edit:xai")],
         [ui.btn("🖼 图片生成设置", "img:show"),
          ui.btn("📈 配额监控", "oa:quota")],
         [ui.btn(f"🎭 CCH模式：{cch_action}", "oa:cch_toggle"),
@@ -1359,7 +1614,7 @@ def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL) -> tuple[str
             ak = _account_key(acc)
             short = ui.register_code(ak)
             prov = oauth_manager.provider_of(acc)
-            tag = "🅾" if prov == "openai" else ("🅰" if prov == "claude" else "✉")
+            tag = _provider_icon(prov)
             num = start + offset + 1
             row_btns.append(ui.btn(f"{num}. {tag} {email}", f"oa:view:{_callback_payload(short, page, filter_key)}"))
         rows.append(row_btns)
@@ -1488,7 +1743,7 @@ def _sort_item_line(idx: int, account_key: str) -> str:
         return f"{idx}. <code>{ui.escape_html(account_key)}</code> ⚠ 已不存在"
     email = str(acc.get("email") or oauth_manager.account_key_to_email(account_key) or "?")
     prov = oauth_manager.provider_of(acc)
-    tag = "🅾" if prov == "openai" else ("🅰" if prov == "claude" else "✉")
+    tag = _provider_icon(prov)
     status = "enabled" if acc.get("enabled", True) and not acc.get("disabled_reason") else (acc.get("disabled_reason") or "disabled")
     suffix = _openai_workspace_label(acc, force=True) if prov == "openai" else ""
     suffix_text = f" · {suffix}" if suffix else ""
@@ -1831,11 +2086,13 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
             provider_line += f"📋 订阅: <code>{ui.escape_html(' · '.join(sub_parts))}</code>\n"
         if sub_created:
             provider_line += f"📅 开始: <code>{_format_bjt(sub_created)}</code>\n"
+    elif prov == "xai":
+        provider_line = _format_xai_provider_line(account_key, detail=True)
     else:
         provider_line = ""
     max_cc = int(acc.get("maxConcurrent", 0) or 0)
     max_cc_label = str(max_cc) if max_cc > 0 else "默认"
-    prov_icon = "🅾️ OpenAI" if prov == "openai" else ("🅰️ Claude" if prov == "claude" else prov)
+    prov_icon = _provider_tag(prov)
     text = (
         f"{icon} <b>{ui.escape_html(email)}</b> {prov_icon}\n\n"
         f"状态: <code>{ui.escape_html('enabled' if acc.get('enabled', True) and not acc.get('disabled_reason') else reason)}</code>\n"
@@ -1880,9 +2137,10 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
             text += f" (累计失败 {e['error_count']} 次)\n"
 
     payload = _callback_payload(short, page, filter_key)
+    usage_btn_label = "📊 刷新账单" if prov == "xai" else "📊 刷新用量/重置卡"
     rows = [
         [ui.btn("🔄 刷新 Token", f"oa:refresh_token:{payload}"),
-         ui.btn("📊 刷新用量/重置卡",   f"oa:refresh_usage:{payload}")],
+         ui.btn(usage_btn_label,   f"oa:refresh_usage:{payload}")],
     ]
     if prov == "openai":
         rows.append([
@@ -1974,6 +2232,8 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
     provider = oauth_manager.provider_of(ak)
     if provider == "openai":
         ui.answer_cb(cb_id, "拉取 OpenAI 用量/重置卡...")
+    elif provider == "xai":
+        ui.answer_cb(cb_id, "拉取 Grok 官方账单...")
     else:
         ui.answer_cb(cb_id, "拉取中...")
 
@@ -2009,6 +2269,17 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
             fields = metadata_action.get("fields") or {}
             if fields.get("plan_type"):
                 head += f"\n🏷 套餐信息已刷新: <code>{ui.escape_html(fields.get('plan_type'))}</code>"
+        if quota_action and quota_action.get("action") == "disabled":
+            hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
+            head += f"\n🔒 已自动标记为配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
+        elif quota_action and quota_action.get("action") == "still_over_quota":
+            hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
+            head += f"\n⚠ 仍处于配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
+        elif quota_action and quota_action.get("action") == "resumed":
+            head += "\n♻ 额度已恢复，已自动解除配额禁用"
+        ui.edit(chat_id, message_id, head + "\n\n" + text, reply_markup=kb)
+    elif provider == "xai":
+        head = "✅ 已更新 Grok 官方账单"
         if quota_action and quota_action.get("action") == "disabled":
             hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
             head += f"\n🔒 已自动标记为配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
@@ -2060,7 +2331,7 @@ def on_reset_quota_ask(chat_id: int, message_id: int, cb_id: str, short: str,
     else:
         unit = "次" if count == 1 else "次"
         body = (
-            "♻️ <b>OpenAI 官方额度重置说明</b>\n\n"
+            f"♻️ {ui.provider_custom_emoji_html('openai')} <b>OpenAI 官方额度重置说明</b>\n\n"
             f"当前可用官方重置次数: <code>{count}</code> {unit}\n\n"
             "这一步 <b>不会消耗</b> 重置次数，只是进入最终确认页。\n\n"
             "请确认你理解：\n"
@@ -2111,7 +2382,7 @@ def on_reset_quota_confirm(chat_id: int, message_id: int, cb_id: str, short: str
     cancel_payload = _callback_payload(ui.register_code(ak), page, filter_key)
     reset_label = _openai_reset_credit_label_from_row(state_db.quota_load(ak), show_zero=True)
     body = (
-        "🚨 <b>最终确认：消耗 1 次 OpenAI 官方重置</b>\n\n"
+        f"🚨 {ui.provider_custom_emoji_html('openai')} <b>最终确认：消耗 1 次 OpenAI 官方重置</b>\n\n"
         f"账号: <code>{ui.escape_html(email or ak)}</code>\n"
         f"当前可用官方重置次数: <code>{ui.escape_html(reset_label)}</code>\n\n"
         "点击下面的最终确认后，会立即调用 OpenAI 官方接口：\n"
@@ -2171,7 +2442,7 @@ def on_reset_quota(chat_id: int, message_id: int, cb_id: str, short: str, page: 
         if not text:
             return
         if outcome in ("reset", "alreadyRedeemed"):
-            prefix = "♻️ <b>OpenAI 官方额度重置已执行</b>\n"
+            prefix = f"♻️ {ui.provider_custom_emoji_html('openai')} <b>OpenAI 官方额度重置已执行</b>\n"
             if result.get("available_count") is not None:
                 prefix += f"剩余官方重置次数: <code>{result.get('available_count')}</code>\n"
             quota_action = result.get("quota_action") or {}
@@ -2277,7 +2548,7 @@ def on_delete_ask(chat_id: int, message_id: int, cb_id: str, short: str, page: i
     acc = oauth_manager.get_account(ak)
     email = (acc or {}).get("email") or _account_email(ak)
     prov = oauth_manager.provider_of(ak)
-    prov_tag = "🅾 OpenAI" if prov == "openai" else "🅰 Claude"
+    prov_tag = _provider_tag(prov)
     ui.answer_cb(cb_id)
     ui.edit(
         chat_id, message_id,
@@ -2558,7 +2829,7 @@ def _run_refresh_all_legacy_panel(chat_id: int, progress_mid: int, account_keys:
     for idx, ak in enumerate([k for k in account_keys if k], 1):
         provider = oauth_manager.provider_of(ak)
         email = _account_email(ak)
-        prov_tag = "🅾 OpenAI" if provider == "openai" else ("🅰 Claude" if provider == "claude" else ui.escape_html(provider or "OAuth"))
+        prov_tag = _provider_tag(provider)
         ek = ui.escape_html(email or ak)
 
         lines.append(f"<b>{idx}. {ek}</b> · {prov_tag}")
@@ -2745,14 +3016,16 @@ def on_add_menu(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
     ui.edit(
         chat_id, message_id,
-        "<b>新增 OAuth 账户</b>\n请选择类型：",
+        f"<b>新增 OAuth 账户</b>\n请选择类型：\n\n{_provider_tag('claude')} / {_provider_tag('openai')} / {_provider_tag('xai')}",
         reply_markup=ui.inline_kb([
-            [ui.btn("🟣 Claude 登录获取 Token", "oa:login")],
-            [ui.btn("📄 Claude 手动设置 JSON", "oa:set_json")],
-            [ui.btn("🅾 OpenAI 登录获取 Token", "oa:login:openai")],
-            [ui.btn("🔑 OpenAI 粘贴 refresh_token", "oa:set_rt:openai")],
-            [ui.btn("📦 OpenAI 导入 Sub2API 文件", "oa:import:sub2api")],
-            [ui.btn("🗂 OpenAI 导入 CPA 文件", "oa:import:cpa")],
+            [ui.btn(f"{_provider_icon('claude')} Claude 登录获取 Token", "oa:login")],
+            [ui.btn(f"{_provider_icon('claude')} Claude 手动设置 JSON", "oa:set_json")],
+            [ui.btn(f"{_provider_icon('openai')} OpenAI 登录获取 Token", "oa:login:openai")],
+            [ui.btn(f"{_provider_icon('openai')} OpenAI 粘贴 refresh_token", "oa:set_rt:openai")],
+            [ui.btn(f"{_provider_icon('xai')} Grok 登录获取 Token", "oa:login:xai")],
+            [ui.btn(f"{_provider_icon('xai')} Grok 粘贴 refresh_token", "oa:set_rt:xai")],
+            [ui.btn(f"📦 {_provider_icon('openai')} OpenAI 导入 Sub2API 文件", "oa:import:sub2api")],
+            [ui.btn(f"🗂 {_provider_icon('openai')} OpenAI 导入 CPA 文件", "oa:import:cpa")],
             [ui.btn("◀ 返回列表", "menu:oauth")],
             [ui.btn("🏠 返回主菜单", "menu:main")],
         ]),
@@ -2764,7 +3037,7 @@ def on_add_claude(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
     ui.edit(
         chat_id, message_id,
-        "<b>新增 Claude OAuth 账户</b>\n请选择方式：",
+        f"<b>新增</b> {_provider_tag('claude', full=True)} <b>OAuth 账户</b>\n请选择方式：",
         reply_markup=ui.inline_kb([
             [ui.btn("🌐 登录获取 Token", "oa:login")],
             [ui.btn("📝 手动设置 JSON",  "oa:set_json")],
@@ -2778,7 +3051,7 @@ def on_add_openai(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
     ui.edit(
         chat_id, message_id,
-        "<b>新增 OpenAI OAuth 账户</b>\n请选择方式：\n\n"
+        f"<b>新增</b> {_provider_tag('openai')} <b>OAuth 账户</b>\n请选择方式：\n\n"
         "<i>登录获取：浏览器打开 Codex CLI 授权页，登录后页面会重定向到一个"
         "本地 URL（通常显示「无法访问此网站」），把地址栏里整段 URL 复制回来即可。</i>\n"
         "<i>手动粘 RT：已经有 refresh_token 时直接粘字符串，代理会自动刷新"
@@ -2805,7 +3078,7 @@ def on_login_start(chat_id: int, message_id: int, cb_id: str) -> None:
 
     ui.edit(
         chat_id, message_id,
-        "请在浏览器中打开以下链接完成 Claude 账号登录：\n\n"
+        f"请在浏览器中打开以下链接完成 {_provider_tag('claude')} 账号登录：\n\n"
         f"<a href=\"{ui.escape_html(url)}\">点此打开登录页</a>\n\n"
         "登录后页面会显示一个 <b>authorization code</b>（通常形如 <code>abc#state</code>），"
         "请复制并发送给我。\n\n"
@@ -2898,7 +3171,7 @@ def on_login_code_input(chat_id: int, text: str) -> None:
     _cl_created_line = f"\n开始时间: <code>{_format_bjt(_cl_created)}</code>" if _cl_created else ""
     ui.send_result(
         chat_id,
-        "✅ <b>Anthropic OAuth 账户已添加</b>\n\n"
+        f"✅ {ui.provider_custom_emoji_html('claude')} <b>Anthropic OAuth 账户已添加</b>\n\n"
         f"Email: <code>{ui.escape_html(email)}</code>\n"
         f"套餐计划: <code>{ui.escape_html(_cl_plan or '?')}</code>{_cl_sub_line}{_cl_created_line}\n"
         f"过期: <code>{_fmt_time_full(new_expired)}</code>\n"
@@ -2914,7 +3187,7 @@ def on_set_json_start(chat_id: int, message_id: int, cb_id: str) -> None:
     states.set_state(chat_id, "oa_set_json")
     ui.edit(
         chat_id, message_id,
-        "请粘贴 OAuth JSON（需包含 <code>email / access_token / refresh_token / expired</code>）：",
+        f"请粘贴 {_provider_tag('claude')} OAuth JSON（需包含 <code>email / access_token / refresh_token / expired</code>）：",
         reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "oa:add")]]),
     )
 
@@ -2985,7 +3258,7 @@ _OA_NAV_OPENAI = {"back_label": "◀ 返回新增账户", "back_callback": "oa:a
 def _build_openai_login_text_and_kb(url: str) -> tuple[str, dict]:
     """构建 OpenAI 登录页的文本和键盘（复用于首次生成和重新生成）。"""
     text = (
-        "请在浏览器打开以下链接登录 OpenAI / ChatGPT 账号：\n\n"
+        f"请在浏览器打开以下链接登录 {_provider_tag('openai')} / ChatGPT 账号：\n\n"
         f"<a href=\"{ui.escape_html(url)}\">📱 点此打开登录页</a>\n\n"
         "👇 长按下方地址可复制（推荐用隐私浏览器打开）：\n"
         f"<code>{ui.escape_html(url)}</code>\n\n"
@@ -3355,10 +3628,10 @@ def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
     sub_exp = meta.get("subscription_expires_at") or ""
     sub_line = f"订阅到期时间: <code>{_format_bjt(sub_exp)}</code>\n" if sub_exp else ""
     title = {
-        "added": "✅ <b>OpenAI OAuth 账户已添加</b>",
-        "replaced": "✅ <b>OpenAI OAuth 账户已更新</b>",
-        "skipped": "✅ <b>OpenAI OAuth 账户已存在</b>",
-    }.get(action, "✅ <b>OpenAI OAuth 账户已处理</b>")
+        "added": f"✅ {ui.provider_custom_emoji_html('openai')} <b>OpenAI OAuth 账户已添加</b>",
+        "replaced": f"✅ {ui.provider_custom_emoji_html('openai')} <b>OpenAI OAuth 账户已更新</b>",
+        "skipped": f"✅ {ui.provider_custom_emoji_html('openai')} <b>OpenAI OAuth 账户已存在</b>",
+    }.get(action, f"✅ {ui.provider_custom_emoji_html('openai')} <b>OpenAI OAuth 账户已处理</b>")
     lb_hint = (
         "\n已加入负载均衡优先级队列末尾，如需调整请进入「负载均衡」。"
         if action == "added" and load_balancing.is_initialized() else ""
@@ -3374,6 +3647,211 @@ def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
         f"处理: <code>{ui.escape_html(action_msg)}</code>\n"
         f"来源: <code>{source}</code>{lb_hint}",
         **_OA_NAV_OPENAI,
+    )
+
+
+# ─── xAI / Grok OAuth 登录 ───────────────────────────────────────
+
+_OA_NAV_XAI = {"back_label": "◀ 返回新增账户", "back_callback": "oa:add"}
+
+
+def _build_xai_login_text_and_kb(url: str) -> tuple[str, dict]:
+    redirect = xai_provider.redirect_uri()
+    text = (
+        f"请在浏览器打开以下链接登录 {_provider_tag('xai', full=True)} 账号：\n\n"
+        f"<a href=\"{ui.escape_html(url)}\">📱 点此打开登录页</a>\n\n"
+        "👇 长按下方地址可复制：\n"
+        f"<code>{ui.escape_html(url)}</code>\n\n"
+        f"登录后浏览器会跳到 <code>{ui.escape_html(redirect)}?code=...&amp;state=...</code>"
+        "（页面显示无法访问属正常，Parrot 不会监听这个端口）。\n"
+        "请把 <b>地址栏里整段 URL</b> 复制发给我即可。\n\n"
+        "<i>（登录会话 30 分钟内有效）</i>"
+    )
+    kb = ui.inline_kb([
+        [ui.btn("🔄 重新生成登录地址", "oa:login:xai:regen")],
+        [ui.btn("❌ 取消", "oa:add")],
+    ])
+    return text, kb
+
+
+def on_login_xai_start(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    verifier, challenge = xai_provider.pkce_generate()
+    state = secrets.token_urlsafe(32)
+    try:
+        discovery = xai_provider.discover_sync()
+        authorization_endpoint = discovery.get("authorization_endpoint") or xai_provider.authorization_url()
+        token_endpoint = discovery.get("token_endpoint") or xai_provider.token_url()
+        url = xai_provider.build_login_url(
+            challenge,
+            state,
+            authorization_endpoint=authorization_endpoint,
+        )
+    except Exception as exc:
+        ui.send_result(
+            chat_id,
+            _oauth_error_html(exc, provider="xai", operation="discovery"),
+            **_OA_NAV_XAI,
+        )
+        return
+
+    states.set_state(chat_id, "oa_xai_code", {
+        "code_verifier": verifier,
+        "state": state,
+        "token_endpoint": token_endpoint,
+        "redirect_uri": xai_provider.redirect_uri(),
+    })
+
+    text, kb = _build_xai_login_text_and_kb(url)
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_login_xai_regen(chat_id: int, message_id: int, cb_id: str) -> None:
+    on_login_xai_start(chat_id, message_id, cb_id)
+
+
+def on_login_xai_code_input(chat_id: int, text: str) -> None:
+    state = states.pop_state(chat_id)
+    if not state or state.get("action") != "oa_xai_code":
+        ui.send_result(chat_id, "❌ 登录会话已失效，请重新发起登录流程。", **_OA_NAV_XAI)
+        return
+    data = state.get("data") or {}
+    code, recv_state = _extract_openai_code_and_state(text)
+    if not code:
+        ui.send_result(chat_id, "❌ 没有抽到 code，请重新发起登录流程。", **_OA_NAV_XAI)
+        return
+    orig_state = data.get("state", "")
+    if recv_state and orig_state and recv_state != orig_state:
+        ui.send_result(
+            chat_id,
+            f"❌ state 不匹配：收到 <code>{ui.escape_html(recv_state[:16])}...</code>，"
+            f"期望 <code>{ui.escape_html(orig_state[:16])}...</code>。"
+            "可能是会话错乱，请重新发起登录流程。",
+            **_OA_NAV_XAI,
+        )
+        return
+    try:
+        tok = xai_provider.exchange_code_sync(
+            code,
+            data.get("code_verifier", ""),
+            redirect_uri=data.get("redirect_uri") or xai_provider.redirect_uri(),
+            token_endpoint=data.get("token_endpoint") or xai_provider.token_url(),
+        )
+    except Exception as exc:
+        ui.send_result(
+            chat_id,
+            _oauth_error_html(exc, provider="xai", operation="exchange_code"),
+            **_OA_NAV_XAI,
+        )
+        return
+
+    _finish_xai_add(chat_id, tok, source="login")
+
+
+def on_set_rt_xai_start(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    states.set_state(chat_id, "oa_xai_rt")
+    ui.edit(
+        chat_id, message_id,
+        f"请粘贴 {_provider_tag('xai', full=True)} <b>refresh_token</b>（纯字符串即可，代理会立即刷新一次 "
+        "token 并从 id_token 解出 email / subject）：",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "oa:add")]]),
+    )
+
+
+def on_set_rt_xai_input(chat_id: int, text: str) -> None:
+    states.pop_state(chat_id)
+    rt = (text or "").strip()
+    m = re.search(r"([A-Za-z0-9_\-\.]{20,})", rt)
+    rt_clean = m.group(1) if m else rt
+    if not rt_clean or len(rt_clean) < 20:
+        ui.send_result(chat_id, "❌ refresh_token 过短或无法识别，请重新粘贴。", **_OA_NAV_XAI)
+        return
+    try:
+        tok = xai_provider.refresh_sync(rt_clean)
+    except Exception as exc:
+        ui.send_result(
+            chat_id,
+            _oauth_error_html(exc, provider="xai", operation="refresh_token"),
+            **_OA_NAV_XAI,
+        )
+        return
+    if not tok.get("refresh_token"):
+        tok["refresh_token"] = rt_clean
+    _finish_xai_add(chat_id, tok, source="rt")
+
+
+def _xai_token_to_entry(tok: dict, *, fallback_email: str = "") -> tuple[dict, dict]:
+    id_token = tok.get("id_token", "") or ""
+    info: dict = {}
+    if id_token:
+        try:
+            info = xai_provider.extract_user_info(xai_provider.decode_id_token(id_token))
+        except Exception as exc:
+            raise ValueError(f"id_token 解码失败: {exc}") from exc
+
+    email = tok.get("email") or info.get("email") or fallback_email or ""
+    subject = tok.get("subject") or tok.get("sub") or info.get("subject") or ""
+    if not email:
+        email = f"unnamed-xai-{int(datetime.now().timestamp())}@local"
+
+    expires_in = int(tok.get("expires_in", 3600) or 3600)
+    new_expired = (
+        datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    entry = {
+        "email": email,
+        "provider": "xai",
+        "access_token": tok.get("access_token", ""),
+        "refresh_token": tok.get("refresh_token", ""),
+        "expired": new_expired,
+        "last_refresh": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "type": "xai",
+        "enabled": True,
+        "disabled_reason": None,
+        "disabled_until": None,
+        "models": [],
+        "id_token": id_token,
+        "subject": subject,
+        "sub": subject,
+        "base_url": tok.get("base_url") or tok.get("baseUrl") or xai_provider.api_base_url(),
+        "token_endpoint": tok.get("token_endpoint") or xai_provider.token_url(),
+        "redirect_uri": tok.get("redirect_uri") or xai_provider.redirect_uri(),
+    }
+    meta = {"email": email, "subject": subject, "expired": new_expired}
+    return entry, meta
+
+
+def _finish_xai_add(chat_id: int, tok: dict, *, source: str) -> None:
+    try:
+        entry, meta = _xai_token_to_entry(tok)
+        ak = _account_key(entry)
+        existed = oauth_manager.get_account(ak) is not None
+        oauth_manager.add_account(entry)
+    except Exception as exc:
+        ui.send_result(
+            chat_id,
+            f"❌ 保存失败: <code>{ui.escape_html(str(exc))[:500]}</code>",
+            **_OA_NAV_XAI,
+        )
+        return
+
+    title = (f"✅ {ui.provider_custom_emoji_html('xai')} <b>Grok OAuth 账户已更新</b>" if existed
+             else f"✅ {ui.provider_custom_emoji_html('xai')} <b>Grok OAuth 账户已添加</b>")
+    lb_hint = (
+        "\n已加入负载均衡优先级队列末尾，如需调整请进入「负载均衡」。"
+        if not existed and load_balancing.is_initialized() else ""
+    )
+    subject_line = f"Subject: <code>{ui.escape_html(meta.get('subject') or '')}</code>\n" if meta.get("subject") else ""
+    ui.send_result(
+        chat_id,
+        f"{title}\n\n"
+        f"Email: <code>{ui.escape_html(meta.get('email') or entry.get('email') or '')}</code>\n"
+        f"{subject_line}"
+        f"过期: <code>{_fmt_time_full(meta.get('expired'))}</code>\n"
+        "额度: <code>xAI 暂无已确认的零成本 quota 端点</code>\n"
+        f"来源: <code>{ui.escape_html(source)}</code>{lb_hint}",
+        **_OA_NAV_XAI,
     )
 
 
@@ -3395,10 +3873,10 @@ def on_import_openai_start(chat_id: int, message_id: int, cb_id: str, kind: str)
     states.set_state(chat_id, "oa_openai_import", {"kind": kind})
     ui.edit(
         chat_id, message_id,
-        f"<b>导入 {label} 账户</b>\n\n"
+        f"<b>导入</b> {_provider_tag('openai')} <b>{label} 账户</b>\n\n"
         "请上传 <code>.zip</code> / <code>.json</code> 文件，或直接粘贴 JSON 文本。\n\n"
         "我会只提取 <code>email</code> 与 <code>refresh_token</code>，随后复用"
-        "「OpenAI 粘贴 refresh_token」逻辑刷新并导入。\n\n"
+        f"「{_provider_icon('openai')} OpenAI 粘贴 refresh_token」逻辑刷新并导入。\n\n"
         "<i>导入前会先展示识别到的邮箱列表，请确认后再写入配置。</i>",
         reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "oa:import_cancel")]]),
     )
@@ -3427,7 +3905,7 @@ def _parse_openai_import_or_report(chat_id: int, kind: str, payload, *, filename
 def _show_openai_import_preview(chat_id: int, kind: str, items: list[dict]) -> None:
     label = _OPENAI_IMPORT_LABELS.get(kind, kind.upper())
     states.set_state(chat_id, "oa_openai_import_confirm", {"kind": kind, "items": items})
-    lines = [f"<b>导入 {label} 账户</b>", "", "当前识别到："]
+    lines = [f"<b>导入</b> {_provider_tag('openai')} <b>{label} 账户</b>", "", "当前识别到："]
     max_show = 30
     for i, item in enumerate(items[:max_show], 1):
         email = item.get("email") or "?"
@@ -3578,14 +4056,14 @@ def on_import_openai_exec(chat_id: int, message_id: int, cb_id: str) -> None:
         return
 
     ui.answer_cb(cb_id, "开始导入…")
-    ui.edit(chat_id, message_id, f"正在导入 {label} 账户，共 {len(items)} 个，请稍等…")
+    ui.edit(chat_id, message_id, f"正在导入 {_provider_tag('openai')} {label} 账户，共 {len(items)} 个，请稍等…")
 
     buckets = {"added": [], "replaced": [], "skipped": [], "failed": []}
     for item in items:
         status, email, msg = _import_candidate_with_policy(item)
         buckets.setdefault(status, []).append((email, msg))
 
-    lines = [f"<b>导入 {label} 账户完成</b>", ""]
+    lines = [f"<b>导入</b> {_provider_tag('openai')} <b>{label} 账户完成</b>", ""]
     if buckets["added"]:
         lines.append(f"✅ 新增 {len(buckets['added'])} 个")
         for email, _ in buckets["added"][:20]:
@@ -3849,6 +4327,15 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data == "oa:set_rt:openai":
         on_set_rt_openai_start(chat_id, message_id, cb_id)
         return True
+    if data == "oa:login:xai":
+        on_login_xai_start(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:login:xai:regen":
+        on_login_xai_regen(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:set_rt:xai":
+        on_set_rt_xai_start(chat_id, message_id, cb_id)
+        return True
     if data.startswith("oa:import:"):
         on_import_openai_start(chat_id, message_id, cb_id, data.rsplit(":", 1)[-1])
         return True
@@ -3934,6 +4421,12 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
         return True
     if action == "oa_openai_rt":
         on_set_rt_openai_input(chat_id, text)
+        return True
+    if action == "oa_xai_code":
+        on_login_xai_code_input(chat_id, text)
+        return True
+    if action == "oa_xai_rt":
+        on_set_rt_xai_input(chat_id, text)
         return True
     if action == "oa_openai_import":
         on_import_openai_text_input(chat_id, text)

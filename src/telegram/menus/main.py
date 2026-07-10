@@ -23,12 +23,13 @@ def _kb() -> dict:
 
 def _quota_hot_count(threshold_pct: float = 80.0) -> int:
     """返回当前用量 >= threshold 的 OAuth 账户数量（不含已禁用）。"""
-    # 使用 oauth_manager.list_accounts() 作为唯一数据源，
-    # 覆盖所有 provider（Claude + OpenAI），而非仅 cfg.oauthAccounts。
+    # 使用 oauth_manager.list_accounts() 作为唯一数据源。
+    # Claude/OpenAI 走窗口配额；Grok/xAI 走官方月度 billing percent。
     accounts = oauth_manager.list_accounts()
     account_keys = [
         _account_key(a) for a in accounts
         if a.get("email") and not a.get("disabled_reason")
+        and oauth_manager.provider_of(a) in ("claude", "openai", "xai")
     ]
     if account_keys:
         oauth_manager.ensure_quota_fresh_sync(account_keys)
@@ -37,12 +38,18 @@ def _quota_hot_count(threshold_pct: float = 80.0) -> int:
         email = acc.get("email")
         if not email:
             continue
+        provider = oauth_manager.provider_of(acc)
+        if provider not in ("claude", "openai", "xai"):
+            continue
         ak = _account_key(acc)
         row = state_db.quota_load(ak)
         if not row:
             continue
-        utils = [row.get(k) for k in ("five_hour_util", "seven_day_util",
-                                       "sonnet_util", "opus_util")]
+        if provider == "xai":
+            utils = [row.get("thirty_day_util")]
+        else:
+            utils = [row.get(k) for k in ("five_hour_util", "seven_day_util",
+                                           "thirty_day_util", "sonnet_util", "opus_util")]
         if any(u is not None and u >= threshold_pct for u in utils):
             n += 1
     return n
@@ -149,19 +156,19 @@ def _address_block(port: int) -> list[str]:
     out += [
         "",
         "📍 <b>接口地址</b> (POST)",
-        "  <b>Anthropic</b>",
+        f"  {ui.provider_tag('claude', full=True)}",
         f"    本地 <code>http://127.0.0.1:{port}/v1/messages</code>",
     ]
     if pub:
         out.append(f"    公网 <code>http://{pub}:{port}/v1/messages</code>")
     out += [
-        "  <b>OpenAI Chat</b>",
+        f"  {ui.provider_tag('openai')} Chat",
         f"    本地 <code>http://127.0.0.1:{port}/v1/chat/completions</code>",
     ]
     if pub:
         out.append(f"    公网 <code>http://{pub}:{port}/v1/chat/completions</code>")
     out += [
-        "  <b>OpenAI Responses</b>",
+        f"  {ui.provider_tag('openai')} Responses",
         f"    本地 <code>http://127.0.0.1:{port}/v1/responses</code>",
     ]
     if pub:

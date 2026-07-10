@@ -37,8 +37,10 @@ from .oauth_ids import (
     account_key as _account_key,
     openai_workspace_id as _openai_workspace_id,
     split_account_key as _split_ak,
+    xai_subject as _xai_subject,
 )
 from .oauth import openai as openai_provider
+from .oauth import xai as xai_provider
 from .transform.cc_mimicry import CLI_USER_AGENT
 
 
@@ -86,6 +88,14 @@ def _is_openai_acc(acc: dict) -> bool:
     return _acc_provider(acc) == "openai"
 
 
+def _is_xai_acc(acc: dict) -> bool:
+    return _acc_provider(acc) == "xai"
+
+
+def _is_openai_family_provider(provider: str) -> bool:
+    return provider in ("openai", "xai")
+
+
 def _canonical_key(acc: dict) -> str:
     return _account_key(acc)
 
@@ -130,6 +140,24 @@ def _matching_accounts_for_key(key: str) -> list[dict]:
                     or _openai_workspace_id(acc) == identity
                     or str(acc.get("chatgpt_account_id") or "") == identity
                     or str(acc.get("workspace_id") or "") == identity
+                )
+            ]
+        if provider == "xai":
+            parts = identity.split(":")
+            if len(parts) >= 2:
+                email, subject = parts[0], ":".join(parts[1:])
+                return [
+                    acc for acc in accounts
+                    if _is_xai_acc(acc)
+                    and str(acc.get("email") or "") == email
+                    and (not subject or _xai_subject(acc) == subject)
+                ]
+            return [
+                acc for acc in accounts
+                if _is_xai_acc(acc)
+                and (
+                    acc.get("email") == identity
+                    or _xai_subject(acc) == identity
                 )
             ]
         return [
@@ -225,7 +253,7 @@ def account_key_to_email(account_key: str) -> str:
     if acc is not None:
         return str(acc.get("email") or "")
     provider, identity = _split_ak(account_key)
-    if provider == "openai" and ":" in identity:
+    if provider in ("openai", "xai") and ":" in identity:
         return identity.split(":", 1)[0]
     return identity
 
@@ -263,7 +291,7 @@ def _parse_iso(s: str | None) -> datetime | None:
 
 
 def provider_of(key_or_account: str | dict) -> str:
-    """按账户拿到 provider（"claude" / "openai"）。
+    """按账户拿到 provider（"claude" / "openai" / "xai"）。
 
     入参既可以是 account entry（dict），也可以是 account_key 字符串。
     若入参是 "provider:email" 三段式 → 直接拆出 provider 返回（不必查 config）。
@@ -341,9 +369,10 @@ def _save_token_fields(account_key: str, new: dict) -> None:
         except Exception as exc:
             print(f"[oauth] state rename failed {old_key} -> {new_key}: {exc}")
         try:
+            _prov = provider_of(old_acc or old_key)
             load_balancing.sync_channel_renamed(
                 f"oauth:{old_key}", f"oauth:{new_key}",
-                "openai" if provider_of(old_acc or old_key) == "openai" else "anthropic",
+                "openai" if _is_openai_family_provider(_prov) else "anthropic",
             )
         except Exception as exc:
             print(f"[oauth] priority rename failed {old_key} -> {new_key}: {exc}")
@@ -494,6 +523,13 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
                 workspace_id=acc.get("workspace_id") or acc.get("chatgpt_account_id") or None,
                 org_id=acc.get("organization_id") or None,
             )
+        elif provider == "xai":
+            data = xai_provider.refresh_sync(
+                acc["refresh_token"],
+                token_endpoint=acc.get("token_endpoint") or None,
+                email=email,
+                subject=_xai_subject(acc) or None,
+            )
         elif mock_mode_enabled():
             data = _do_refresh_mock(acc["refresh_token"])
         else:
@@ -570,6 +606,24 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
                     ):
                         continue
                 new_fields[k] = data[k]
+
+        # xAI: refresh 响应若带 id_token 同步 subject/email 元数据。
+        if provider == "xai":
+            if data.get("id_token"):
+                new_fields["id_token"] = data["id_token"]
+                try:
+                    claims = xai_provider.decode_id_token(data["id_token"])
+                    info = xai_provider.extract_user_info(claims)
+                    if info.get("email"):
+                        new_fields["email"] = info["email"]
+                    if info.get("subject"):
+                        new_fields["subject"] = info["subject"]
+                        new_fields["sub"] = info["subject"]
+                except Exception as exc:
+                    print(f"[oauth] xai refresh: id_token decode failed for {email}: {exc}")
+            for k in ("subject", "sub", "base_url", "token_endpoint", "redirect_uri"):
+                if data.get(k):
+                    new_fields[k] = data[k]
 
         # Claude: refresh 后 best-effort 拉 profile 更新套餐信息
         if provider == "claude":
@@ -753,6 +807,7 @@ async def fetch_usage(account_key: str) -> dict:
 
       - Claude / Anthropic: 调 /api/oauth/usage（零 token 成本，JSON body）
       - OpenAI (Codex)    : 调 ChatGPT backend-api/wham/usage（零 Codex 请求成本）
+      - xAI / Grok        : 调 Grok CLI proxy billing/user/settings（零模型 token 成本）
 
     返回：与 Anthropic 原生 `/oauth/usage` JSON 结构兼容的 dict（顶层含
     five_hour / seven_day / ...），让 extract_utils_percent / latest_reset_iso / flatten_usage
@@ -760,7 +815,11 @@ async def fetch_usage(account_key: str) -> dict:
     """
     account_key = _resolve_existing_account_key_or_raise(account_key)
     provider = provider_of(account_key)
+
     access_token = await ensure_valid_token(account_key)
+
+    if provider == "xai":
+        return await xai_provider.fetch_cli_billing_usage(access_token)
 
     if provider != "openai":
         # Claude 路径：直接走 /api/oauth/usage
@@ -1311,7 +1370,7 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
           - 账号已是 quota 禁用：保持不动（不刷新 disabled_until，避免目标移动）
           - 账号未禁用：set_disabled_by_quota，disabled_until = 撞到窗口的最大 reset
       • 所有窗口 util < threshold → 可用
-          - OpenAI 账号若 usage 没有任何窗口指标，或这份 usage 不是本轮新鲜探测，
+          - OpenAI / Grok 账号若 usage 没有任何窗口指标，或这份 usage 不是本轮新鲜探测，
             不能作为恢复依据；保持原 quota 禁用状态，避免“未知=恢复”误判。
           - OpenAI 账号若仍处于 disabled_until 冷却期，或仍有未过期的 Codex
             响应头超限快照，继续保持 quota 禁用，避免 WHAM/Codex 边界不同步
@@ -1320,6 +1379,7 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
             全部低于阈值时，才 set_enabled(True) 自动恢复。
             respect_disabled_until=False 的官方 reset credit / 手动强刷新路径例外：
             上游已确认消耗 reset 后，可用新鲜 usage 直接覆盖本地旧冷却时间。
+          - Grok 账号使用官方 billing 月度快照，fresh usage 低于阈值即可恢复。
           - 其他账号是 quota 禁用：set_enabled(True) 自动恢复。
           - 账号未禁用：无事发生
 
@@ -1339,15 +1399,16 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
         except Exception:
             threshold = 95.0
 
+    canonical = _resolve_existing_account_key(account_key)
+    if canonical:
+        account_key = canonical
+    provider = provider_of(account_key)
     utils = extract_utils_percent(usage)
-    window_labels = ["5h", "7d", "30d", "sonnet", "opus"]
+    window_labels = ["5h", "7d", "月度" if provider == "xai" else "30d", "sonnet", "opus"]
     hit_windows = [lbl for lbl, u in zip(window_labels, utils)
                    if u is not None and u >= threshold]
     any_over = bool(hit_windows)
 
-    canonical = _resolve_existing_account_key(account_key)
-    if canonical:
-        account_key = canonical
     acc = get_account(account_key)
     if acc is None:
         return {"action": "noop_missing", "utils": utils, "any_over": any_over,
@@ -1392,7 +1453,7 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
     # 提前恢复：OpenAI WHAM 与 Codex 响应头在边界附近会不同步，提前恢复会
     # 造成“恢复通知 → 下一次请求马上响应头禁用”的假恢复。
     if reason == "quota":
-        if provider_of(account_key) == "openai":
+        if provider in ("openai", "xai"):
             if not _usage_has_any_quota_signal(usage):
                 return {"action": "quota_unknown_keep_disabled", "utils": utils,
                         "any_over": False, "hit_windows": [],
@@ -1401,7 +1462,10 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                 return {"action": "quota_stale_keep_disabled", "utils": utils,
                         "any_over": False, "hit_windows": [],
                         "disabled_until": acc.get("disabled_until")}
-            if respect_disabled_until and _quota_disabled_until_still_future(acc):
+            # OpenAI/Codex 的 WHAM 与响应头窗口可能短暂不同步，需等本地
+            # disabled_until 过期；Grok 使用官方 billing 月度快照，fresh 数据
+            # 低于阈值即可恢复，避免充值/提额后被锁到月底。
+            if provider == "openai" and respect_disabled_until and _quota_disabled_until_still_future(acc):
                 return {"action": "quota_cooldown_keep_disabled", "utils": utils,
                         "any_over": False, "hit_windows": [],
                         "disabled_until": acc.get("disabled_until")}
@@ -1696,10 +1760,12 @@ def add_account(entry: dict) -> None:
     """entry 需至少含 email / access_token / refresh_token。
 
     支持可选字段：
-      - provider: "claude" (默认) / "openai"
+      - provider: "claude" (默认) / "openai" / "xai"
       - id_token / chatgpt_account_id / workspace_id / workspace_name /
         workspace_type / organization_id / plan_type / subscription_expires_at
         (OpenAI 专属)
+      - id_token / subject / sub / base_url / token_endpoint / redirect_uri
+        (xAI 专属)
     """
     required = ("email", "access_token", "refresh_token")
     missing = [k for k in required if not entry.get(k)]
@@ -1719,7 +1785,7 @@ def add_account(entry: dict) -> None:
         "refresh_token": entry["refresh_token"],
         "expired": entry.get("expired", ""),
         "last_refresh": entry.get("last_refresh", _format_utc(datetime.now(timezone.utc))),
-        "type": entry.get("type", "openai" if provider == "openai" else "claude"),
+        "type": entry.get("type", provider if provider in ("openai", "xai") else "claude"),
         "enabled": entry.get("enabled", True),
         "disabled_reason": entry.get("disabled_reason"),
         "disabled_until": entry.get("disabled_until"),
@@ -1731,6 +1797,17 @@ def add_account(entry: dict) -> None:
     # OpenAI 专属字段（缺失时保持空串，渲染端按需展示）
     if provider == "openai":
         normalized.update(_openai_metadata_patch(entry))
+    # xAI 专属字段（缺失时保持空串；subject 用于稳定 account_key）
+    elif provider == "xai":
+        subject = str(entry.get("subject") or entry.get("sub") or "")
+        normalized.update({
+            "id_token": entry.get("id_token", "") or "",
+            "subject": subject,
+            "sub": subject,
+            "base_url": entry.get("base_url") or entry.get("baseUrl") or xai_provider.api_base_url(),
+            "token_endpoint": entry.get("token_endpoint") or xai_provider.token_url(),
+            "redirect_uri": entry.get("redirect_uri") or xai_provider.redirect_uri(),
+        })
     # Claude 专属字段（套餐/订阅信息，来自 /api/oauth/profile）
     elif provider == "claude":
         for k in ("plan_type", "rate_limit_tier", "billing_type",
@@ -1740,11 +1817,28 @@ def add_account(entry: dict) -> None:
                 normalized[k] = entry[k]
 
     normalized_key = _account_key(normalized)
+
+    def _matches_xai_target(acc: dict) -> bool:
+        if _acc_provider(acc) != "xai":
+            return False
+        acc_subject = _xai_subject(acc)
+        new_subject = _xai_subject(normalized)
+        if acc_subject and new_subject:
+            return acc_subject == new_subject
+        # Legacy/imported entries may not have subject yet.  Same email is only
+        # used when at least one side lacks subject, so two known xAI subjects
+        # sharing an email never collapse into one account.
+        return str(acc.get("email") or "") == email
+
     added = {"v": False}
     existing_target = None
     for a in config.get().get("oauthAccounts", []):
         if provider == "openai":
-            if _is_openai_acc(a) and _canonical_key(a) == normalized_key:
+            if _acc_provider(a) == provider and _canonical_key(a) == normalized_key:
+                existing_target = a
+                break
+        elif provider == "xai":
+            if _matches_xai_target(a):
                 existing_target = a
                 break
         elif a.get("email") == email and _acc_provider(a) == provider:
@@ -1763,9 +1857,14 @@ def add_account(entry: dict) -> None:
         target: dict | None = None
         if provider == "openai":
             for a in accounts:
-                if not _is_openai_acc(a):
+                if _acc_provider(a) != provider:
                     continue
                 if _canonical_key(a) == normalized_key:
+                    target = a
+                    break
+        elif provider == "xai":
+            for a in accounts:
+                if _matches_xai_target(a):
                     target = a
                     break
         else:
@@ -1775,7 +1874,7 @@ def add_account(entry: dict) -> None:
                     break
 
         if target is not None:
-            if provider != "openai":
+            if provider not in ("openai", "xai"):
                 raise ValueError(
                     f"account already exists: provider={provider} email={email}"
                 )
@@ -1789,7 +1888,7 @@ def add_account(entry: dict) -> None:
             if rename_new_key:
                 lb = cfg.setdefault("loadBalancing", {})
                 po = lb.setdefault("priorityOrders", {})
-                fam = "openai" if provider == "openai" else "anthropic"
+                fam = "openai" if _is_openai_family_provider(provider) else "anthropic"
                 for f in ("anthropic", "openai"):
                     arr = list(po.get(f) or [])
                     new_arr: list[str] = []
@@ -1812,7 +1911,7 @@ def add_account(entry: dict) -> None:
     if added["v"]:
         load_balancing.sync_channel_added(
             f"oauth:{normalized_key}",
-            "openai" if provider == "openai" else "anthropic",
+            "openai" if _is_openai_family_provider(provider) else "anthropic",
         )
 
 
@@ -2244,7 +2343,7 @@ def _build_refresh_notice(account_key: str, usage_flat: dict | None) -> str:
     """构造 OAuth Token 刷新成功通知文案（中文 + HTML + 北京时间 + 用量摘要）。"""
     email = account_key_to_email(account_key)
     prov = provider_of(account_key)
-    prov_tag = "🅾 OpenAI" if prov == "openai" else "🅰 Claude"
+    prov_tag = notifier.provider_tag(prov)
     new_exp = (get_account(account_key) or {}).get("expired")
     parts = [
         "✅ <b>OAuth Token 已刷新</b>",
@@ -2255,6 +2354,16 @@ def _build_refresh_notice(account_key: str, usage_flat: dict | None) -> str:
     # 用量
     if prov == "openai":
         parts.append("📊 用量: <i>由响应头更新（无独立端点）</i>")
+    elif prov == "xai":
+        td_util = (usage_flat or {}).get("thirty_day_util") if usage_flat else None
+        td_reset = (usage_flat or {}).get("thirty_day_reset") if usage_flat else None
+        if td_util is not None:
+            parts.append(
+                f"📊 月度额度: <b>{td_util:.2f}%</b>"
+                f" | 重置: <code>{_to_bjt(td_reset)}</code>"
+            )
+        else:
+            parts.append("📊 月度额度: <i>本次未拉取到</i>")
     elif usage_flat:
         fh_util = usage_flat.get("five_hour_util")
         sd_util = usage_flat.get("seven_day_util")
@@ -2373,10 +2482,10 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
             _rf_plan_tag = ""
             if provider_of(ak) == "claude":
                 _rf_pl = claude_plan_label(acc)
-                _rf_plan_tag = f"\n🅰 Claude · {notifier.escape_html(_rf_pl)}" if _rf_pl else ""
+                _rf_plan_tag = f"\n{notifier.provider_tag('claude')} · {notifier.escape_html(_rf_pl)}" if _rf_pl else ""
             elif provider_of(ak) == "openai":
                 _rf_pl = acc.get("plan_type") or ""
-                _rf_plan_tag = f"\n🅾 OpenAI · {notifier.escape_html(_rf_pl)}" if _rf_pl else ""
+                _rf_plan_tag = f"\n{notifier.provider_tag('openai')} · {notifier.escape_html(_rf_pl)}" if _rf_pl else ""
             notifier.notify_event(
                 "oauth_refresh_failed",
                 "⚠ <b>OAuth Token 刷新失败</b>\n"
@@ -2407,6 +2516,7 @@ async def quota_monitor_once() -> dict:
         if not email:
             continue
         ak = _account_key(acc)
+        provider = provider_of(acc)
         if acc.get("disabled_reason") in ("user", "auth_error"):
             out[email] = f"skipped:{acc['disabled_reason']}"
             continue
@@ -2425,7 +2535,7 @@ async def quota_monitor_once() -> dict:
         # 业务响应头采样时间戳可能早于本轮 wham/usage 主动刷新，误把新数据当 stale。
         # Claude 仍沿用真实 usage API。
         fresh_for_resume = True
-        if provider_of(ak) == "openai" and reason_before == "quota":
+        if provider == "openai" and reason_before == "quota":
             fresh_for_resume = _usage_has_any_quota_signal(usage)
 
         result = evaluate_and_toggle_by_usage(ak, usage, threshold=threshold, fresh=fresh_for_resume)
@@ -2434,12 +2544,14 @@ async def quota_monitor_once() -> dict:
 
         # 通知里追加套餐标签（Claude 显示套餐/tier，OpenAI 显示 plan_type）
         _plan_tag = ""
-        if provider_of(ak) == "claude":
+        if provider == "claude":
             _pl = claude_plan_label(acc)
-            _plan_tag = f"\n🅰 Claude · {notifier.escape_html(_pl)}" if _pl else ""
-        elif provider_of(ak) == "openai":
+            _plan_tag = f"\n{notifier.provider_tag('claude')} · {notifier.escape_html(_pl)}" if _pl else ""
+        elif provider == "openai":
             _label = openai_plan_workspace_label(acc)
-            _plan_tag = f"\n🅾 {notifier.escape_html(_label)}" if _label else ""
+            _plan_tag = f"\n{notifier.provider_custom_emoji_html('openai')} {notifier.escape_html(_label)}" if _label else ""
+        elif provider == "xai":
+            _plan_tag = f"\n{notifier.provider_custom_emoji_html('xai')} Grok"
 
         if action == "disabled":
             latest_reset = result["disabled_until"]
