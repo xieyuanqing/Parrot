@@ -186,10 +186,28 @@ class AttemptResult:
     stream_started: bool = False
     response: Any = None
     http_status: Optional[int] = None
+    # Final/terminal upstream route-round timing.  ``connect_ms`` is the business
+    # connection metric defined by transport mode (HTTP stream→final headers,
+    # HTTP non-stream→request body sent, WS→handshake return), never TCP-only.
+    round_id: Optional[str] = None
     connect_ms: Optional[int] = None
     first_byte_ms: Optional[int] = None
+    idle_ms: Optional[int] = None
     total_ms: Optional[int] = None
+    # Outer channel-attempt elapsed is stored separately and never aliases total_ms.
+    attempt_elapsed_ms: Optional[int] = None
+    request_upload_ms: Optional[int] = None
+    response_headers_wait_ms: Optional[int] = None
+    response_body_first_byte_wait_ms: Optional[int] = None
+    dns_ms: Optional[int] = None
+    tcp_ms: Optional[int] = None
+    proxy_tcp_ms: Optional[int] = None
+    proxy_tunnel_ms: Optional[int] = None
+    tls_ms: Optional[int] = None
+    target_tls_ms: Optional[int] = None
+    ws_handshake_ms: Optional[int] = None
     error_detail: Optional[str] = None
+    error_code: Optional[str] = None
     usage: dict = field(default_factory=lambda: {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -228,7 +246,7 @@ async def prepare_non_stream_response(
     raw: bytes,
     *,
     dynamic_map: Optional[dict],
-    connect_ms: int,
+    connect_ms: int | None,
     total_ms: int,
     translator_ctx: Optional[dict] = None,
 ) -> PreparedNonStreamResponse:
@@ -341,7 +359,11 @@ def should_record_failure(outcome: str) -> bool:
 def failover_final_http_status(result: Any | None) -> int:
     """HTTP status for the final all-candidates-failed JSON response."""
     outcome = getattr(result, "outcome", None)
-    if outcome in ("connect_timeout", "first_byte_timeout", "total_timeout"):
+    if outcome in (
+        "connection_timeout", "http_connect_timeout", "pool_timeout",
+        "write_timeout", "read_timeout", "transport_timeout",
+        "connect_timeout", "first_byte_timeout", "idle_timeout", "total_timeout",
+    ):
         return 504
     if outcome in ("connect_error", "transport_error"):
         return 502
@@ -356,7 +378,11 @@ def upstream_ws_http_status_from_attempt(result: Any) -> int:
     if http_status is not None:
         return int(http_status)
     outcome = getattr(result, "outcome", None)
-    if outcome in ("connect_timeout", "first_byte_timeout", "idle_timeout", "total_timeout"):
+    if outcome in (
+        "connection_timeout", "http_connect_timeout", "pool_timeout",
+        "write_timeout", "read_timeout", "transport_timeout",
+        "connect_timeout", "first_byte_timeout", "idle_timeout", "total_timeout",
+    ):
         return 504
     if outcome in ("blacklist_hit", "upstream_error_json", "stream_upstream_error"):
         return 503
@@ -370,7 +396,11 @@ def responses_ws_http_status_from_attempt(result: Any | None) -> int:
     if result is not None and getattr(result, "http_status", None):
         return int(getattr(result, "http_status"))
     outcome = getattr(result, "outcome", None) if result is not None else None
-    if outcome in ("connect_timeout", "first_byte_timeout", "idle_timeout", "total_timeout"):
+    if outcome in (
+        "connection_timeout", "http_connect_timeout", "pool_timeout",
+        "write_timeout", "read_timeout", "transport_timeout",
+        "connect_timeout", "first_byte_timeout", "idle_timeout", "total_timeout",
+    ):
         return 504
     if outcome in ("connect_error", "transport_error", "upstream_closed", "closed_before_first_byte"):
         return 502
@@ -596,11 +626,32 @@ def _mark_request_invalid(result: AttemptResult, status: int) -> AttemptResult:
     return result
 
 
+def _structured_http_request_invalid_error_info(
+    result: AttemptResult,
+) -> tuple[str | None, str] | None:
+    """Return safe code/message for an explicit pre-commit HTTP 400 input error."""
+    if result.outcome != "http_error" or result.http_status != 400:
+        return None
+    raw = str(result.error_detail or "").strip()
+    prefix = "HTTP 400:"
+    if raw.startswith(prefix):
+        raw = raw[len(prefix):].lstrip()
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return None
+    return protocol_errors.request_invalid_error_info(payload)
+
+
 def request_invalid_result_if_needed(result: AttemptResult) -> AttemptResult:
     if is_invalid_encrypted_content_error(result.error_detail):
         return _mark_request_invalid(result, 400)
     if is_context_length_exceeded_error(result.error_detail):
         return _mark_request_invalid(result, _request_invalid_status(result))
+    request_error = _structured_http_request_invalid_error_info(result)
+    if request_error is not None:
+        result.error_code, result.error_detail = request_error
+        return _mark_request_invalid(result, 400)
     return result
 
 

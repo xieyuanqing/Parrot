@@ -172,8 +172,12 @@ def _merge_group_stats(members: list[str], pstats: dict) -> dict:
               "cache_creation_tokens": 0, "cache_read_tokens": 0,
               "total_tokens": 0,
               "bytes_up": 0, "bytes_down": 0, "total_bytes": 0,
-              "avg_connect_ms": 0, "avg_first_byte_ms": 0, "avg_total_ms": 0}
-    count = 0
+              "connect_sum_ms": 0, "connect_sample_count": 0,
+              "first_byte_sum_ms": 0, "first_byte_sample_count": 0,
+              "idle_sum_ms": 0, "idle_sample_count": 0,
+              "total_sum_ms": 0, "total_sample_count": 0,
+              "avg_connect_ms": 0, "avg_first_byte_ms": 0,
+              "avg_idle_ms": 0, "avg_total_ms": 0}
     for m in members:
         if m == "direct":
             continue
@@ -191,14 +195,22 @@ def _merge_group_stats(members: list[str], pstats: dict) -> dict:
         merged["bytes_up"] += int(ps.get("bytes_up", 0) or 0)
         merged["bytes_down"] += int(ps.get("bytes_down", 0) or 0)
         merged["total_bytes"] += int(ps.get("total_bytes", 0) or 0)
-        merged["avg_connect_ms"] += ps["avg_connect_ms"] * ps["requests"]
-        merged["avg_first_byte_ms"] += ps["avg_first_byte_ms"] * ps["requests"]
-        merged["avg_total_ms"] += ps["avg_total_ms"] * ps["requests"]
-        count += ps["requests"]
-    if count > 0:
-        merged["avg_connect_ms"] = round(merged["avg_connect_ms"] / count)
-        merged["avg_first_byte_ms"] = round(merged["avg_first_byte_ms"] / count)
-        merged["avg_total_ms"] = round(merged["avg_total_ms"] / count)
+        for sum_key, count_key in (
+            ("connect_sum_ms", "connect_sample_count"),
+            ("first_byte_sum_ms", "first_byte_sample_count"),
+            ("idle_sum_ms", "idle_sample_count"),
+            ("total_sum_ms", "total_sample_count"),
+        ):
+            merged[sum_key] += int(ps.get(sum_key) or 0)
+            merged[count_key] += int(ps.get(count_key) or 0)
+    for avg_key, sum_key, count_key in (
+        ("avg_connect_ms", "connect_sum_ms", "connect_sample_count"),
+        ("avg_first_byte_ms", "first_byte_sum_ms", "first_byte_sample_count"),
+        ("avg_idle_ms", "idle_sum_ms", "idle_sample_count"),
+        ("avg_total_ms", "total_sum_ms", "total_sample_count"),
+    ):
+        count = int(merged[count_key] or 0)
+        merged[avg_key] = round(merged[sum_key] / count) if count else 0
     return merged
 
 
@@ -877,6 +889,7 @@ def _show_routing(chat_id: int, message_id: int, cb_id: str) -> None:
     r = pm.get_routing()
 
     default_route = r.get("default", "direct")
+    direct_fallback = bool(r.get("directFallback", False))
     acct_count = len(r.get("accounts") or {})
     ch_count = len(r.get("channels") or {})
     model_count = len(r.get("models") or {})
@@ -892,7 +905,14 @@ def _show_routing(chat_id: int, message_id: int, cb_id: str) -> None:
     lines = [
         "🎯 <b>路由规则</b>", "",
         "<i>优先级: 账号 = 渠道 > 模型 > 功能路由 > 默认路由</i>", "",
-        f"📌 默认路由: <code>{ui.escape_html(str(default_route))}</code>", "",
+        f"📌 默认路由: <code>{ui.escape_html(str(default_route))}</code>",
+        f"🛟 直连兜底: <b>{'开启' if direct_fallback else '关闭'}</b>",
+        (
+            "<i>已配置的非直连路由异常时，会在代理链末尾尝试 direct；可能暴露本机出口。</i>"
+            if direct_fallback else
+            "<i>已配置的非直连路由异常时保持失败，不会静默改走 direct；未配置网络规则时仍正常直连。</i>"
+        ),
+        "",
         "📡 功能路由：",
     ]
     if func_lines:
@@ -905,12 +925,20 @@ def _show_routing(chat_id: int, message_id: int, cb_id: str) -> None:
     rows = [
         [ui.btn("📌 默认路由", "px:rt_pick:default"),
          ui.btn("📡 功能路由", "px:rt_func")],
+        [ui.btn(f"🛟 直连兜底：{'开启' if direct_fallback else '关闭'}", "px:rt_df")],
         [ui.btn("👤 账号路由", "px:rt_accounts"),
          ui.btn("📦 渠道路由", "px:rt_channels"),
          ui.btn("🤖 模型路由", "px:rt_models")],
         [ui.btn("◀ 返回网络设置", "sys:show:network")],
     ]
     ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb(rows))
+
+
+def _toggle_direct_fallback(chat_id: int, message_id: int, cb_id: str) -> None:
+    enabled = not pm.direct_fallback_enabled()
+    pm.set_direct_fallback(enabled)
+    ui.answer_cb(cb_id, "直连兜底已开启" if enabled else "直连兜底已关闭")
+    _show_routing(chat_id, message_id, "")
 
 
 # ── target picker (shared for all) ──────────────────────────────
@@ -1253,6 +1281,8 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     # 路由规则
     if data == "px:routing":
         _show_routing(chat_id, message_id, cb_id); return True
+    if data == "px:rt_df":
+        _toggle_direct_fallback(chat_id, message_id, cb_id); return True
     if data == "px:rt_func":
         _show_func_routing(chat_id, message_id, cb_id); return True
     if data == "px:rt_accounts":

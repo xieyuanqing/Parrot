@@ -8,6 +8,7 @@ import copy
 import json
 import os
 import shutil
+import tempfile
 import threading
 from typing import Any
 
@@ -101,6 +102,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "defaultMaxConcurrent": 5,
         "defaultMaxQueue": 50,
         "defaultQueueWaitSeconds": 1800,
+        # 排队期间 disconnect watcher 会预读并回放请求体；以下单请求字节/事件
+        # 上限只约束该 replay 资源。非排队核心 API 保持各协议入口原有契约；图片
+        # 入口另按 maxInputImageBytes 和 multipart/JSON 形态执行 endpoint 上限。
+        "defaultMaxRequestBodyBytes": 8388608,
+        "defaultMaxRequestBodyEvents": 4096,
+        "defaultMaxQueuedBodyBytesPerKey": 33554432,
+        "maxQueuedBodyBytes": 134217728,
+        "queuedBodySpoolThresholdBytes": 1048576,
+        "defaultMaxQueuedBodySpoolBytesPerKey": 536870912,
+        "maxQueuedBodySpoolBytes": 2147483648,
     },
     "oauthAccounts": [],
     "channels": [],
@@ -155,6 +166,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "groups": {},
         "routing": {
             "default": "direct",
+            # 仅当已配置的非直连路由无法解析/建立时，才允许自动追加 direct。
+            # 未配置任何网络规则时仍按正常默认值直连，不受此开关限制。
+            "directFallback": False,
             # "telegram": "direct",
             # "oauth": "direct",
             # "models": {},
@@ -469,6 +483,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
     },
     "logDir": "logs",
+    # 请求业务日志留存：forever = 永久保留；days = 仅保留最近 N 天（N >= 1）。
+    # 无效/缺失配置在运行时 fail-closed 为 forever，避免升级或手工编辑误删日志。
+    "logRetention": {
+        "mode": "forever",
+        "days": None,
+    },
     "stateDbPath": "state.db",
     # OpenAI OAuth/Codex 简化配置。旧版 oauth.providers.openai 仍兼容；加载旧配置时会自动补齐到这里。
     "openaiOAuth": {
@@ -545,10 +565,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 _cache: dict[str, Any] | None = None
 _mtime: float = 0.0
-# 必须是可重入锁 (RLock)：
-# update() 持锁后调 _fire_reload_callbacks → registry._on_reload →
-# rebuild_from_config() → config.get() 又试图获取本锁。
-# 用 threading.Lock (non-reentrant) 会让同线程二次 acquire 永久死锁。
+# 必须是可重入锁 (RLock)：同一线程内的加载/保存辅助函数可能再次访问配置。
+# reload callbacks 始终在锁外执行，避免 callback 跨模块重入造成死锁。
 _lock = threading.RLock()
 _reload_callbacks: list = []
 
@@ -685,20 +703,29 @@ def _rotate_backups() -> None:
 
 
 def _write_atomic(data: dict) -> None:
-    tmp = CONFIG_PATH + ".tmp"
+    """Write through a private 0600 temp file, then atomically replace config."""
+    parent = os.path.dirname(os.path.abspath(CONFIG_PATH)) or "."
+    prefix = f".{os.path.basename(CONFIG_PATH)}."
+    fd, tmp = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=parent, text=True)
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        stream = os.fdopen(fd, "w", encoding="utf-8")
+        fd = -1
+        with stream as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
         _rotate_backups()
         os.replace(tmp, CONFIG_PATH)
-    except Exception:
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             os.unlink(tmp)
         except OSError:
             pass
-        raise
 
 
 def _current_mtime() -> float:
@@ -756,23 +783,28 @@ def save() -> None:
         _mtime = _current_mtime()
 
 
-def update(mutator) -> dict:
-    """以 mutator(cfg) 的方式修改 cfg 并持久化。
+def update(mutator, *, skip_if_unchanged: bool = False) -> dict:
+    """以 mutator(cfg) 的方式原子修改 cfg 并持久化。
 
     `mutator` 是一个接受当前 cfg dict 的函数，可原地修改；返回值被忽略。
-    调用完成后自动持久化并触发回调。
+    mutator 只接触当前配置的深拷贝；候选配置持久化成功后才发布为共享
+    cache 并触发回调。这样写盘失败不会留下仅当前进程可见的半提交状态。
 
     **callback 在锁外执行**：避免 callback 内访问 config 接口时被自身锁阻塞，
     也消除其它跨模块 callback 链可能产生的死锁。
     """
-    global _mtime
+    global _cache, _mtime
     with _lock:
         if _cache is None:
             _ensure_loaded()
-        mutator(_cache)
-        _write_atomic(_cache)
+        candidate = copy.deepcopy(_cache)
+        mutator(candidate)
+        if skip_if_unchanged and candidate == _cache:
+            return _cache
+        _write_atomic(candidate)
         _mtime = _current_mtime()
-        snapshot = _cache
+        _cache = candidate
+        snapshot = candidate
     _fire_reload_callbacks(snapshot)
     return snapshot
 

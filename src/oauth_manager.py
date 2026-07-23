@@ -1211,17 +1211,16 @@ def evaluate_and_toggle_by_cached_quota(account_key: str,
                 "disabled_until": None}
     return evaluate_and_toggle_by_usage(account_key, usage, threshold=threshold)
 
-def _quota_disabled_until_still_future(acc: dict) -> bool:
-    dt = _parse_iso(acc.get("disabled_until"))
-    if dt is None:
-        return False
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt > datetime.now(timezone.utc)
-
-
 def _usage_has_any_quota_signal(usage: dict) -> bool:
     return any(u is not None for u in extract_utils_percent(usage))
+
+
+def _explicit_openai_wham_limit(usage: dict) -> bool:
+    """Whether a WHAM response explicitly says routing is unavailable."""
+    openai = usage.get("openai") if isinstance(usage, dict) else None
+    if not isinstance(openai, dict) or openai.get("source") != "wham_usage":
+        return False
+    return openai.get("allowed") is False or openai.get("limit_reached") is True
 
 
 def openai_plan_workspace_label(acc: dict | None) -> str:
@@ -1360,8 +1359,7 @@ def _cached_openai_codex_quota_hit(account_key: str, threshold: float) -> dict:
 
 def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                                  *, threshold: float | None = None,
-                                 fresh: bool = True,
-                                 respect_disabled_until: bool = True) -> dict:
+                                 fresh: bool = True) -> dict:
     """核心策略：拿到新鲜 usage 后评估禁用/恢复，并执行状态切换。
 
     规则：
@@ -1372,19 +1370,18 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
       • 所有窗口 util < threshold → 可用
           - OpenAI / Grok 账号若 usage 没有任何窗口指标，或这份 usage 不是本轮新鲜探测，
             不能作为恢复依据；保持原 quota 禁用状态，避免“未知=恢复”误判。
-          - OpenAI 账号若仍处于 disabled_until 冷却期，或仍有未过期的 Codex
-            响应头超限快照，继续保持 quota 禁用，避免 WHAM/Codex 边界不同步
-            导致“假恢复”。
-          - OpenAI 账号只有在冷却期/响应头快照都过期，且本轮新鲜有效 usage
-            全部低于阈值时，才 set_enabled(True) 自动恢复。
-            respect_disabled_until=False 的官方 reset credit / 手动强刷新路径例外：
-            上游已确认消耗 reset 后，可用新鲜 usage 直接覆盖本地旧冷却时间。
+          - OpenAI 账号若仍有未过期的 Codex 响应头超限快照，继续保持 quota
+            禁用，避免 WHAM/Codex 边界不同步导致“假恢复”。
+          - 若 Codex 没有活动的超限快照，且本轮新鲜有效 usage 全部低于阈值，
+            说明上游窗口已经重置；直接恢复并清除旧 disabled_until。旧时间只是
+            上次超限时的预测，不能覆盖更新后的上游事实。
           - Grok 账号使用官方 billing 月度快照，fresh usage 低于阈值即可恢复。
           - 其他账号是 quota 禁用：set_enabled(True) 自动恢复。
           - 账号未禁用：无事发生
 
     返回: {
       "action": "noop_user"|"noop_auth_error"|"disabled"|"still_over_quota"|
+                "wham_limit_disabled"|"wham_limit_keep_disabled"|
                 "resumed"|"kept_enabled"|"disable_failed"|"resume_failed"|"noop_missing",
       "utils": [5h, 7d, 30d, sonnet, opus],   # None 表示该指标缺失
       "any_over": bool,
@@ -1419,6 +1416,28 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                 "hit_windows": hit_windows,
                 "disabled_until": acc.get("disabled_until")}
 
+    # WHAM's explicit gate is authoritative even when its percentage windows
+    # are absent or temporarily report a low number.  In particular, never turn
+    # "allowed: false" / "limit_reached: true" into quota recovery.
+    wham_limit = provider == "openai" and _explicit_openai_wham_limit(usage)
+    if wham_limit:
+        hit_windows.append("WHAM limit")
+        if reason == "quota":
+            return {"action": "wham_limit_keep_disabled", "utils": utils,
+                    "any_over": True, "hit_windows": hit_windows,
+                    "disabled_until": acc.get("disabled_until")}
+        latest_reset = reset_iso_for_hit_windows(usage, threshold)
+        try:
+            set_disabled_by_quota(account_key, latest_reset)
+        except Exception as exc:
+            print(f"[oauth] evaluate WHAM disable failed for {account_key}: {exc}")
+            return {"action": "disable_failed", "utils": utils,
+                    "any_over": True, "hit_windows": hit_windows,
+                    "disabled_until": None}
+        return {"action": "wham_limit_disabled", "utils": utils,
+                "any_over": True, "hit_windows": hit_windows,
+                "disabled_until": latest_reset}
+
     cached_codex_hit = None
     if provider_of(account_key) == "openai":
         cached_codex_hit = _cached_openai_codex_quota_hit(account_key, threshold)
@@ -1447,11 +1466,10 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
         return {"action": "disabled", "utils": utils, "any_over": True,
                 "hit_windows": hit_windows, "disabled_until": latest_reset}
 
-    # 全部窗口都可用。OpenAI 的 usage 来自响应头/最小 probe 的缓存合成，
-    # 空缓存或被节流跳过的旧缓存不能证明额度恢复；尤其 quota 禁用账号不能
-    # 因 [None, None, None, None] 被误恢复。若 disabled_until 仍在未来，也不
-    # 提前恢复：OpenAI WHAM 与 Codex 响应头在边界附近会不同步，提前恢复会
-    # 造成“恢复通知 → 下一次请求马上响应头禁用”的假恢复。
+    # 全部窗口都可用。空缓存或被节流跳过的旧缓存不能证明额度恢复；尤其
+    # quota 禁用账号不能因 [None, None, None, None] 被误恢复。OpenAI 若仍有
+    # 活动的 Codex 超限快照，前面的 any_over 分支已经保持禁用；否则新鲜
+    # WHAM 低用量应覆盖旧 disabled_until，因为后者只是上次超限时的预测。
     if reason == "quota":
         if provider in ("openai", "xai"):
             if not _usage_has_any_quota_signal(usage):
@@ -1462,22 +1480,59 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                 return {"action": "quota_stale_keep_disabled", "utils": utils,
                         "any_over": False, "hit_windows": [],
                         "disabled_until": acc.get("disabled_until")}
-            # OpenAI/Codex 的 WHAM 与响应头窗口可能短暂不同步，需等本地
-            # disabled_until 过期；Grok 使用官方 billing 月度快照，fresh 数据
-            # 低于阈值即可恢复，避免充值/提额后被锁到月底。
-            if provider == "openai" and respect_disabled_until and _quota_disabled_until_still_future(acc):
-                return {"action": "quota_cooldown_keep_disabled", "utils": utils,
+        runtime_state = None
+        if provider == "openai" and fresh:
+            # Clear persistent/runtime routing blockers before enabling. The
+            # cooldown clear itself is DB-first, so a failed delete leaves the
+            # current process and a restarted process consistently blocked.
+            runtime_state = _clear_oauth_runtime_state(
+                account_key,
+                clear_quota_cache=False,
+                notify_recovered=False,
+            )
+            if not runtime_state.get("required_state_cleared"):
+                print(
+                    f"[oauth] evaluate resume blocked by runtime state for "
+                    f"{account_key}: {runtime_state}"
+                )
+                return {"action": "resume_failed", "utils": utils,
                         "any_over": False, "hit_windows": [],
-                        "disabled_until": acc.get("disabled_until")}
+                        "disabled_until": acc.get("disabled_until"),
+                        "error_code": "runtime_state_clear_failed",
+                        "runtime_state": runtime_state}
         try:
-            set_enabled(account_key, True)
+            enable_result = set_enabled(
+                account_key, True, expected_disabled_reason="quota",
+            )
         except Exception as exc:
             print(f"[oauth] evaluate set_enabled failed for {account_key}: {exc}")
             return {"action": "resume_failed", "utils": utils,
                     "any_over": False, "hit_windows": [],
-                    "disabled_until": acc.get("disabled_until")}
-        return {"action": "resumed", "utils": utils, "any_over": False,
-                "hit_windows": [], "disabled_until": None}
+                    "disabled_until": acc.get("disabled_until"),
+                    "error_code": "account_enable_failed",
+                    "runtime_state": runtime_state}
+        enable_state = (enable_result or {}).get("state")
+        if enable_state == "enabled":
+            return {"action": "resumed", "utils": utils, "any_over": False,
+                    "hit_windows": [], "disabled_until": None,
+                    "runtime_state": runtime_state}
+        if enable_state == "already_enabled":
+            return {"action": "kept_enabled", "utils": utils, "any_over": False,
+                    "hit_windows": [], "disabled_until": None,
+                    "runtime_state": runtime_state}
+        if enable_state == "missing":
+            action = "noop_missing"
+        else:
+            current_reason = (enable_result or {}).get("disabled_reason")
+            action = (f"noop_{current_reason}"
+                      if current_reason in ("user", "auth_error")
+                      else enable_state or "state_conflict")
+        return {"action": action, "utils": utils, "any_over": False,
+                "hit_windows": [],
+                "disabled_until": (enable_result or {}).get("disabled_until"),
+                "disabled_reason": (enable_result or {}).get("disabled_reason"),
+                "error_code": "account_state_conflict",
+                "runtime_state": runtime_state}
     return {"action": "kept_enabled", "utils": utils, "any_over": False,
             "hit_windows": [], "disabled_until": None}
 
@@ -1942,8 +1997,10 @@ def delete_account(account_key: str) -> None:
     ch_key = f"oauth:{cleanup_key}"
     load_balancing.sync_channel_removed(ch_key)
     state_db.perf_delete(ch_key)
-    state_db.error_delete(ch_key)
-    # 走内存 + state.db 双清接口，避免只清硬盘留下内存脏亲和。
+    # cooldown 与亲和都必须走各自的内存 + state.db 双清接口；否则同一
+    # account key 在当前进程内重新添加后可能继承只存在于内存的冻结状态。
+    from . import cooldown as _cooldown
+    _cooldown.clear(ch_key, notify_recovered=False)
     from . import affinity as _affinity
     _affinity.delete_by_channel(ch_key)
     try:
@@ -1963,11 +2020,18 @@ def delete_account(account_key: str) -> None:
     forget_openai_probe(cleanup_key)
 
 
+_EXPECTED_REASON_UNSET = object()
+
+
 def set_enabled(account_key: str, enabled: bool, reason: str | None = None,
-                disabled_until: str | None = None) -> None:
+                disabled_until: str | None = None, *,
+                expected_disabled_reason=_EXPECTED_REASON_UNSET) -> dict | None:
+    """Set account state; recovery may require the account to still be quota-disabled."""
     canonical = _resolve_existing_account_key(account_key)
     has_prov = ":" in account_key
     target_provider, target_identity = _split_ak(account_key)
+    conditional = expected_disabled_reason is not _EXPECTED_REASON_UNSET
+    decision = {"state": "missing", "disabled_reason": None, "disabled_until": None}
 
     def mutate(cfg):
         for acc in cfg.get("oauthAccounts", []):
@@ -1979,6 +2043,23 @@ def set_enabled(account_key: str, enabled: bool, reason: str | None = None,
                     continue
                 if has_prov and _acc_provider(acc) != target_provider:
                     continue
+            if conditional:
+                current_reason = acc.get("disabled_reason")
+                current_enabled = acc.get("enabled")
+                decision.update(disabled_reason=current_reason,
+                                disabled_until=acc.get("disabled_until"))
+                if type(current_enabled) is not bool:
+                    decision["state"] = "invalid_state"
+                    return
+                if current_enabled:
+                    decision["state"] = (
+                        "already_enabled" if not current_reason else "invalid_state"
+                    )
+                    return
+                if current_reason != expected_disabled_reason:
+                    decision["state"] = "state_conflict"
+                    return
+                decision["state"] = "enabled"
             acc["enabled"] = enabled
             if enabled:
                 acc["disabled_reason"] = None
@@ -1987,27 +2068,39 @@ def set_enabled(account_key: str, enabled: bool, reason: str | None = None,
                 acc["disabled_reason"] = reason or "user"
                 acc["disabled_until"] = disabled_until
             return
-    config.update(mutate)
+    config.update(mutate, skip_if_unchanged=conditional)
+    return decision if conditional else None
 
 
 def set_disabled_by_quota(account_key: str, resets_at: str | None) -> None:
     set_enabled(account_key, False, reason="quota", disabled_until=resets_at)
 
 
-def _clear_oauth_runtime_state(canonical: str, *, clear_quota_cache: bool) -> dict:
+def _clear_oauth_runtime_state(canonical: str, *, clear_quota_cache: bool,
+                               notify_recovered: bool = True) -> dict:
     """Clear local runtime state for one OAuth channel.
 
-    `clear_quota_cache=False` is used after an official OpenAI reset, because the
-    fresh quota row has just been saved and must remain visible/evaluable.
+    `clear_quota_cache=False` preserves the fresh quota row used to prove
+    recovery. ``required_state_cleared`` is true only when every persistent
+    state required for routing recovery was committed successfully. Callers
+    which must persist a later account-enable commit pass ``notify_recovered=False``
+    so clearing an intermediate blocker cannot emit a false recovery notice.
     """
     ch_key = f"oauth:{canonical}"
-    out = {"channel_key": ch_key, "quota_cache_cleared": False}
+    out = {
+        "channel_key": ch_key,
+        "cooldown_cleared": False,
+        "quota_cache_cleared": False,
+        "snapshots_cleared": False,
+    }
     try:
         from . import cooldown
-        cooldown.clear(ch_key, model=None)
+        cooldown.clear(
+            ch_key, model=None, notify_recovered=notify_recovered,
+        )
         out["cooldown_cleared"] = True
     except Exception as exc:
-        out["cooldown_error"] = str(exc)
+        out["cooldown_error"] = type(exc).__name__
         print(f"[oauth] runtime clear cooldown failed for {canonical}: {exc}")
 
     if clear_quota_cache:
@@ -2015,7 +2108,7 @@ def _clear_oauth_runtime_state(canonical: str, *, clear_quota_cache: bool) -> di
             state_db.quota_delete(canonical)
             out["quota_cache_cleared"] = True
         except Exception as exc:
-            out["quota_cache_error"] = str(exc)
+            out["quota_cache_error"] = type(exc).__name__
             print(f"[oauth] runtime clear quota cache failed for {canonical}: {exc}")
 
     try:
@@ -2024,9 +2117,13 @@ def _clear_oauth_runtime_state(canonical: str, *, clear_quota_cache: bool) -> di
         failover.forget_anthropic_snapshot(canonical)
         out["snapshots_cleared"] = True
     except Exception as exc:
-        out["snapshot_error"] = str(exc)
+        out["snapshot_error"] = type(exc).__name__
         print(f"[oauth] runtime clear snapshot failed for {canonical}: {exc}")
     forget_openai_probe(canonical)
+    out["required_state_cleared"] = bool(
+        out["cooldown_cleared"]
+        and (not clear_quota_cache or out["quota_cache_cleared"])
+    )
     return out
 
 
@@ -2036,7 +2133,8 @@ def reset_quota(account_key: str) -> dict:
     This mirrors CLIProxyAPI's ResetQuota semantics: it does not reset upstream
     limits, but clears Parrot's local quota-disabled state and model cooldown so
     the account can participate in routing again. User-disabled and auth_error
-    accounts are intentionally left untouched.
+    accounts are intentionally left untouched. A quota-disabled account is only
+    enabled after every required local blocker was durably cleared.
     """
     acc = get_account(account_key)
     if acc is None:
@@ -2048,11 +2146,57 @@ def reset_quota(account_key: str) -> dict:
         return {"action": f"noop_{reason}", "account_key": canonical,
                 "disabled_reason": reason}
 
-    action = "reset" if reason == "quota" else "cleared_runtime_state"
-    if reason == "quota":
-        set_enabled(canonical, True)
+    # For quota-disabled accounts, TG is the final success receipt. Suppress the
+    # lower-level channel recovery notice until the account-enable commit exists;
+    # on failure there must be no recovery signal at all.
+    runtime = _clear_oauth_runtime_state(
+        canonical,
+        clear_quota_cache=True,
+        notify_recovered=reason != "quota",
+    )
+    if not runtime.get("required_state_cleared"):
+        return {
+            "action": "reset_failed",
+            "error_code": "runtime_state_clear_failed",
+            "account_key": canonical,
+            "disabled_reason": reason,
+            **runtime,
+        }
 
-    runtime = _clear_oauth_runtime_state(canonical, clear_quota_cache=True)
+    if reason == "quota":
+        try:
+            enable_result = set_enabled(
+                canonical, True, expected_disabled_reason="quota",
+            )
+        except Exception as exc:
+            print(f"[oauth] reset quota enable failed for {canonical}: {exc}")
+            return {
+                "action": "reset_failed",
+                "error_code": "account_enable_failed",
+                "enable_error": type(exc).__name__,
+                "account_key": canonical,
+                "disabled_reason": reason,
+                **runtime,
+            }
+        enable_state = (enable_result or {}).get("state")
+        if enable_state == "enabled":
+            action = "reset"
+        elif enable_state == "already_enabled":
+            action = "already_enabled"
+        elif enable_state == "missing":
+            action = "noop_missing"
+        else:
+            current_reason = (enable_result or {}).get("disabled_reason")
+            action = (f"noop_{current_reason}"
+                      if current_reason in ("user", "auth_error")
+                      else enable_state or "state_conflict")
+            return {"action": action, "error_code": "account_state_conflict",
+                    "account_key": canonical, "disabled_reason": current_reason,
+                    "disabled_until": (enable_result or {}).get("disabled_until"),
+                    **runtime}
+    else:
+        action = "cleared_runtime_state"
+
     return {"action": action, "account_key": canonical,
             "disabled_reason": reason, **runtime}
 
@@ -2116,11 +2260,11 @@ async def redeem_openai_rate_limit_reset_credit(account_key: str,
     if isinstance(reset_credits, dict) and reset_credits.get("available_count") is not None:
         out["available_count"] = reset_credits.get("available_count")
 
-    eval_result = evaluate_and_toggle_by_usage(
-        canonical, usage, fresh=True, respect_disabled_until=False,
-    )
+    eval_result = evaluate_and_toggle_by_usage(canonical, usage, fresh=True)
     out["quota_action"] = eval_result
-    if eval_result.get("action") in ("resumed", "kept_enabled") and not eval_result.get("any_over"):
+    if eval_result.get("action") == "resumed":
+        out["runtime_clear"] = eval_result.get("runtime_state")
+    elif eval_result.get("action") == "kept_enabled" and not eval_result.get("any_over"):
         out["runtime_clear"] = _clear_oauth_runtime_state(canonical, clear_quota_cache=False)
     return out
 
@@ -2553,7 +2697,7 @@ async def quota_monitor_once() -> dict:
         elif provider == "xai":
             _plan_tag = f"\n{notifier.provider_custom_emoji_html('xai')} Grok"
 
-        if action == "disabled":
+        if action in ("disabled", "wham_limit_disabled"):
             latest_reset = result["disabled_until"]
             hit = " / ".join(result["hit_windows"]) or "?"
             out[email] = f"disabled_quota:{latest_reset}"
@@ -2565,8 +2709,8 @@ async def quota_monitor_once() -> dict:
                 f"重置时间: <code>{_to_bjt(latest_reset) if latest_reset else 'unknown'}</code>\n"
                 "所有撞到窗口恢复后即可自动解禁。"
             )
-        elif action == "still_over_quota":
-            out[email] = "still_over_quota"
+        elif action in ("still_over_quota", "wham_limit_keep_disabled"):
+            out[email] = action
         elif action == "resumed":
             out[email] = "resumed"
             notifier.throttled_notify_event_sync(

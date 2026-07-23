@@ -11,13 +11,18 @@
 写操作由 `_write_lock` 序列化；跨月自动切换连接。
 """
 
+import hashlib
 import json
 import os
+import re
+import shutil
 import sqlite3
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from pathlib import Path
+from typing import Any, Literal
 
 from . import config
 
@@ -28,6 +33,67 @@ _local = threading.local()
 _write_lock = threading.RLock()
 _initialized = False
 _log_dir: str | None = None
+
+# 日志留存清理在独立锁下串行运行；真正删除 / VACUUM 时还会持有
+# _write_lock，避免与请求流水写入交错。
+_retention_lock = threading.Lock()
+_retention_auto_lock = threading.Lock()
+_last_retention_cleanup_key: tuple[int, str] | None = None
+
+# 每线程仍通过 _local 缓存连接；额外登记是为了整月删除前可以关闭旧月的
+# 空闲写连接，使 unlink 后磁盘空间能够立即回收，而不是等 worker 线程退出。
+_write_conn_registry_lock = threading.Lock()
+_write_conn_registry: dict[str, list[sqlite3.Connection]] = {}
+_retired_log_paths: set[str] = set()
+
+_MONTH_LOG_NAME_RE = re.compile(r"^(?P<year>\d{4})-(?P<month>\d{2})\.db$")
+_RETENTION_MODE_FOREVER = "forever"
+_RETENTION_MODE_DAYS = "days"
+_RETENTION_CHILD_TABLES = ("request_detail", "retry_chain", "proxy_chain", "local_web_log")
+# SQLite VACUUM 在最坏情况下会临时占用约两倍原库空间；额外留出 10%（至少 512 MiB）
+# 以容纳 WAL / 并发写入等波动。
+_RETENTION_VACUUM_MIN_MARGIN_BYTES = 512 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class LogDbRef:
+    """A concrete monthly database identity captured when a row is created."""
+
+    month: str
+    path: str
+
+
+@dataclass(frozen=True)
+class RequestLogHandle:
+    request_id: str
+    db: LogDbRef
+
+
+@dataclass(frozen=True)
+class RowLogHandle:
+    table: Literal["retry_chain", "proxy_chain", "local_web_log"]
+    row_id: int
+    request_id: str
+    db: LogDbRef
+
+    def __int__(self) -> int:
+        """Compatibility for old tests/diagnostics; production updates use handle."""
+
+        return self.row_id
+
+
+class HistoricalLogError(RuntimeError):
+    """A historical month couldn't be queried read-only and must not be skipped."""
+
+
+class RetentionPlanError(RuntimeError):
+    """A retention plan cannot be safely executed in the current log state."""
+
+
+# Compatibility lookup for call sites migrated incrementally.  The authoritative
+# value is still the immutable handle returned by insert_pending; S5/S6 thread it
+# explicitly through active request paths.
+_request_handles: dict[str, RequestLogHandle] = {}
 
 
 def _resolve_log_dir() -> str:
@@ -62,9 +128,17 @@ def _schema_sql() -> str:
       output_tokens         INTEGER DEFAULT 0,
       cache_creation_tokens INTEGER DEFAULT 0,
       cache_read_tokens     INTEGER DEFAULT 0,
+      -- Four business metrics from the final/terminal upstream route round.
       connect_time_ms       INTEGER,
       first_token_time_ms   INTEGER,
+      idle_time_ms          INTEGER,
       total_time_ms         INTEGER,
+      final_round_id        TEXT,
+      -- Downstream/request lifecycle display only; never a business round total.
+      request_elapsed_ms    INTEGER,
+      request_upload_ms     INTEGER,
+      response_headers_wait_ms INTEGER,
+      response_body_first_byte_wait_ms INTEGER,
       retry_count           INTEGER DEFAULT 0,
       affinity_hit          INTEGER DEFAULT 0,
       fingerprint           TEXT,
@@ -103,8 +177,17 @@ def _schema_sql() -> str:
       channel_type    TEXT NOT NULL,
       model           TEXT NOT NULL,
       started_at      REAL NOT NULL,
+      -- Final/terminal route-round summary for this channel attempt.
+      final_round_id  TEXT,
       connect_ms      INTEGER,
       first_byte_ms   INTEGER,
+      idle_ms         INTEGER,
+      request_upload_ms INTEGER,
+      response_headers_wait_ms INTEGER,
+      response_body_first_byte_wait_ms INTEGER,
+      total_ms        INTEGER,
+      -- Outer channel-attempt display duration; never added to round total.
+      attempt_elapsed_ms INTEGER,
       ended_at        REAL,
       outcome         TEXT,
       error_detail    TEXT,
@@ -119,9 +202,26 @@ def _schema_sql() -> str:
       request_id      TEXT NOT NULL,
       retry_attempt_id INTEGER,
       attempt_order   INTEGER NOT NULL,
+      -- proxy_chain is the route-round detail table; direct is stored explicitly.
+      round_id        TEXT,
+      transport       TEXT,
+      request_mode    TEXT,
       proxy_name      TEXT NOT NULL,
       started_at      REAL NOT NULL,
       connect_ms      INTEGER,
+      first_byte_ms   INTEGER,
+      idle_ms         INTEGER,
+      total_ms        INTEGER,
+      dns_ms          INTEGER,
+      tcp_ms          INTEGER,
+      proxy_tcp_ms    INTEGER,
+      proxy_tunnel_ms INTEGER,
+      tls_ms          INTEGER,
+      target_tls_ms   INTEGER,
+      ws_handshake_ms INTEGER,
+      request_upload_ms INTEGER,
+      response_headers_wait_ms INTEGER,
+      response_body_first_byte_wait_ms INTEGER,
       ended_at        REAL,
       outcome         TEXT,
       error_detail    TEXT,
@@ -162,10 +262,41 @@ def init() -> None:
     print(f"[log_db] Using {path}")
 
 
-def _current_db_path() -> tuple[str, str]:
+def _db_ref_for_timestamp(timestamp: float | None = None) -> LogDbRef:
     assert _log_dir is not None
-    month = datetime.now(_BJT).strftime("%Y-%m")
-    return os.path.join(_log_dir, f"{month}.db"), month
+    dt = datetime.now(_BJT) if timestamp is None else datetime.fromtimestamp(float(timestamp), tz=_BJT)
+    month = dt.strftime("%Y-%m")
+    return LogDbRef(month=month, path=os.path.join(_log_dir, f"{month}.db"))
+
+
+def _current_db_path() -> tuple[str, str]:
+    ref = _db_ref_for_timestamp()
+    return ref.path, ref.month
+
+
+def _request_handle(value: str | RequestLogHandle) -> RequestLogHandle:
+    if isinstance(value, RequestLogHandle):
+        return value
+    with _write_lock:
+        known = _request_handles.get(str(value))
+    if known is not None:
+        return known
+    # Compatibility only for pre-handle callers that didn't originate through
+    # insert_pending in this process.  New production paths pass the handle.
+    return RequestLogHandle(request_id=str(value), db=_db_ref_for_timestamp())
+
+
+def _row_handle(
+    value: int | RowLogHandle,
+    *,
+    table: Literal["retry_chain", "proxy_chain", "local_web_log"],
+) -> RowLogHandle:
+    if isinstance(value, RowLogHandle):
+        if value.table != table:
+            raise ValueError(f"row handle table mismatch: {value.table!r} != {table!r}")
+        return value
+    # Legacy compatibility; production callers are migrated to RowLogHandle.
+    return RowLogHandle(table=table, row_id=int(value), request_id="", db=_db_ref_for_timestamp())
 
 
 def _ensure_migrations(conn: sqlite3.Connection) -> None:
@@ -200,6 +331,19 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
     if "fast_mode" not in cols:
         conn.execute("ALTER TABLE request_log ADD COLUMN fast_mode INTEGER DEFAULT 0")
         changed = True
+    for col in (
+        "idle_time_ms",
+        "request_elapsed_ms",
+        "request_upload_ms",
+        "response_headers_wait_ms",
+        "response_body_first_byte_wait_ms",
+    ):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE request_log ADD COLUMN {col} INTEGER")
+            changed = True
+    if "final_round_id" not in cols:
+        conn.execute("ALTER TABLE request_log ADD COLUMN final_round_id TEXT")
+        changed = True
     # retry_chain migration
     retry_cols = {row[1] for row in conn.execute("PRAGMA table_info(retry_chain)").fetchall()}
     if retry_cols and "proxy_name" not in retry_cols:
@@ -211,6 +355,21 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
     if retry_cols and "bytes_down" not in retry_cols:
         conn.execute("ALTER TABLE retry_chain ADD COLUMN bytes_down INTEGER DEFAULT 0")
         changed = True
+    if retry_cols:
+        for col in (
+            "idle_ms",
+            "attempt_elapsed_ms",
+            "request_upload_ms",
+            "response_headers_wait_ms",
+            "response_body_first_byte_wait_ms",
+            "total_ms",
+        ):
+            if col not in retry_cols:
+                conn.execute(f"ALTER TABLE retry_chain ADD COLUMN {col} INTEGER")
+                changed = True
+        if "final_round_id" not in retry_cols:
+            conn.execute("ALTER TABLE retry_chain ADD COLUMN final_round_id TEXT")
+            changed = True
 
     proxy_cols = {row[1] for row in conn.execute("PRAGMA table_info(proxy_chain)").fetchall()}
     if not proxy_cols:
@@ -219,9 +378,25 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
           request_id      TEXT NOT NULL,
           retry_attempt_id INTEGER,
           attempt_order   INTEGER NOT NULL,
+          round_id        TEXT,
+          transport       TEXT,
+          request_mode    TEXT,
           proxy_name      TEXT NOT NULL,
           started_at      REAL NOT NULL,
           connect_ms      INTEGER,
+          first_byte_ms   INTEGER,
+          idle_ms         INTEGER,
+          total_ms        INTEGER,
+          dns_ms          INTEGER,
+          tcp_ms          INTEGER,
+          proxy_tcp_ms    INTEGER,
+          proxy_tunnel_ms INTEGER,
+          tls_ms          INTEGER,
+          target_tls_ms   INTEGER,
+          ws_handshake_ms INTEGER,
+          request_upload_ms INTEGER,
+          response_headers_wait_ms INTEGER,
+          response_body_first_byte_wait_ms INTEGER,
           ended_at        REAL,
           outcome         TEXT,
           error_detail    TEXT,
@@ -229,12 +404,29 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
           bytes_down      INTEGER DEFAULT 0
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_proxy_chain_req ON proxy_chain(request_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_proxy_chain_round ON proxy_chain(round_id)")
         changed = True
     else:
         for col, ddl in (
             ("retry_attempt_id", "ALTER TABLE proxy_chain ADD COLUMN retry_attempt_id INTEGER"),
             ("attempt_order", "ALTER TABLE proxy_chain ADD COLUMN attempt_order INTEGER DEFAULT 0"),
+            ("round_id", "ALTER TABLE proxy_chain ADD COLUMN round_id TEXT"),
+            ("transport", "ALTER TABLE proxy_chain ADD COLUMN transport TEXT"),
+            ("request_mode", "ALTER TABLE proxy_chain ADD COLUMN request_mode TEXT"),
             ("connect_ms", "ALTER TABLE proxy_chain ADD COLUMN connect_ms INTEGER"),
+            ("first_byte_ms", "ALTER TABLE proxy_chain ADD COLUMN first_byte_ms INTEGER"),
+            ("idle_ms", "ALTER TABLE proxy_chain ADD COLUMN idle_ms INTEGER"),
+            ("total_ms", "ALTER TABLE proxy_chain ADD COLUMN total_ms INTEGER"),
+            ("dns_ms", "ALTER TABLE proxy_chain ADD COLUMN dns_ms INTEGER"),
+            ("tcp_ms", "ALTER TABLE proxy_chain ADD COLUMN tcp_ms INTEGER"),
+            ("proxy_tcp_ms", "ALTER TABLE proxy_chain ADD COLUMN proxy_tcp_ms INTEGER"),
+            ("proxy_tunnel_ms", "ALTER TABLE proxy_chain ADD COLUMN proxy_tunnel_ms INTEGER"),
+            ("tls_ms", "ALTER TABLE proxy_chain ADD COLUMN tls_ms INTEGER"),
+            ("target_tls_ms", "ALTER TABLE proxy_chain ADD COLUMN target_tls_ms INTEGER"),
+            ("ws_handshake_ms", "ALTER TABLE proxy_chain ADD COLUMN ws_handshake_ms INTEGER"),
+            ("request_upload_ms", "ALTER TABLE proxy_chain ADD COLUMN request_upload_ms INTEGER"),
+            ("response_headers_wait_ms", "ALTER TABLE proxy_chain ADD COLUMN response_headers_wait_ms INTEGER"),
+            ("response_body_first_byte_wait_ms", "ALTER TABLE proxy_chain ADD COLUMN response_body_first_byte_wait_ms INTEGER"),
             ("bytes_up", "ALTER TABLE proxy_chain ADD COLUMN bytes_up INTEGER DEFAULT 0"),
             ("bytes_down", "ALTER TABLE proxy_chain ADD COLUMN bytes_down INTEGER DEFAULT 0"),
         ):
@@ -242,6 +434,7 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
                 conn.execute(ddl)
                 changed = True
         conn.execute("CREATE INDEX IF NOT EXISTS idx_proxy_chain_req ON proxy_chain(request_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_proxy_chain_round ON proxy_chain(round_id)")
 
     local_web_cols = {row[1] for row in conn.execute("PRAGMA table_info(local_web_log)").fetchall()}
     if not local_web_cols:
@@ -282,23 +475,38 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
-def _get_conn() -> sqlite3.Connection:
-    """按月切换 thread-local 连接；跨月时关闭旧连接建立新连接。"""
+def _get_conn_for_ref(ref: LogDbRef) -> sqlite3.Connection:
+    """Return a write connection permanently bound to ``ref.path``.
+
+    Connections are cached per thread *by path*, so a request that crosses the
+    Beijing month boundary can still update its original DB.  We intentionally
+    don't close the old-month connection just because the wall month changed.
+    """
+
     if _log_dir is None:
         raise RuntimeError("log_db.init() not called")
-    path, month = _current_db_path()
-    need_new = (
-        getattr(_local, "conn", None) is None
-        or getattr(_local, "month", None) != month
-    )
-    if need_new:
-        old = getattr(_local, "conn", None)
-        if old is not None:
-            try:
-                old.close()
-            except Exception:
-                pass
-        conn = sqlite3.connect(path, timeout=10)
+    with _write_conn_registry_lock:
+        if ref.path in _retired_log_paths:
+            # 整月留存清理已经删除过这个文件；绝不能因旧 RequestLogHandle
+            # 或跨月迟到写入而创建一个同名空库。
+            raise RetentionPlanError(f"log database was removed by retention cleanup: {ref.path}")
+    cache = getattr(_local, "write_conns", None)
+    if cache is None:
+        cache = {}
+        _local.write_conns = cache
+    conn = cache.get(ref.path)
+    if conn is not None:
+        # 留存清理可从其它 worker 线程关闭旧月的闲置连接。其 thread-local
+        # cache 仍可能留着对象，先探测并丢弃已关闭连接。
+        try:
+            conn.execute("SELECT 1")
+        except sqlite3.ProgrammingError:
+            cache.pop(ref.path, None)
+            conn = None
+    if conn is None:
+        # check_same_thread=False 仅用于留存清理在持 _write_lock 时关闭旧月闲置
+        # 连接；正常读写仍按 thread-local 路由，且写操作始终由 _write_lock 串行。
+        conn = sqlite3.connect(ref.path, timeout=10, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
@@ -307,35 +515,744 @@ def _get_conn() -> sqlite3.Connection:
             conn.executescript(_schema_sql())
             _ensure_migrations(conn)
             conn.commit()
-        _local.conn = conn
-        _local.month = month
-    return _local.conn
+        cache[ref.path] = conn
+        with _write_conn_registry_lock:
+            _write_conn_registry.setdefault(ref.path, []).append(conn)
+    # Legacy introspection compatibility only; write routing never reads these.
+    _local.conn = conn
+    _local.month = ref.month
+    return conn
+
+
+def _get_conn() -> sqlite3.Connection:
+    """Return the current-month write connection for non-request maintenance."""
+
+    return _get_conn_for_ref(_db_ref_for_timestamp())
+
+
+def _open_readonly(path: str) -> sqlite3.Connection:
+    try:
+        uri = f"{Path(path).resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=10)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+    except Exception as exc:
+        raise HistoricalLogError(f"cannot open historical log read-only: {path}: {exc}") from exc
 
 
 def _get_conn_for_month(month: str) -> sqlite3.Connection | None:
-    """打开指定月份的 DB 用于只读查询；不存在返回 None。
+    """Open an existing month read-only; this function never runs migrations."""
 
-    打开方式改为读写（非 `?mode=ro`）以便 `_ensure_migrations` 能为老 DB
-    追加新列。查询层仍按只读使用，没有 INSERT/UPDATE 路径进入。
-    """
     if _log_dir is None:
         return None
     path = os.path.join(_log_dir, f"{month}.db")
     if not os.path.exists(path):
         return None
+    return _open_readonly(path)
+
+
+def migrate_month_schema(month: str) -> None:
+    """Explicit write migration entry; ordinary historical reads never call it."""
+
+    if _log_dir is None:
+        raise RuntimeError("log_db.init() not called")
+    path = os.path.join(_log_dir, f"{month}.db")
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
     conn = sqlite3.connect(path, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=5000")
-    with _write_lock:
-        _ensure_migrations(conn)
-    return conn
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        with _write_lock:
+            conn.executescript(_schema_sql())
+            _ensure_migrations(conn)
+            conn.commit()
+    finally:
+        conn.close()
 
 
 def checkpoint() -> None:
+    # 留存清理/压缩会长期独占写锁；checkpoint 是最佳努力维护，不应因此阻塞
+    # FastAPI event loop。抢不到锁时交给下一轮即可。
+    if not _write_lock.acquire(blocking=False):
+        return
     try:
-        _get_conn().execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    except sqlite3.OperationalError:
-        pass
+        try:
+            _get_conn().execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.OperationalError:
+            pass
+    finally:
+        _write_lock.release()
+
+
+# ─── 请求日志留存 ───────────────────────────────────────────────────
+
+
+def retention_policy(cfg: dict | None = None) -> dict[str, Any]:
+    """返回 fail-closed 的请求日志留存策略。
+
+    缺失、类型错误或非法天数一律按 ``forever`` 处理，避免手工改坏 config 后
+    意外触发历史日志删除。
+    """
+
+    cfg = cfg if isinstance(cfg, dict) else config.get()
+    raw = cfg.get("logRetention") if isinstance(cfg, dict) else None
+    if not isinstance(raw, dict):
+        return {"mode": _RETENTION_MODE_FOREVER, "days": None}
+    if raw.get("mode") != _RETENTION_MODE_DAYS:
+        return {"mode": _RETENTION_MODE_FOREVER, "days": None}
+    value = raw.get("days")
+    if isinstance(value, bool):
+        return {"mode": _RETENTION_MODE_FOREVER, "days": None}
+    try:
+        days = int(value)
+    except (TypeError, ValueError):
+        return {"mode": _RETENTION_MODE_FOREVER, "days": None}
+    if isinstance(value, float) and not value.is_integer():
+        return {"mode": _RETENTION_MODE_FOREVER, "days": None}
+    if days < 1:
+        return {"mode": _RETENTION_MODE_FOREVER, "days": None}
+    return {"mode": _RETENTION_MODE_DAYS, "days": days}
+
+
+def set_retention_forever() -> dict[str, Any]:
+    """关闭自动留存清理（不删除现有日志）。"""
+
+    global _last_retention_cleanup_key
+    if not _retention_lock.acquire(blocking=False):
+        return {"ok": False, "reason": "已有日志留存清理正在执行，请完成后再切换。"}
+    try:
+        config.update(lambda cfg: cfg.__setitem__(
+            "logRetention", {"mode": _RETENTION_MODE_FOREVER, "days": None},
+        ))
+        with _retention_auto_lock:
+            _last_retention_cleanup_key = None
+        return {"ok": True, "policy": retention_policy()}
+    except Exception as exc:
+        return {"ok": False, "reason": f"保存日志留存设置失败：{exc}"}
+    finally:
+        _retention_lock.release()
+
+
+def extend_retention_days(days: Any) -> dict[str, Any]:
+    """在已启用按天留存时延长保留天数，不触发即时清理。
+
+    仅允许 ``new_days > current_days``。缩短留存期会扩大删除范围，必须经由
+    ``plan_retention()`` / ``apply_retention_plan()`` 的双重确认路径处理。
+    """
+
+    new_days = _require_retention_days(days)
+    if not _retention_lock.acquire(blocking=False):
+        return {"ok": False, "reason": "已有日志留存清理正在执行，请完成后再修改。"}
+    try:
+        current = retention_policy()
+        if current["mode"] != _RETENTION_MODE_DAYS:
+            return {"ok": False, "reason": "当前不是按天留存模式，请重新进入数据留存页面。"}
+        old_days = int(current["days"])
+        if new_days <= old_days:
+            return {
+                "ok": False,
+                "reason": "延长保留天数必须大于当前值；缩短留存期请走清理预览确认。",
+            }
+        config.update(lambda cfg: cfg.__setitem__(
+            "logRetention", {"mode": _RETENTION_MODE_DAYS, "days": new_days},
+        ))
+        # 延长留存期不会产生新的删除范围；今天不必再触发一次自动扫描，明日会按
+        # 新天数继续日常收敛。此前已经被旧策略清理的数据当然无法恢复。
+        _mark_retention_cleanup(new_days, time.time())
+        return {
+            "ok": True,
+            "old_days": old_days,
+            "days": new_days,
+            "policy": retention_policy(),
+        }
+    except Exception as exc:
+        return {"ok": False, "reason": f"保存日志留存设置失败：{exc}"}
+    finally:
+        _retention_lock.release()
+
+
+def retention_cleanup_busy() -> bool:
+    return _retention_lock.locked()
+
+
+def _require_retention_days(value: Any) -> int:
+    if isinstance(value, bool):
+        raise RetentionPlanError("保留天数必须是大于等于 1 的整数")
+    try:
+        days = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RetentionPlanError("保留天数必须是大于等于 1 的整数") from exc
+    if isinstance(value, float) and not value.is_integer():
+        raise RetentionPlanError("保留天数必须是大于等于 1 的整数")
+    if days < 1:
+        raise RetentionPlanError("保留天数必须是大于等于 1 的整数")
+    return days
+
+
+def _monthly_log_files() -> list[tuple[str, str]]:
+    """列出严格符合 YYYY-MM.db 的月度业务日志文件。
+
+    不匹配的 .db（例如用户另外放在 logDir 的库）永远不纳入留存计划，避免
+    配置错误扩大删除范围。
+    """
+
+    if _log_dir is None or not os.path.isdir(_log_dir):
+        return []
+    out: list[tuple[str, str]] = []
+    for entry in os.scandir(_log_dir):
+        if not entry.is_file(follow_symlinks=False):
+            continue
+        match = _MONTH_LOG_NAME_RE.fullmatch(entry.name)
+        if not match:
+            continue
+        try:
+            year = int(match.group("year"))
+            month_num = int(match.group("month"))
+            datetime(year, month_num, 1, tzinfo=_BJT)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        out.append((entry.name[:-3], entry.path))
+    return sorted(out)
+
+
+def _log_bundle_bytes(path: str) -> int:
+    total = 0
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            total += int(os.path.getsize(path + suffix))
+        except OSError:
+            pass
+    return total
+
+
+def _existing_tables(conn: sqlite3.Connection) -> set[str]:
+    return {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+
+
+def _read_retention_metadata(path: str, cutoff: float) -> dict[str, Any]:
+    conn = _open_readonly(path)
+    try:
+        tables = _existing_tables(conn)
+        if "request_log" not in tables:
+            raise RetentionPlanError("缺少 request_log 表")
+        columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(request_log)").fetchall()
+        }
+        if "request_id" not in columns or "created_at" not in columns:
+            raise RetentionPlanError("request_log 缺少 request_id 或 created_at 列")
+        row = conn.execute(
+            """SELECT COUNT(*) AS total_requests,
+                      SUM(CASE WHEN created_at < ? THEN 1 ELSE 0 END) AS expired_requests
+                 FROM request_log""",
+            (float(cutoff),),
+        ).fetchone()
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0] or 0)
+        freelist_pages = int(conn.execute("PRAGMA freelist_count").fetchone()[0] or 0)
+        return {
+            "total_requests": int(row["total_requests"] or 0),
+            "expired_requests": int(row["expired_requests"] or 0),
+            "page_size": page_size,
+            "freelist_bytes": page_size * freelist_pages,
+        }
+    finally:
+        conn.close()
+
+
+def _retention_target_signature(plan: dict[str, Any]) -> str:
+    payload = {
+        "days": int(plan.get("days") or 0),
+        "cutoff": f"{float(plan.get('cutoff') or 0):.6f}",
+        "items": [
+            {
+                "month": str(item.get("month") or ""),
+                "action": str(item.get("action") or ""),
+                "expired_requests": int(item.get("expired_requests") or 0),
+            }
+            for item in (plan.get("items") or [])
+        ],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _retention_preflight(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """检查边界月 VACUUM 前的可用空间。
+
+    整月文件会先删，因此可把它们的当前体积计入可用空间预期；边界月逐个
+    压缩，所需临时空间取其中最大值而非累计值。
+    """
+
+    partial = [item for item in items if item.get("action") == "trim_and_vacuum"]
+    if not partial:
+        return {
+            "ok": True,
+            "available_bytes": 0,
+            "full_delete_credit_bytes": 0,
+            "effective_available_bytes": 0,
+            "required_bytes": 0,
+            "reason": "",
+        }
+    if _log_dir is None:
+        return {"ok": False, "reason": "日志目录尚未初始化"}
+    try:
+        free_bytes = int(shutil.disk_usage(_log_dir).free)
+        full_credit = sum(
+            _log_bundle_bytes(str(item["path"]))
+            for item in items
+            if item.get("action") == "delete_file"
+        )
+        required = 0
+        for item in partial:
+            db_bytes = int(os.path.getsize(str(item["path"])))
+            margin = max(_RETENTION_VACUUM_MIN_MARGIN_BYTES, db_bytes // 10)
+            required = max(required, db_bytes * 2 + margin)
+        effective = free_bytes + full_credit
+        ok = effective >= required
+        reason = "" if ok else (
+            f"可用空间不足：压缩边界月需要至少 {required} 字节可用空间，"
+            f"当前可用（含先删除完整月份后的预期）为 {effective} 字节"
+        )
+        return {
+            "ok": ok,
+            "available_bytes": free_bytes,
+            "full_delete_credit_bytes": full_credit,
+            "effective_available_bytes": effective,
+            "required_bytes": required,
+            "reason": reason,
+        }
+    except OSError as exc:
+        return {"ok": False, "reason": f"读取日志目录磁盘空间失败：{exc}"}
+
+
+def _build_retention_plan(
+    days: int,
+    cutoff: float,
+    reference_ts: float,
+    *,
+    base_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """根据固定 cutoff 扫描待删数据；不会写入或删除任何文件。"""
+
+    days = _require_retention_days(days)
+    reference_ts = float(reference_ts)
+    cutoff = float(cutoff)
+    policy = retention_policy() if base_policy is None else retention_policy({"logRetention": base_policy})
+    plan: dict[str, Any] = {
+        "days": days,
+        "cutoff": cutoff,
+        "reference_ts": reference_ts,
+        "created_at": time.time(),
+        "base_policy": policy,
+        "items": [],
+        "errors": [],
+        "scanned_months": 0,
+        "scanned_bytes": 0,
+        "scanned_requests": 0,
+    }
+    if _log_dir is None:
+        plan["errors"].append("日志目录尚未初始化")
+        plan["preflight"] = {"ok": False, "reason": "日志目录尚未初始化"}
+        plan["signature"] = _retention_target_signature(plan)
+        return plan
+
+    active_month = datetime.fromtimestamp(reference_ts, tz=_BJT).strftime("%Y-%m")
+    for month, path in _monthly_log_files():
+        bundle_bytes = _log_bundle_bytes(path)
+        plan["scanned_months"] += 1
+        plan["scanned_bytes"] += bundle_bytes
+        try:
+            meta = _read_retention_metadata(path, cutoff)
+        except Exception as exc:
+            plan["errors"].append(f"{month}.db 无法安全扫描：{exc}")
+            continue
+        total_requests = int(meta["total_requests"])
+        expired_requests = int(meta["expired_requests"])
+        plan["scanned_requests"] += total_requests
+        if expired_requests <= 0:
+            continue
+        # 当前写入月份绝不 unlink：即使它所有现有记录都已过期，仍可能有
+        # thread-local 连接在后续请求中继续使用该文件，必须原地清理并压缩。
+        action = (
+            "delete_file"
+            if expired_requests == total_requests and month != active_month
+            else "trim_and_vacuum"
+        )
+        plan["items"].append({
+            "month": month,
+            "path": path,
+            "action": action,
+            "cutoff": cutoff,
+            "db_bytes": int(os.path.getsize(path)),
+            "bundle_bytes": bundle_bytes,
+            "total_requests": total_requests,
+            "expired_requests": expired_requests,
+            "freelist_bytes": int(meta["freelist_bytes"]),
+        })
+
+    plan["preflight"] = (
+        {"ok": False, "reason": "扫描存在错误，不能执行删除"}
+        if plan["errors"] else _retention_preflight(plan["items"])
+    )
+    plan["signature"] = _retention_target_signature(plan)
+    return plan
+
+
+def plan_retention(days: int, now_ts: float | None = None) -> dict[str, Any]:
+    """生成按天留存的只读清理计划，用于 TG 的第二次确认页。"""
+
+    now = time.time() if now_ts is None else float(now_ts)
+    days = _require_retention_days(days)
+    return _build_retention_plan(
+        days,
+        now - days * 86400,
+        now,
+        base_policy=retention_policy(),
+    )
+
+
+def _revalidate_retention_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(plan, dict):
+        raise RetentionPlanError("清理计划格式无效")
+    days = _require_retention_days(plan.get("days"))
+    try:
+        cutoff = float(plan["cutoff"])
+        reference_ts = float(plan["reference_ts"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RetentionPlanError("清理计划缺少时间边界") from exc
+    base_policy = plan.get("base_policy")
+    if not isinstance(base_policy, dict):
+        raise RetentionPlanError("清理计划缺少原始策略快照")
+    fresh = _build_retention_plan(days, cutoff, reference_ts, base_policy=base_policy)
+    if fresh.get("errors"):
+        raise RetentionPlanError("；".join(str(x) for x in fresh["errors"]))
+    if fresh.get("signature") != plan.get("signature"):
+        raise RetentionPlanError("日志数据在确认期间发生变化，请重新扫描后再确认")
+    if not bool((fresh.get("preflight") or {}).get("ok")):
+        raise RetentionPlanError(str((fresh.get("preflight") or {}).get("reason") or "磁盘空间预检失败"))
+    return fresh
+
+
+def _emit_retention_progress(progress, event: dict[str, Any]) -> None:
+    if not callable(progress):
+        return
+    try:
+        progress(event)
+    except Exception as exc:
+        # 进度消息失败不应中断已经确认的清理任务。
+        print(f"[log_db] retention progress callback failed: {exc}")
+
+
+def _has_active_handle_for_path(path: str) -> bool:
+    return any(handle.db.path == path for handle in _request_handles.values())
+
+
+def _close_cached_write_connections(path: str) -> None:
+    """关闭已无活跃请求的旧月连接，供整库删除前调用。
+
+    调用方必须持有 _write_lock。连接创建时已明确 check_same_thread=False；
+    正常业务仍保持 thread-local 使用方式，这里只在历史库退役时跨线程 close。
+    """
+
+    with _write_conn_registry_lock:
+        conns = list(_write_conn_registry.pop(path, []))
+    for conn in conns:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    local_cache = getattr(_local, "write_conns", None)
+    if isinstance(local_cache, dict):
+        local_cache.pop(path, None)
+
+
+def _mark_log_path_retired(path: str) -> None:
+    with _write_conn_registry_lock:
+        _retired_log_paths.add(path)
+
+
+def _delete_whole_retention_month(item: dict[str, Any]) -> dict[str, Any]:
+    """删除完整过期月库及 WAL/SHM；调用方必须持有 _write_lock。"""
+
+    path = str(item["path"])
+    if _has_active_handle_for_path(path):
+        raise RetentionPlanError(f"{item['month']}.db 仍有活跃请求，拒绝删除")
+    if not os.path.exists(path):
+        raise RetentionPlanError(f"{item['month']}.db 已不存在，请重新扫描")
+    before_bytes = _log_bundle_bytes(path)
+    _close_cached_write_connections(path)
+    removed_files: list[str] = []
+    try:
+        os.unlink(path)
+        removed_files.append(path)
+    except Exception as exc:
+        raise RetentionPlanError(f"删除 {item['month']}.db 失败：{exc}") from exc
+    # 主库已经不在后必须立即 retire，哪怕某个 sidecar 因临时系统错误尚未删掉，
+    # 也不能允许旧 handle 重新创建同名空库。
+    _mark_log_path_retired(path)
+    sidecar_errors: list[str] = []
+    for suffix in ("-wal", "-shm"):
+        sidecar = path + suffix
+        try:
+            os.unlink(sidecar)
+            removed_files.append(sidecar)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            sidecar_errors.append(f"{os.path.basename(sidecar)}: {exc}")
+    error = "；".join(sidecar_errors)
+    return {
+        "month": item["month"],
+        "action": "delete_file",
+        "ok": not bool(error),
+        "deleted_requests": int(item.get("expired_requests") or 0),
+        "before_bytes": before_bytes,
+        "after_bytes": _log_bundle_bytes(path),
+        "removed_files": len(removed_files),
+        "compacted": False,
+        "error": error,
+    }
+
+
+def _trim_retention_month(
+    item: dict[str, Any],
+    *,
+    progress=None,
+    index: int = 0,
+    total: int = 0,
+) -> dict[str, Any]:
+    """精确删除边界月过期记录及关联明细，并 VACUUM 回收物理空间。"""
+
+    path = str(item["path"])
+    before_bytes = _log_bundle_bytes(path)
+    result = {
+        "month": item["month"],
+        "action": "trim_and_vacuum",
+        "ok": False,
+        "deleted_requests": 0,
+        "before_bytes": before_bytes,
+        "after_bytes": before_bytes,
+        "removed_files": 0,
+        "compacted": False,
+        "error": "",
+    }
+    conn: sqlite3.Connection | None = None
+    committed = False
+    try:
+        conn = sqlite3.connect(path, timeout=10, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        tables = _existing_tables(conn)
+        if "request_log" not in tables:
+            raise RetentionPlanError("缺少 request_log 表")
+        columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(request_log)").fetchall()
+        }
+        if "request_id" not in columns or "created_at" not in columns:
+            raise RetentionPlanError("request_log 缺少 request_id 或 created_at 列")
+
+        _emit_retention_progress(progress, {
+            "phase": "trim_delete", "item": item, "index": index, "total": total,
+        })
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("CREATE TEMP TABLE _parrot_retention_ids (request_id TEXT PRIMARY KEY)")
+        conn.execute(
+            "INSERT INTO _parrot_retention_ids(request_id) "
+            "SELECT request_id FROM request_log WHERE created_at < ?",
+            (float(item["cutoff"]),),
+        )
+        target_count = int(conn.execute("SELECT COUNT(*) FROM _parrot_retention_ids").fetchone()[0] or 0)
+        for table in _RETENTION_CHILD_TABLES:
+            if table in tables:
+                conn.execute(
+                    f"DELETE FROM {table} WHERE request_id IN "
+                    "(SELECT request_id FROM _parrot_retention_ids)"
+                )
+        conn.execute(
+            "DELETE FROM request_log WHERE request_id IN "
+            "(SELECT request_id FROM _parrot_retention_ids)"
+        )
+        conn.commit()
+        committed = True
+        result["deleted_requests"] = target_count
+        try:
+            conn.execute("DROP TABLE IF EXISTS _parrot_retention_ids")
+        except Exception:
+            pass
+
+        if target_count:
+            _emit_retention_progress(progress, {
+                "phase": "trim_vacuum", "item": item, "index": index, "total": total,
+            })
+            # 先落下 WAL，随后 VACUUM；若此阶段失败，逻辑删除已提交，结果会如实
+            # 标记“未完成压缩”，而不会谎称已释放磁盘。
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.execute("VACUUM")
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                result["compacted"] = True
+            except Exception as exc:
+                result["error"] = f"历史记录已删除，但数据库压缩失败：{exc}"
+        result["ok"] = not bool(result["error"])
+    except Exception as exc:
+        if conn is not None and conn.in_transaction:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        if committed:
+            result["error"] = result["error"] or f"历史记录已删除，但后续处理失败：{exc}"
+        else:
+            result["error"] = f"清理 {item['month']}.db 失败：{exc}"
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        result["after_bytes"] = _log_bundle_bytes(path)
+    return result
+
+
+def _execute_retention_plan(plan: dict[str, Any], progress=None) -> dict[str, Any]:
+    """在已持有 _write_lock 的前提下执行已重验过的留存计划。"""
+
+    items = list(plan.get("items") or [])
+    before_free = 0
+    if _log_dir is not None:
+        try:
+            before_free = int(shutil.disk_usage(_log_dir).free)
+        except OSError:
+            pass
+    results: list[dict[str, Any]] = []
+    # 先删完整月份，既快速释放空间，也让后续边界月 VACUUM 有更充足余量。
+    ordered = sorted(items, key=lambda item: 0 if item.get("action") == "delete_file" else 1)
+    for index, item in enumerate(ordered, start=1):
+        _emit_retention_progress(progress, {
+            "phase": "item_start", "item": item, "index": index, "total": len(ordered),
+        })
+        if item.get("action") == "delete_file":
+            try:
+                result = _delete_whole_retention_month(item)
+            except Exception as exc:
+                result = {
+                    "month": item.get("month"), "action": "delete_file", "ok": False,
+                    "deleted_requests": 0, "before_bytes": _log_bundle_bytes(str(item.get("path") or "")),
+                    "after_bytes": _log_bundle_bytes(str(item.get("path") or "")),
+                    "removed_files": 0, "compacted": False, "error": str(exc),
+                }
+        else:
+            result = _trim_retention_month(item, progress=progress, index=index, total=len(ordered))
+        results.append(result)
+        _emit_retention_progress(progress, {
+            "phase": "item_done", "item": item, "result": result,
+            "index": index, "total": len(ordered),
+        })
+
+    after_free = before_free
+    if _log_dir is not None:
+        try:
+            after_free = int(shutil.disk_usage(_log_dir).free)
+        except OSError:
+            pass
+    logical_before = sum(int(row.get("before_bytes") or 0) for row in results)
+    logical_after = sum(int(row.get("after_bytes") or 0) for row in results)
+    errors = [str(row.get("error")) for row in results if row.get("error")]
+    return {
+        "ok": not errors,
+        "items": results,
+        "deleted_requests": sum(int(row.get("deleted_requests") or 0) for row in results),
+        "full_months_deleted": sum(1 for row in results if row.get("ok") and row.get("action") == "delete_file"),
+        "logical_bytes_removed": max(0, logical_before - logical_after),
+        "actual_free_bytes": max(0, after_free - before_free),
+        "errors": errors,
+    }
+
+
+def _mark_retention_cleanup(days: int, reference_ts: float) -> None:
+    global _last_retention_cleanup_key
+    day = datetime.fromtimestamp(float(reference_ts), tz=_BJT).strftime("%Y-%m-%d")
+    with _retention_auto_lock:
+        _last_retention_cleanup_key = (int(days), day)
+
+
+def apply_retention_plan(
+    plan: dict[str, Any],
+    *,
+    activate_policy: bool = False,
+    progress=None,
+) -> dict[str, Any]:
+    """重验并执行留存计划。
+
+    ``activate_policy=True`` 仅供 TG 第二次确认使用：预检、重验均通过后才将
+    config 持久化为按天留存，随后立刻执行；若执行中途出错，策略仍保持生效，
+    由后续维护轮次继续收敛，不会出现“已删数据但配置回到永久保留”的假象。
+    """
+
+    if not _retention_lock.acquire(blocking=False):
+        return {"ok": False, "config_saved": False, "reason": "已有日志留存清理正在执行"}
+    try:
+        with _write_lock:
+            try:
+                fresh = _revalidate_retention_plan(plan)
+            except Exception as exc:
+                return {"ok": False, "config_saved": False, "reason": str(exc)}
+            config_saved = False
+            expected = retention_policy({"logRetention": plan.get("base_policy")})
+            if retention_policy() != expected:
+                return {
+                    "ok": False,
+                    "config_saved": False,
+                    "reason": "留存策略在确认期间已被修改，请重新扫描后再确认",
+                }
+            if activate_policy:
+                try:
+                    days = int(fresh["days"])
+                    config.update(lambda cfg: cfg.__setitem__(
+                        "logRetention", {"mode": _RETENTION_MODE_DAYS, "days": days},
+                    ))
+                    config_saved = True
+                except Exception as exc:
+                    return {"ok": False, "config_saved": False, "reason": f"保存留存策略失败：{exc}"}
+            result = _execute_retention_plan(fresh, progress=progress)
+            result["config_saved"] = config_saved
+            result["days"] = int(fresh["days"])
+            _mark_retention_cleanup(int(fresh["days"]), float(fresh["reference_ts"]))
+            return result
+    finally:
+        _retention_lock.release()
+
+
+def maybe_cleanup_retention(now_ts: float | None = None) -> dict[str, Any]:
+    """按已保存策略每天最多执行一次自动到期清理。"""
+
+    now = time.time() if now_ts is None else float(now_ts)
+    policy = retention_policy()
+    if policy["mode"] != _RETENTION_MODE_DAYS:
+        return {"ok": True, "skipped": True, "reason": "永久保留"}
+    days = int(policy["days"])
+    day = datetime.fromtimestamp(now, tz=_BJT).strftime("%Y-%m-%d")
+    global _last_retention_cleanup_key
+    with _retention_auto_lock:
+        if _last_retention_cleanup_key == (days, day):
+            return {"ok": True, "skipped": True, "reason": "今日已检查"}
+        # 即便预检失败也不要每 5 分钟反复触发一次大型扫描 / VACUUM；明日会重试。
+        _last_retention_cleanup_key = (days, day)
+    try:
+        plan = plan_retention(days, now_ts=now)
+        result = apply_retention_plan(plan, activate_policy=False)
+        result["automatic"] = True
+        return result
+    except Exception as exc:
+        return {"ok": False, "automatic": True, "reason": f"自动日志留存清理失败：{exc}"}
+
 
 
 def migrate_channel_keys(mapping: dict[str, str]) -> dict:
@@ -406,9 +1323,12 @@ def insert_pending(
     ingress_protocol: str = "anthropic",
     reasoning_effort: str | None = None,
     fast_mode: bool | None = None,
-) -> None:
+    created_at: float | None = None,
+) -> RequestLogHandle:
+    created = time.time() if created_at is None else float(created_at)
+    handle = RequestLogHandle(request_id=request_id, db=_db_ref_for_timestamp(created))
     with _write_lock:
-        conn = _get_conn()
+        conn = _get_conn_for_ref(handle.db)
         conn.execute(
             """INSERT INTO request_log
                (request_id, created_at, client_ip, api_key_name, requested_model,
@@ -416,7 +1336,7 @@ def insert_pending(
                 ingress_protocol, reasoning_effort, fast_mode)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                request_id, time.time(), client_ip, api_key_name, requested_model,
+                request_id, created, client_ip, api_key_name, requested_model,
                 "pending", 1 if is_stream else 0, msg_count, tool_count,
                 # log 表只存 16 字符（节省空间）；它是 affinity 表 32 字符指纹的前缀，
                 # 排查时可用 `log.fingerprint || '%'` 做前缀匹配反查 cache_affinities。
@@ -436,9 +1356,11 @@ def insert_pending(
             ),
         )
         conn.commit()
+        _request_handles[request_id] = handle
+    return handle
 
 
-def update_pending(request_id: str, **fields: Any) -> None:
+def update_pending(request_id: str | RequestLogHandle, **fields: Any) -> None:
     """在 pending 阶段追加一些字段（如 fingerprint / affinity_hit）。"""
     if not fields:
         return
@@ -456,38 +1378,51 @@ def update_pending(request_id: str, **fields: Any) -> None:
         vals.append(v)
     if not cols:
         return
-    vals.append(request_id)
+    handle = _request_handle(request_id)
+    vals.append(handle.request_id)
     with _write_lock:
-        _get_conn().execute(
+        conn = _get_conn_for_ref(handle.db)
+        conn.execute(
             f"UPDATE request_log SET {', '.join(cols)} WHERE request_id=?",
             vals,
         )
-        _get_conn().commit()
+        conn.commit()
 
 
 def record_retry_attempt(
-    request_id: str, attempt_order: int,
+    request_id: str | RequestLogHandle, attempt_order: int,
     channel_key: str, channel_type: str, model: str,
     started_at: float,
     proxy_name: str | None = None,
-) -> int:
-    """插入一次尝试记录，返回该条的 id，后续用 update_retry_attempt 补齐。"""
+) -> RowLogHandle:
+    """Insert one outer channel attempt and return a month-bound row handle."""
+    request = _request_handle(request_id)
     with _write_lock:
-        conn = _get_conn()
+        conn = _get_conn_for_ref(request.db)
         cur = conn.execute(
             """INSERT INTO retry_chain
                (request_id, attempt_order, channel_key, channel_type, model, started_at, proxy_name)
                VALUES (?,?,?,?,?,?,?)""",
-            (request_id, attempt_order, channel_key, channel_type, model, started_at, proxy_name),
+            (request.request_id, attempt_order, channel_key, channel_type, model, started_at, proxy_name),
         )
         conn.commit()
-        return int(cur.lastrowid)
+        return RowLogHandle(
+            table="retry_chain", row_id=int(cur.lastrowid),
+            request_id=request.request_id, db=request.db,
+        )
 
 
 def update_retry_attempt(
-    attempt_id: int,
+    attempt_id: int | RowLogHandle,
+    final_round_id: str | None = None,
     connect_ms: int | None = None,
     first_byte_ms: int | None = None,
+    idle_ms: int | None = None,
+    attempt_elapsed_ms: int | None = None,
+    request_upload_ms: int | None = None,
+    response_headers_wait_ms: int | None = None,
+    response_body_first_byte_wait_ms: int | None = None,
+    total_ms: int | None = None,
     ended_at: float | None = None,
     outcome: str | None = None,
     error_detail: str | None = None,
@@ -496,10 +1431,22 @@ def update_retry_attempt(
     bytes_down: int | None = None,
 ) -> None:
     fields, vals = [], []
+    if final_round_id is not None:
+        fields.append("final_round_id=?"); vals.append(final_round_id)
     if connect_ms is not None:
         fields.append("connect_ms=?"); vals.append(connect_ms)
     if first_byte_ms is not None:
         fields.append("first_byte_ms=?"); vals.append(first_byte_ms)
+    for name, value in (
+        ("idle_ms", idle_ms),
+        ("attempt_elapsed_ms", attempt_elapsed_ms),
+        ("request_upload_ms", request_upload_ms),
+        ("response_headers_wait_ms", response_headers_wait_ms),
+        ("response_body_first_byte_wait_ms", response_body_first_byte_wait_ms),
+        ("total_ms", total_ms),
+    ):
+        if value is not None:
+            fields.append(f"{name}=?"); vals.append(int(value))
     if ended_at is not None:
         fields.append("ended_at=?"); vals.append(ended_at)
     if outcome is not None:
@@ -514,38 +1461,72 @@ def update_retry_attempt(
         fields.append("bytes_down=?"); vals.append(int(bytes_down or 0))
     if not fields:
         return
-    vals.append(attempt_id)
+    handle = _row_handle(attempt_id, table="retry_chain")
+    vals.append(handle.row_id)
     with _write_lock:
-        _get_conn().execute(
+        conn = _get_conn_for_ref(handle.db)
+        conn.execute(
             f"UPDATE retry_chain SET {', '.join(fields)} WHERE id=?",
             vals,
         )
-        _get_conn().commit()
+        conn.commit()
 
 
 def record_proxy_attempt(
-    request_id: str,
-    retry_attempt_id: int | None,
+    request_id: str | RequestLogHandle,
+    retry_attempt_id: int | RowLogHandle | None,
     attempt_order: int,
     proxy_name: str,
     started_at: float,
-) -> int:
-    """插入一次代理链尝试，记录组内代理为何切换。"""
+    *,
+    round_id: str | None = None,
+    transport: str | None = None,
+    request_mode: str | None = None,
+) -> RowLogHandle:
+    """Insert one real route round (including ``direct``) with a bound handle."""
+    request = _request_handle(request_id)
+    retry_id: int | None = None
+    if retry_attempt_id is not None:
+        retry = _row_handle(retry_attempt_id, table="retry_chain")
+        if isinstance(retry_attempt_id, RowLogHandle) and retry.db != request.db:
+            raise ValueError("retry and route round must belong to the same monthly DB")
+        retry_id = retry.row_id
     with _write_lock:
-        conn = _get_conn()
+        conn = _get_conn_for_ref(request.db)
         cur = conn.execute(
             """INSERT INTO proxy_chain
-               (request_id, retry_attempt_id, attempt_order, proxy_name, started_at)
-               VALUES (?,?,?,?,?)""",
-            (request_id, retry_attempt_id, attempt_order, proxy_name, started_at),
+               (request_id, retry_attempt_id, attempt_order, round_id, transport,
+                request_mode, proxy_name, started_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                request.request_id, retry_id, attempt_order, round_id, transport,
+                request_mode, proxy_name, started_at,
+            ),
         )
         conn.commit()
-        return int(cur.lastrowid)
+        return RowLogHandle(
+            table="proxy_chain", row_id=int(cur.lastrowid),
+            request_id=request.request_id, db=request.db,
+        )
 
 
 def update_proxy_attempt(
-    proxy_attempt_id: int,
+    proxy_attempt_id: int | RowLogHandle,
+    started_at: float | None = None,
     connect_ms: int | None = None,
+    first_byte_ms: int | None = None,
+    idle_ms: int | None = None,
+    total_ms: int | None = None,
+    dns_ms: int | None = None,
+    tcp_ms: int | None = None,
+    proxy_tcp_ms: int | None = None,
+    proxy_tunnel_ms: int | None = None,
+    tls_ms: int | None = None,
+    target_tls_ms: int | None = None,
+    ws_handshake_ms: int | None = None,
+    request_upload_ms: int | None = None,
+    response_headers_wait_ms: int | None = None,
+    response_body_first_byte_wait_ms: int | None = None,
     ended_at: float | None = None,
     outcome: str | None = None,
     error_detail: str | None = None,
@@ -553,8 +1534,27 @@ def update_proxy_attempt(
     bytes_down: int | None = None,
 ) -> None:
     fields, vals = [], []
+    if started_at is not None:
+        fields.append("started_at=?"); vals.append(float(started_at))
     if connect_ms is not None:
         fields.append("connect_ms=?"); vals.append(connect_ms)
+    for name, value in (
+        ("first_byte_ms", first_byte_ms),
+        ("idle_ms", idle_ms),
+        ("total_ms", total_ms),
+        ("dns_ms", dns_ms),
+        ("tcp_ms", tcp_ms),
+        ("proxy_tcp_ms", proxy_tcp_ms),
+        ("proxy_tunnel_ms", proxy_tunnel_ms),
+        ("tls_ms", tls_ms),
+        ("target_tls_ms", target_tls_ms),
+        ("ws_handshake_ms", ws_handshake_ms),
+        ("request_upload_ms", request_upload_ms),
+        ("response_headers_wait_ms", response_headers_wait_ms),
+        ("response_body_first_byte_wait_ms", response_body_first_byte_wait_ms),
+    ):
+        if value is not None:
+            fields.append(f"{name}=?"); vals.append(int(value))
     if ended_at is not None:
         fields.append("ended_at=?"); vals.append(ended_at)
     if outcome is not None:
@@ -567,42 +1567,48 @@ def update_proxy_attempt(
         fields.append("bytes_down=?"); vals.append(int(bytes_down or 0))
     if not fields:
         return
-    vals.append(proxy_attempt_id)
+    handle = _row_handle(proxy_attempt_id, table="proxy_chain")
+    vals.append(handle.row_id)
     with _write_lock:
-        _get_conn().execute(
+        conn = _get_conn_for_ref(handle.db)
+        conn.execute(
             f"UPDATE proxy_chain SET {', '.join(fields)} WHERE id=?",
             vals,
         )
-        _get_conn().commit()
+        conn.commit()
 
 
 
 
 def record_local_web_call(
-    request_id: str,
+    request_id: str | RequestLogHandle,
     round_no: int,
     tool_name: str,
     query: str | None = None,
     url: str | None = None,
     started_at: float | None = None,
-) -> int:
+) -> RowLogHandle:
+    request = _request_handle(request_id)
     with _write_lock:
-        conn = _get_conn()
+        conn = _get_conn_for_ref(request.db)
         cur = conn.execute(
             """INSERT INTO local_web_log
                (request_id, round_no, tool_name, query, url, started_at, status)
                VALUES (?,?,?,?,?,?,?)""",
             (
-                request_id, int(round_no or 0), tool_name,
+                request.request_id, int(round_no or 0), tool_name,
                 query, url, float(started_at or time.time()), "running",
             ),
         )
         conn.commit()
-        return int(cur.lastrowid)
+        return RowLogHandle(
+            table="local_web_log", row_id=int(cur.lastrowid),
+            request_id=request.request_id, db=request.db,
+        )
 
 
 def finish_local_web_call(
-    log_id: int,
+    log_id: int | RowLogHandle,
     *,
     status: str,
     result_count: int = 0,
@@ -611,8 +1617,10 @@ def finish_local_web_call(
     error_message: str | None = None,
     ended_at: float | None = None,
 ) -> None:
+    handle = _row_handle(log_id, table="local_web_log")
     with _write_lock:
-        _get_conn().execute(
+        conn = _get_conn_for_ref(handle.db)
+        conn.execute(
             """UPDATE local_web_log SET
                ended_at=?, status=?, result_count=?, content_bytes=?, content_chars=?, error_message=?
                WHERE id=?""",
@@ -620,21 +1628,22 @@ def finish_local_web_call(
                 float(ended_at or time.time()), status, int(result_count or 0),
                 int(content_bytes or 0), int(content_chars or 0),
                 (error_message[:4000] if isinstance(error_message, str) else error_message),
-                int(log_id),
+                handle.row_id,
             ),
         )
-        _get_conn().commit()
+        conn.commit()
 
 
-def local_web_count(request_id: str) -> int:
-    row = _get_conn().execute(
+def local_web_count(request_id: str | RequestLogHandle) -> int:
+    handle = _request_handle(request_id)
+    row = _get_conn_for_ref(handle.db).execute(
         "SELECT COUNT(*) AS n FROM local_web_log WHERE request_id=?",
-        (request_id,),
+        (handle.request_id,),
     ).fetchone()
     return int(row["n"] or 0) if row else 0
 
 def finish_success(
-    request_id: str,
+    request_id: str | RequestLogHandle,
     final_channel_key: str,
     final_channel_type: str,
     final_model: str,
@@ -644,7 +1653,10 @@ def finish_success(
     cache_read_tokens: int = 0,
     connect_ms: int | None = None,
     first_token_ms: int | None = None,
+    idle_ms: int | None = None,
     total_ms: int | None = None,
+    final_round_id: str | None = None,
+    request_elapsed_ms: int | None = None,
     retry_count: int = 0,
     affinity_hit: int = 0,
     response_body: str | None = None,
@@ -654,40 +1666,52 @@ def finish_success(
     proxy_name: str | None = None,
     proxy_bytes_up: int | None = None,
     proxy_bytes_down: int | None = None,
+    request_upload_ms: int | None = None,
+    response_headers_wait_ms: int | None = None,
+    response_body_first_byte_wait_ms: int | None = None,
 ) -> None:
+    handle = _request_handle(request_id)
     with _write_lock:
-        conn = _get_conn()
+        conn = _get_conn_for_ref(handle.db)
         conn.execute(
             """UPDATE request_log SET
                  status='success', finished_at=?, http_status=?,
                  final_channel_key=?, final_channel_type=?, final_model=?,
                  input_tokens=?, output_tokens=?,
                  cache_creation_tokens=?, cache_read_tokens=?,
-                 connect_time_ms=?, first_token_time_ms=?, total_time_ms=?,
+                 connect_time_ms=?, first_token_time_ms=?, idle_time_ms=?, total_time_ms=?,
+                 final_round_id=?, request_elapsed_ms=?,
                  retry_count=?, affinity_hit=?, upstream_protocol=?, upstream_transport=?, proxy_name=?,
-                 proxy_bytes_up=?, proxy_bytes_down=?
+                 proxy_bytes_up=?, proxy_bytes_down=?,
+                 request_upload_ms=?, response_headers_wait_ms=?,
+                 response_body_first_byte_wait_ms=?
                WHERE request_id=?""",
             (
                 time.time(), http_status,
                 final_channel_key, final_channel_type, final_model,
                 input_tokens, output_tokens,
                 cache_creation_tokens, cache_read_tokens,
-                connect_ms, first_token_ms, total_ms,
+                connect_ms, first_token_ms, idle_ms, total_ms,
+                final_round_id, request_elapsed_ms,
                 retry_count, affinity_hit, upstream_protocol, upstream_transport, proxy_name,
                 int(proxy_bytes_up or 0), int(proxy_bytes_down or 0),
-                request_id,
+                request_upload_ms, response_headers_wait_ms,
+                response_body_first_byte_wait_ms,
+                handle.request_id,
             ),
         )
         if response_body is not None:
             conn.execute(
                 "UPDATE request_detail SET response_body=? WHERE request_id=?",
-                (response_body, request_id),
+                (response_body, handle.request_id),
             )
         conn.commit()
+        if _request_handles.get(handle.request_id) == handle:
+            _request_handles.pop(handle.request_id, None)
 
 
 def finish_error(
-    request_id: str,
+    request_id: str | RequestLogHandle,
     error_message: str,
     retry_count: int = 0,
     final_channel_key: str | None = None,
@@ -695,7 +1719,10 @@ def finish_error(
     final_model: str | None = None,
     connect_ms: int | None = None,
     first_token_ms: int | None = None,
+    idle_ms: int | None = None,
     total_ms: int | None = None,
+    final_round_id: str | None = None,
+    request_elapsed_ms: int | None = None,
     http_status: int | None = None,
     response_body: str | None = None,
     affinity_hit: int = 0,
@@ -704,32 +1731,46 @@ def finish_error(
     proxy_name: str | None = None,
     proxy_bytes_up: int | None = None,
     proxy_bytes_down: int | None = None,
+    request_upload_ms: int | None = None,
+    response_headers_wait_ms: int | None = None,
+    response_body_first_byte_wait_ms: int | None = None,
+    status: str = "error",
 ) -> None:
+    terminal_status = "cancelled" if status == "cancelled" else "error"
+    handle = _request_handle(request_id)
     with _write_lock:
-        conn = _get_conn()
+        conn = _get_conn_for_ref(handle.db)
         conn.execute(
             """UPDATE request_log SET
-                 status='error', finished_at=?, error_message=?, http_status=?,
+                 status=?, finished_at=?, error_message=?, http_status=?,
                  final_channel_key=?, final_channel_type=?, final_model=?,
-                 connect_time_ms=?, first_token_time_ms=?, total_time_ms=?,
+                 connect_time_ms=?, first_token_time_ms=?, idle_time_ms=?, total_time_ms=?,
+                 final_round_id=?, request_elapsed_ms=?,
                  retry_count=?, affinity_hit=?, upstream_protocol=?, upstream_transport=?, proxy_name=?,
-                 proxy_bytes_up=?, proxy_bytes_down=?
+                 proxy_bytes_up=?, proxy_bytes_down=?,
+                 request_upload_ms=?, response_headers_wait_ms=?,
+                 response_body_first_byte_wait_ms=?
                WHERE request_id=?""",
             (
-                time.time(), error_message, http_status,
+                terminal_status, time.time(), error_message, http_status,
                 final_channel_key, final_channel_type, final_model,
-                connect_ms, first_token_ms, total_ms,
+                connect_ms, first_token_ms, idle_ms, total_ms,
+                final_round_id, request_elapsed_ms,
                 retry_count, affinity_hit, upstream_protocol, upstream_transport, proxy_name,
                 int(proxy_bytes_up or 0), int(proxy_bytes_down or 0),
-                request_id,
+                request_upload_ms, response_headers_wait_ms,
+                response_body_first_byte_wait_ms,
+                handle.request_id,
             ),
         )
         if response_body is not None:
             conn.execute(
                 "UPDATE request_detail SET response_body=? WHERE request_id=?",
-                (response_body, request_id),
+                (response_body, handle.request_id),
             )
         conn.commit()
+        if _request_handles.get(handle.request_id) == handle:
+            _request_handles.pop(handle.request_id, None)
 
 
 def stats_lifetime() -> dict:
@@ -757,12 +1798,7 @@ def stats_lifetime() -> dict:
             conn = _get_conn()
             close_fn = None
         else:
-            try:
-                uri = f"file:{path}?mode=ro"
-                conn = sqlite3.connect(uri, uri=True, timeout=10)
-                conn.row_factory = sqlite3.Row
-            except Exception:
-                continue
+            conn = _open_readonly(path)
             close_fn = conn.close
         try:
             row = conn.execute(
@@ -785,7 +1821,7 @@ def stats_lifetime() -> dict:
                 out["cache_creation"] += int(row["cc"] or 0)
                 out["cache_read"] += int(row["cr"] or 0)
         except Exception as exc:
-            print(f"[log_db] stats_lifetime: {name} skipped: {exc}")
+            raise HistoricalLogError(f"stats_lifetime failed for {name}: {exc}") from exc
         finally:
             if close_fn is not None:
                 try:
@@ -951,7 +1987,7 @@ def xai_cost_for_channel(channel_key: str, since_ts: float = 0) -> dict:
                 except (TypeError, ValueError):
                     pass
         except Exception as exc:
-            print(f"[log_db] xai_cost_for_channel: skip: {exc}")
+            raise HistoricalLogError(f"xai_cost_for_channel failed: {exc}") from exc
         finally:
             try:
                 close_fn()
@@ -1001,7 +2037,7 @@ def _aggregate_by_filter(where: str, where_args: tuple, since_ts: float) -> dict
                 out["cache_read"] += int(row["cr"] or 0)
                 _merge_tps(out, row)
         except Exception as exc:
-            print(f"[log_db] _aggregate_by_filter: skip: {exc}")
+            raise HistoricalLogError(f"aggregate query failed: {exc}") from exc
         finally:
             try:
                 close_fn()
@@ -1072,7 +2108,7 @@ def channel_model_stats(channel_key: str, since_ts: float) -> list[dict]:
                 bucket["cache_read"] += int(r["cr"] or 0)
                 _merge_tps(bucket, r)
         except Exception as exc:
-            print(f"[log_db] channel_model_stats: skip: {exc}")
+            raise HistoricalLogError(f"channel_model_stats failed: {exc}") from exc
         finally:
             try:
                 close_fn()
@@ -1134,7 +2170,7 @@ def apikey_model_stats(api_key_name: str, since_ts: float) -> list[dict]:
                 bucket["cache_read"] += int(r["cr"] or 0)
                 _merge_tps(bucket, r)
         except Exception as exc:
-            print(f"[log_db] apikey_model_stats: skip: {exc}")
+            raise HistoricalLogError(f"apikey_model_stats failed: {exc}") from exc
         finally:
             try:
                 close_fn()
@@ -1178,7 +2214,7 @@ def channels_by_requested_model(since_ts: float) -> dict[str, list[dict]]:
                 k = (r["ck"], r["ct"])
                 bucket[k] = bucket.get(k, 0) + int(r["cnt"] or 0)
         except Exception as exc:
-            print(f"[log_db] channels_by_requested_model: skip: {exc}")
+            raise HistoricalLogError(f"channels_by_requested_model failed: {exc}") from exc
         finally:
             try:
                 close_fn()
@@ -1217,7 +2253,7 @@ def tps_by_channel_model(since_ts: float) -> dict[tuple[str, str], float]:
                 })
                 _merge_tps(bucket, r)
         except Exception as exc:
-            print(f"[log_db] tps_by_channel_model: skip: {exc}")
+            raise HistoricalLogError(f"tps_by_channel_model failed: {exc}") from exc
         finally:
             try:
                 close_fn()
@@ -1252,17 +2288,11 @@ def _iter_month_conns_all(since_ts: float):
         if cursor == end and path == current_path:
             yield _get_conn(), lambda: None
         elif os.path.exists(path):
-            try:
-                # 打开为读写：读路径不会 INSERT/UPDATE，但 _ensure_migrations 需要
-                # ALTER TABLE 能力给老月份 DB 补列（如新增 ingress_protocol）。
-                c = sqlite3.connect(path, timeout=10)
-                c.row_factory = sqlite3.Row
-                c.execute("PRAGMA busy_timeout=5000")
-                with _write_lock:
-                    _ensure_migrations(c)
-                yield c, c.close
-            except Exception:
-                pass
+            # Historical reads are fail-closed and read-only.  Missing nullable
+            # columns are handled by projection helpers; incompatible required
+            # schema raises HistoricalLogError instead of silently dropping a month.
+            c = _open_readonly(path)
+            yield c, c.close
         if m == 12:
             cursor = (y + 1, 1)
         else:
@@ -1314,7 +2344,9 @@ _RECENT_COLS = (
     "final_channel_key, final_channel_type, final_model, "
     "status, http_status, error_message, is_stream, "
     "input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, "
-    "connect_time_ms, first_token_time_ms, total_time_ms, "
+    "connect_time_ms, first_token_time_ms, idle_time_ms, total_time_ms, "
+    "final_round_id, request_elapsed_ms, "
+    "request_upload_ms, response_headers_wait_ms, response_body_first_byte_wait_ms, "
     "retry_count, affinity_hit, "
     "ingress_protocol, upstream_protocol, upstream_transport, proxy_name, proxy_bytes_up, proxy_bytes_down, "
     "reasoning_effort, fast_mode, "
@@ -1322,13 +2354,51 @@ _RECENT_COLS = (
 )
 
 
+def _compatible_recent_cols(conn: sqlite3.Connection) -> str:
+    """Project nullable timing columns when reading pre-migration monthly DBs."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(request_log)").fetchall()}
+    sql = _RECENT_COLS
+    for name in (
+        "idle_time_ms", "final_round_id", "request_elapsed_ms",
+        "request_upload_ms", "response_headers_wait_ms",
+        "response_body_first_byte_wait_ms", "ingress_protocol",
+        "upstream_protocol", "upstream_transport", "proxy_name",
+        "proxy_bytes_up", "proxy_bytes_down", "reasoning_effort", "fast_mode",
+    ):
+        if name not in cols:
+            sql = sql.replace(name, f"NULL AS {name}")
+    tables = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "local_web_log" not in tables:
+        sql = sql.replace(
+            "(SELECT COUNT(*) FROM local_web_log lw WHERE lw.request_id=request_log.request_id) AS local_web_count",
+            "0 AS local_web_count",
+        )
+    return sql
+
+
+def _request_connect_sql(conn: sqlite3.Connection) -> str:
+    """Return a read-only compatibility expression for historical bad values."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(request_log)").fetchall()}
+    legacy = (
+        "status='error' "
+        "AND lower(COALESCE(error_message,'')) LIKE '%first byte timeout%' "
+        "AND lower(COALESCE(error_message,'')) LIKE '%response header%'"
+    )
+    if "response_headers_wait_ms" in cols:
+        legacy += " AND response_headers_wait_ms IS NULL"
+    return f"CASE WHEN ({legacy}) THEN NULL ELSE connect_time_ms END"
+
 
 def proxy_stats(limit: int = 20, since_ts: float | None = None) -> list[dict]:
     """Aggregate proxy usage stats across monthly log DBs.
 
     Includes the requested proxy metrics:
-      requests/successes/failures, tokens, average connect/first-byte/total
-      latency, and total proxied bytes (request + response body bytes).
+      requests/successes/failures, tokens, connect/first-byte/idle/total
+      sum+sample-count pairs and averages, plus proxied request/response bytes.
     """
     lim = max(1, int(limit or 20))
     since = 0.0 if since_ts is None else float(since_ts)
@@ -1338,7 +2408,17 @@ def proxy_stats(limit: int = 20, since_ts: float | None = None) -> list[dict]:
 
     for conn, close_fn in _iter_month_conns_all(since):
         try:
-            rows = conn.execute("""
+            connect_expr = _request_connect_sql(conn)
+            request_cols = {row[1] for row in conn.execute("PRAGMA table_info(request_log)").fetchall()}
+            idle_sum_expr = (
+                "SUM(CASE WHEN idle_time_ms IS NOT NULL THEN idle_time_ms ELSE 0 END)"
+                if "idle_time_ms" in request_cols else "0"
+            )
+            idle_n_expr = (
+                "SUM(CASE WHEN idle_time_ms IS NOT NULL THEN 1 ELSE 0 END)"
+                if "idle_time_ms" in request_cols else "0"
+            )
+            rows = conn.execute(f"""
                 SELECT proxy_name,
                        COUNT(*) AS requests,
                        SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS successes,
@@ -1349,10 +2429,12 @@ def proxy_stats(limit: int = 20, since_ts: float | None = None) -> list[dict]:
                        COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
                        COALESCE(SUM(proxy_bytes_up), 0) AS bytes_up,
                        COALESCE(SUM(proxy_bytes_down), 0) AS bytes_down,
-                       SUM(CASE WHEN connect_time_ms IS NOT NULL THEN connect_time_ms ELSE 0 END) AS connect_sum,
-                       SUM(CASE WHEN connect_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS connect_n,
+                       SUM(CASE WHEN {connect_expr} IS NOT NULL THEN {connect_expr} ELSE 0 END) AS connect_sum,
+                       SUM(CASE WHEN {connect_expr} IS NOT NULL THEN 1 ELSE 0 END) AS connect_n,
                        SUM(CASE WHEN first_token_time_ms IS NOT NULL THEN first_token_time_ms ELSE 0 END) AS first_sum,
                        SUM(CASE WHEN first_token_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS first_n,
+                       {idle_sum_expr} AS idle_sum,
+                       {idle_n_expr} AS idle_n,
                        SUM(CASE WHEN total_time_ms IS NOT NULL THEN total_time_ms ELSE 0 END) AS total_sum,
                        SUM(CASE WHEN total_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS total_n
                 FROM request_log
@@ -1371,14 +2453,16 @@ def proxy_stats(limit: int = 20, since_ts: float | None = None) -> list[dict]:
                     "bytes_up": 0, "bytes_down": 0,
                     "connect_sum": 0, "connect_n": 0,
                     "first_sum": 0, "first_n": 0,
+                    "idle_sum": 0, "idle_n": 0,
                     "total_sum": 0, "total_n": 0,
                 })
                 for k in ("requests", "successes", "failures", "input_tokens", "output_tokens",
                           "cache_creation_tokens", "cache_read_tokens", "bytes_up", "bytes_down",
-                          "connect_sum", "connect_n", "first_sum", "first_n", "total_sum", "total_n"):
+                          "connect_sum", "connect_n", "first_sum", "first_n",
+                          "idle_sum", "idle_n", "total_sum", "total_n"):
                     b[k] += int(r[k] or 0)
         except Exception as exc:
-            print(f"[log_db] proxy_stats: skip: {exc}")
+            raise HistoricalLogError(f"proxy_stats failed: {exc}") from exc
         finally:
             try:
                 close_fn()
@@ -1403,8 +2487,17 @@ def proxy_stats(limit: int = 20, since_ts: float | None = None) -> list[dict]:
             "bytes_up": int(b["bytes_up"]),
             "bytes_down": int(b["bytes_down"]),
             "total_bytes": total_bytes,
+            "connect_sum_ms": int(b["connect_sum"]),
+            "connect_sample_count": int(b["connect_n"]),
+            "first_byte_sum_ms": int(b["first_sum"]),
+            "first_byte_sample_count": int(b["first_n"]),
+            "idle_sum_ms": int(b["idle_sum"]),
+            "idle_sample_count": int(b["idle_n"]),
+            "total_sum_ms": int(b["total_sum"]),
+            "total_sample_count": int(b["total_n"]),
             "avg_connect_ms": int(b["connect_sum"] / b["connect_n"]) if b["connect_n"] else 0,
             "avg_first_byte_ms": int(b["first_sum"] / b["first_n"]) if b["first_n"] else 0,
+            "avg_idle_ms": int(b["idle_sum"] / b["idle_n"]) if b["idle_n"] else 0,
             "avg_total_ms": int(b["total_sum"] / b["total_n"]) if b["total_n"] else 0,
         })
     out.sort(key=lambda x: (x["requests"], x["total_bytes"]), reverse=True)
@@ -1500,6 +2593,73 @@ def _recent_logs_where(
     return where, vals
 
 
+def _is_response_header_first_byte_timeout(outcome: object, error_detail: object) -> bool:
+    """Identify the historical branch that mislabeled header wait as connect.
+
+    Text/outcome, rather than a numeric threshold, is used so a legitimate slow
+    connection is never discarded merely because it took about 90 seconds.
+    """
+    outcome_text = str(outcome or "").strip().lower()
+    detail_text = str(error_detail or "").strip().lower()
+    return (
+        (outcome_text == "first_byte_timeout" or "first byte timeout" in detail_text)
+        and "response header" in detail_text
+    )
+
+
+def compatible_connect_ms(
+    connect_ms: object,
+    *,
+    outcome: object,
+    error_detail: object,
+    stage_timing_present: bool,
+):
+    """Return a connect sample only when it is not the identifiable legacy bug.
+
+    Old response-header timeout rows have the precise timeout outcome/message but
+    no newly-added stage timing.  New rows carry a measured header-wait (or proxy
+    attempt total), so a real slow connect is retained.  No numeric cutoff is
+    used.  This helper is also used at the live scorer boundary as defense in
+    depth; it never rewrites a persisted row.
+    """
+    if not stage_timing_present and _is_response_header_first_byte_timeout(outcome, error_detail):
+        return None
+    return connect_ms
+
+
+def _sanitize_request_timing(row: object) -> dict:
+    item = dict(row)  # sqlite3.Row or an ordinary mapping
+    item["connect_time_ms"] = compatible_connect_ms(
+        item.get("connect_time_ms"),
+        outcome=item.get("status"),
+        error_detail=item.get("error_message"),
+        stage_timing_present=item.get("response_headers_wait_ms") is not None,
+    )
+    return item
+
+
+def _sanitize_retry_timing(row: object) -> dict:
+    item = dict(row)
+    item["connect_ms"] = compatible_connect_ms(
+        item.get("connect_ms"),
+        outcome=item.get("outcome"),
+        error_detail=item.get("error_detail"),
+        stage_timing_present=item.get("response_headers_wait_ms") is not None,
+    )
+    return item
+
+
+def _sanitize_proxy_timing(row: object) -> dict:
+    item = dict(row)
+    item["connect_ms"] = compatible_connect_ms(
+        item.get("connect_ms"),
+        outcome=item.get("outcome"),
+        error_detail=item.get("error_detail"),
+        stage_timing_present=item.get("total_ms") is not None,
+    )
+    return item
+
+
 def recent_logs(
     limit: int = 20,
     channel_key: str | None = None,
@@ -1516,10 +2676,11 @@ def recent_logs(
     )
     lim = max(1, int(limit or 20))
     off = max(0, int(offset or 0))
-    sql = f"SELECT {_RECENT_COLS} FROM request_log {where} ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    conn = _get_conn()
+    sql = f"SELECT {_compatible_recent_cols(conn)} FROM request_log {where} ORDER BY created_at DESC LIMIT ? OFFSET ?"
     vals.extend([lim, off])
-    rows = _get_conn().execute(sql, vals).fetchall()
-    return [dict(r) for r in rows]
+    rows = conn.execute(sql, vals).fetchall()
+    return [_sanitize_request_timing(r) for r in rows]
 
 
 def recent_logs_count(
@@ -1596,10 +2757,10 @@ def log_detail(request_id: str) -> dict:
         (request_id,),
     ).fetchall()
     return {
-        "log": dict(log_row) if log_row else None,
+        "log": _sanitize_request_timing(log_row) if log_row else None,
         "detail": dict(detail_row) if detail_row else None,
-        "retry_chain": [dict(r) for r in chain_rows],
-        "proxy_chain": [dict(r) for r in proxy_rows],
+        "retry_chain": [_sanitize_retry_timing(r) for r in chain_rows],
+        "proxy_chain": [_sanitize_proxy_timing(r) for r in proxy_rows],
         "local_web_log": [dict(r) for r in local_web_rows],
     }
 
@@ -1669,6 +2830,7 @@ def stats_summary(
     recent_cache_misses: list[dict] = []
 
     def _agg_group(target: dict, conn, col_expr: str) -> None:
+        connect_expr = _request_connect_sql(conn)
         rows = conn.execute(
             f"""SELECT {col_expr} AS grp_key,
                  COUNT(*) AS total,
@@ -1680,8 +2842,8 @@ def stats_summary(
                  SUM(output_tokens) AS total_output_tokens,
                  SUM(cache_creation_tokens) AS total_cache_creation,
                  SUM(cache_read_tokens) AS total_cache_read,
-                 SUM(CASE WHEN status='success' AND connect_time_ms IS NOT NULL THEN connect_time_ms ELSE 0 END) AS sum_connect_ms,
-                 SUM(CASE WHEN status='success' AND connect_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_connect,
+                 SUM(CASE WHEN status='success' AND {connect_expr} IS NOT NULL THEN {connect_expr} ELSE 0 END) AS sum_connect_ms,
+                 SUM(CASE WHEN status='success' AND {connect_expr} IS NOT NULL THEN 1 ELSE 0 END) AS cnt_connect,
                  SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN first_token_time_ms ELSE 0 END) AS sum_first_token_ms,
                  SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_first_token,
                  {_tps_agg_sql()}
@@ -1697,6 +2859,7 @@ def stats_summary(
 
     try:
         for conn, _ in conns:
+            connect_expr = _request_connect_sql(conn)
             row = conn.execute(
                 f"""SELECT
                      COUNT(*) AS total,
@@ -1712,8 +2875,8 @@ def stats_summary(
                      SUM(output_tokens) AS total_output_tokens,
                      SUM(cache_creation_tokens) AS total_cache_creation,
                      SUM(cache_read_tokens) AS total_cache_read,
-                     SUM(CASE WHEN status='success' AND connect_time_ms IS NOT NULL THEN connect_time_ms ELSE 0 END) AS sum_connect_ms,
-                     SUM(CASE WHEN status='success' AND connect_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_connect,
+                     SUM(CASE WHEN status='success' AND {connect_expr} IS NOT NULL THEN {connect_expr} ELSE 0 END) AS sum_connect_ms,
+                     SUM(CASE WHEN status='success' AND {connect_expr} IS NOT NULL THEN 1 ELSE 0 END) AS cnt_connect,
                      SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN first_token_time_ms ELSE 0 END) AS sum_first_token_ms,
                      SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_first_token,
                      SUM(CASE WHEN status='success' AND total_time_ms IS NOT NULL THEN total_time_ms ELSE 0 END) AS sum_total_ms,
@@ -1741,12 +2904,12 @@ def stats_summary(
                 recent_errors.append(dict(r))
 
             for r in conn.execute(
-                f"""SELECT {_RECENT_COLS}
+                f"""SELECT {_compatible_recent_cols(conn)}
                    FROM request_log WHERE created_at >= ?{_family_where(family)}
                    ORDER BY created_at DESC LIMIT 3""",
                 (since_ts, *_family_params(family)),
             ).fetchall():
-                recent_calls.append(dict(r))
+                recent_calls.append(_sanitize_request_timing(r))
 
             # 最近未命中样本（cc-proxy 同款）：成功但 cache_read_tokens=0
             for r in conn.execute(

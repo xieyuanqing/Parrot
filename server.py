@@ -27,6 +27,7 @@ import uvicorn
 from uvicorn.server import HANDLED_SIGNALS
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from src import (
     __version__, drain,
@@ -112,6 +113,20 @@ async def _stale_pending_loop():
                 print(f"[log_db] cleaned {cleared} stale pending records")
         except Exception as e:
             print(f"[log_db] stale cleanup failed: {e}")
+        # 留存策略已经由 TG 二次确认后持久化；这里每天最多实际清理一次。
+        # 放在后台维护线程而非请求写入路径，避免一条新请求撞上大型 VACUUM。
+        try:
+            retention = await asyncio.to_thread(log_db.maybe_cleanup_retention)
+            if not retention.get("skipped"):
+                if retention.get("ok"):
+                    removed = int(retention.get("deleted_requests") or 0)
+                    freed = int(retention.get("actual_free_bytes") or 0)
+                    if removed or freed:
+                        print(f"[log_db] retention cleanup removed {removed} requests, freed {freed} bytes")
+                else:
+                    print(f"[log_db] retention cleanup failed: {retention.get('reason') or retention.get('errors')}")
+        except Exception as e:
+            print(f"[log_db] retention cleanup failed: {e}")
 
 
 async def _affinity_cleanup_loop():
@@ -143,6 +158,19 @@ async def lifespan(app: FastAPI):
     image_db.init()
     translation.init()
     await asyncio.to_thread(log_db.cleanup_stale_pending, 1800)
+    # 手工编辑 config 后重启的按天留存策略也应尽快收敛；默认永久保留时只做
+    # 一个轻量判断，不会触碰任何日志数据。
+    try:
+        retention = await asyncio.to_thread(log_db.maybe_cleanup_retention)
+        if retention.get("ok") and not retention.get("skipped"):
+            removed = int(retention.get("deleted_requests") or 0)
+            freed = int(retention.get("actual_free_bytes") or 0)
+            if removed or freed:
+                print(f"[log_db] startup retention cleanup removed {removed} requests, freed {freed} bytes")
+        elif not retention.get("ok"):
+            print(f"[log_db] startup retention cleanup failed: {retention.get('reason') or retention.get('errors')}")
+    except Exception as exc:
+        print(f"[log_db] startup retention cleanup failed: {exc}")
 
     # 老数据 provider 字段回填（无 provider 字段的账户默认 claude；幂等）
     try:
@@ -275,6 +303,7 @@ async def lifespan(app: FastAPI):
         for t in _background_tasks:
             t.cancel()
         await asyncio.gather(*_background_tasks, return_exceptions=True)
+        await apikey_limiter.shutdown_spooling()
         tgbot.stop()
         await upstream.close_client()
 
@@ -314,59 +343,217 @@ def _api_key_limit_error_response(path: str, exc: apikey_limiter.ApiKeyLimitErro
     return resp
 
 
-@app.middleware("http")
-async def _drain_http_middleware(request: Request, call_next):
-    """Reject new work while draining and keep active bodies counted.
+def _request_body_limit_error_response(
+    path: str, exc: apikey_limiter.RequestBodyTooLarge,
+):
+    """Map per-request limits to 413 and shared queue pressure to 429."""
+    aggregate_pressure = exc.reason in {"key_aggregate", "process_aggregate"}
+    status = 429 if aggregate_pressure else 413
+    if path == "/v1/messages":
+        resp = errors.json_error_response(
+            status,
+            errors.ErrType.RATE_LIMIT if aggregate_pressure else errors.ErrType.REQUEST_TOO_LARGE,
+            str(exc),
+            code="queued_body_capacity" if aggregate_pressure else "request_too_large",
+        )
+    else:
+        resp = errors.json_error_openai(
+            status,
+            errors.ErrTypeOpenAI.RATE_LIMIT if aggregate_pressure else errors.ErrTypeOpenAI.INVALID_REQUEST,
+            str(exc),
+            code="queued_body_capacity" if aggregate_pressure else "request_too_large",
+        )
+    if aggregate_pressure:
+        resp.headers["Retry-After"] = "1"
+    return resp
 
-    The active lease is held until the response body iterator finishes.  That
-    matters for StreamingResponse/SSE because the route handler returns before
-    the chunked body is done.  下游 API Key 限流也在这里统一挂载，避免每个
-    handler 分别处理 streaming release。
+
+def _queued_body_spool_error_response(
+    path: str, exc: apikey_limiter.QueuedBodySpoolError,
+):
+    """Return a retryable stable error without exposing spool OS details."""
+    message = "queued request body spool is temporarily unavailable"
+    if path == "/v1/messages":
+        resp = errors.json_error_response(
+            503, errors.ErrType.OVERLOADED, message, code="queued_body_spool_unavailable",
+        )
+    else:
+        resp = errors.json_error_openai(
+            503, errors.ErrTypeOpenAI.SERVER, message,
+            code="queued_body_spool_unavailable",
+        )
+    resp.headers["Retry-After"] = "1"
+    return resp
+
+
+def _find_request_body_limit_error(exc: BaseException) -> apikey_limiter.RequestBodyTooLarge | None:
+    """Unwrap Starlette/AnyIO task-group errors without version-specific APIs."""
+    if isinstance(exc, apikey_limiter.RequestBodyTooLarge):
+        return exc
+    for nested in getattr(exc, "exceptions", ()) or ():
+        found = _find_request_body_limit_error(nested)
+        if found is not None:
+            return found
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None and cause is not exc:
+        found = _find_request_body_limit_error(cause)
+        if found is not None:
+            return found
+    context = getattr(exc, "__context__", None)
+    if context is not None and context is not exc:
+        return _find_request_body_limit_error(context)
+    return None
+
+
+def _find_queued_body_spool_error(
+    exc: BaseException,
+) -> apikey_limiter.QueuedBodySpoolError | None:
+    """Unwrap task-group errors containing a spool failure."""
+    if isinstance(exc, apikey_limiter.QueuedBodySpoolError):
+        return exc
+    for nested in getattr(exc, "exceptions", ()) or ():
+        found = _find_queued_body_spool_error(nested)
+        if found is not None:
+            return found
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None and cause is not exc:
+        found = _find_queued_body_spool_error(cause)
+        if found is not None:
+            return found
+    context = getattr(exc, "__context__", None)
+    if context is not None and context is not exc:
+        return _find_queued_body_spool_error(context)
+    return None
+
+
+def _with_asgi_response_headers(
+    message: Message, headers: dict[str, str],
+) -> Message:
+    """Return an ASGI response-start event with limiter headers replaced."""
+    if message.get("type") != "http.response.start" or not headers:
+        return message
+    replacement_names = {name.lower().encode("latin-1") for name in headers}
+    raw_headers = [
+        (name, value) for name, value in message.get("headers", [])
+        if name.lower() not in replacement_names
+    ]
+    raw_headers.extend(
+        (name.lower().encode("latin-1"), value.encode("latin-1"))
+        for name, value in headers.items()
+    )
+    updated = dict(message)
+    updated["headers"] = raw_headers
+    return updated
+
+
+class _DrainHttpMiddleware:
+    """Pure ASGI drain/API-key middleware with explicit receive ownership.
+
+    A queued request's watcher exclusively owns the original receive callable.
+    Once admission finishes and watcher cleanup has completed, the lease's
+    replaying receive callable is passed to FastAPI. Response completion or any
+    cancellation path releases both leases exactly once.
     """
 
-    path = request.url.path
-    if drain.is_draining() and not drain.allow_path_during_drain(path):
-        return drain.reject_response()
+    def __init__(self, app: ASGIApp):
+        self.app = app
 
-    # Health checks must not keep a draining process alive.
-    if drain.allow_path_during_drain(path):
-        return await call_next(request)
+    async def __call__(
+        self, scope: Scope, receive: Receive, send: Send,
+    ) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
 
-    lease = await drain.enter(f"http {request.method} {path}")
-    key_lease = None
-    try:
-        if request.method.upper() == "POST" and path in _API_KEY_LIMITED_HTTP_PATHS:
-            key_name, _allowed_models, err = auth.validate(request.headers)
-            if not err and key_name:
-                try:
-                    key_lease = await apikey_limiter.acquire(key_name, request)
-                except apikey_limiter.ApiKeyLimitError as exc:
-                    await lease.aclose()
-                    return _api_key_limit_error_response(path, exc)
-        response = await call_next(request)
-    except BaseException:
-        if key_lease is not None:
-            await key_lease.release()
-        await lease.aclose()
-        raise
+        path = str(scope.get("path") or "")
+        if drain.is_draining() and not drain.allow_path_during_drain(path):
+            await drain.reject_response()(scope, receive, send)
+            return
 
-    if key_lease is not None:
-        response = apikey_limiter.attach_release_to_response(response, key_lease)
+        # Health checks must not keep a draining process alive.
+        if drain.allow_path_during_drain(path):
+            await self.app(scope, receive, send)
+            return
 
-    body_iterator = getattr(response, "body_iterator", None)
-    if body_iterator is None:
-        await lease.aclose()
-        return response
+        method = str(scope.get("method") or "")
+        drain_lease = await drain.enter(f"http {method} {path}")
+        key_lease: apikey_limiter.ApiKeyLease | None = None
+        response_started = False
+        released = False
 
-    async def _wrapped_body_iterator():
+        async def release_all() -> None:
+            nonlocal released
+            if released:
+                return
+            released = True
+            try:
+                if key_lease is not None:
+                    await key_lease.release()
+            finally:
+                await drain_lease.aclose()
+
+        async def send_wrapped(message: Message) -> None:
+            nonlocal response_started
+            if message.get("type") == "http.response.start":
+                response_started = True
+                if key_lease is not None:
+                    message = _with_asgi_response_headers(
+                        message, key_lease.response_headers,
+                    )
+            await send(message)
+            if (
+                message.get("type") == "http.response.body"
+                and not message.get("more_body", False)
+            ):
+                await release_all()
+
+        async def send_error(response) -> None:
+            await release_all()
+            await response(scope, receive, send)
+
         try:
-            async for chunk in body_iterator:
-                yield chunk
+            request = Request(scope, receive=receive)
+            if method.upper() == "POST" and path in _API_KEY_LIMITED_HTTP_PATHS:
+                key_name, _allowed_models, err = auth.validate(request.headers)
+                if not err and key_name:
+                    key_lease = await apikey_limiter.acquire(
+                        key_name, request, receive=receive,
+                    )
+            downstream_receive = (
+                key_lease.receive
+                if key_lease is not None and key_lease.receive is not None
+                else receive
+            )
+            await self.app(scope, downstream_receive, send_wrapped)
+        except apikey_limiter.ApiKeyLimitError as exc:
+            if response_started:
+                raise
+            await send_error(_api_key_limit_error_response(path, exc))
+        except apikey_limiter.RequestBodyTooLarge as exc:
+            if response_started:
+                raise
+            await send_error(_request_body_limit_error_response(path, exc))
+        except apikey_limiter.QueuedBodySpoolError as exc:
+            if response_started:
+                raise
+            await send_error(_queued_body_spool_error_response(path, exc))
+        except BaseException as exc:
+            if response_started:
+                raise
+            body_limit_error = _find_request_body_limit_error(exc)
+            if body_limit_error is not None:
+                await send_error(_request_body_limit_error_response(path, body_limit_error))
+                return
+            spool_error = _find_queued_body_spool_error(exc)
+            if spool_error is not None:
+                await send_error(_queued_body_spool_error_response(path, spool_error))
+                return
+            raise
         finally:
-            await lease.aclose()
+            await release_all()
 
-    response.body_iterator = _wrapped_body_iterator()
-    return response
+
+app.add_middleware(_DrainHttpMiddleware)
 
 
 def _model_never_supported(model: str) -> bool:
@@ -626,6 +813,7 @@ async def proxy_images_edits_openai(request: Request):
 @app.post("/v1/messages")
 async def proxy_messages(request: Request):
     start_time = time.time()
+    start_monotonic = time.monotonic()
     request_id = str(uuid.uuid4())
     client_ip = get_client_ip(request)
 
@@ -737,17 +925,22 @@ async def proxy_messages(request: Request):
             await asyncio.to_thread(
                 log_db.finish_error, request_id, msg, 0,
                 http_status=400, affinity_hit=(1 if result.affinity_hit else 0),
-                total_ms=int((time.time() - start_time) * 1000),
+                total_ms=int((time.monotonic() - start_monotonic) * 1000),
             )
             return errors.json_error_response(
                 400, errors.ErrType.INVALID_REQUEST, msg
             )
 
         msg = f"No available upstream channels for model: {model}"
+        exclusion_summary = result.exclusion_summary()
+        print(
+            f"[scheduler] no channels ingress=anthropic model={model}: "
+            f"{exclusion_summary}"
+        )
         await asyncio.to_thread(
             log_db.finish_error, request_id, msg, 0,
             http_status=503, affinity_hit=(1 if result.affinity_hit else 0),
-            total_ms=int((time.time() - start_time) * 1000),
+            total_ms=int((time.monotonic() - start_monotonic) * 1000),
         )
         # 主动告警（节流 5min）：帮助运维第一时间发现
         ek = notifier.escape_html
@@ -756,7 +949,8 @@ async def proxy_messages(request: Request):
             "🚨 <b>无可用渠道</b>\n"
             f"客户端: <code>{ek(client_ip)}</code> / Key <code>{ek(str(key_name))}</code>\n"
             f"请求模型: <code>{ek(model)}</code>\n"
-            "请检查渠道是否全部禁用或全部进入冷却。"
+            f"筛选详情: <code>{ek(exclusion_summary)}</code>\n"
+            "请按筛选详情检查渠道状态。"
         )
         # 先尝试更精准的错误类型：model 不在任何渠道 → not_found；所有渠道冷却 → api_error
         err_type = errors.ErrType.NOT_FOUND if _model_never_supported(model) else errors.ErrType.API
@@ -772,7 +966,7 @@ async def proxy_messages(request: Request):
             msg,
             0,
             http_status=400,
-            total_ms=int((time.time() - start_time) * 1000),
+            total_ms=int((time.monotonic() - start_monotonic) * 1000),
             affinity_hit=(1 if result.affinity_hit else 0),
         )
         print(
@@ -801,10 +995,11 @@ async def proxy_messages(request: Request):
         response = await failover.run_failover(
             result, body, request_id, key_name, client_ip,
             is_stream=is_stream, start_time=start_time,
+            start_monotonic=start_monotonic,
         )
     except Exception as e:
         import traceback; traceback.print_exc()
-        total_ms = int((time.time() - start_time) * 1000)
+        total_ms = int((time.monotonic() - start_monotonic) * 1000)
         await asyncio.to_thread(
             log_db.finish_error, request_id, f"unexpected: {e}", 0,
             http_status=500, total_ms=total_ms,

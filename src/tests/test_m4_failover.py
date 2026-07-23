@@ -1,7 +1,7 @@
 """M4 故障转移集成测试。
 
 使用 httpx.MockTransport 模拟上游行为，不触网。覆盖：
-  - 非流式成功 / HTTP 500 → 切换 / HTTP 400 → 切换但不 cooldown
+  - 非流式成功 / HTTP 500 → 切换 / 渠道语义 HTTP 400 → 切换并 cooldown
   - 流式成功完整转发
   - 上游首个 SSE event 是 error → 切换
   - 首包文本黑名单命中 → 切换
@@ -115,8 +115,15 @@ def http_500():
     return httpx.Response(500, json={"type": "error", "error": {"type": "api_error", "message": "oops"}})
 
 
-def http_400():
-    return httpx.Response(400, json={"type": "error", "error": {"type": "invalid_request_error", "message": "bad"}})
+def http_channel_400():
+    return httpx.Response(400, json={
+        "type": "error",
+        "error": {
+            "type": "api_error",
+            "code": "upstream_rejected",
+            "message": "channel request was rejected",
+        },
+    })
 
 
 def openai_context_length_error():
@@ -208,6 +215,18 @@ def responses_sse_chunked_metadata_then_error():
                           headers={"content-type": "text/event-stream"})
 
 
+def responses_sse_chunked_metadata_then_close():
+    """Emit only pre-commit Responses metadata, then EOF without a terminal event."""
+    chunks = [
+        b'event: response.created\n'
+        b'data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_eof","status":"in_progress"}}\n\n',
+        b'event: response.in_progress\n'
+        b'data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_eof","status":"in_progress"}}\n\n',
+    ]
+    return httpx.Response(200, stream=ChunkedByteStream(chunks),
+                          headers={"content-type": "text/event-stream"})
+
+
 def responses_sse_chunked_metadata_then_context_length_error():
     chunks = [
         b'event: response.created\n'
@@ -279,10 +298,14 @@ def sse_with_blacklist():
 
 
 class _MockStreamContext:
-    def __init__(self, resp: httpx.Response):
+    def __init__(self, resp: httpx.Response, trace=None):
         self.resp = resp
+        self.trace = trace
 
     async def __aenter__(self):
+        if self.trace is not None:
+            await self.trace("http11.send_request_body.started", {})
+            await self.trace("http11.send_request_body.complete", {})
         return self.resp
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -306,13 +329,16 @@ class _ProxyMockClient:
         self.closed = False
         self.requests: list[httpx.Request] = []
 
-    def stream(self, method, url, *, headers=None, content=None, timeout=None):
+    def stream(self, method, url, *, headers=None, content=None, timeout=None, extensions=None):
+        # This fake owns request upload, so it emits the same authoritative
+        # send-body trace boundary as HTTPcore instead of inventing wall timing.
+        trace = (extensions or {}).get("trace")
         if self.fail_enter:
             return _FailingEnterCtx()
         req = httpx.Request(method, url, headers=headers, content=content)
         self.requests.append(req)
         resp = self.router.handle(req)
-        return _MockStreamContext(resp)
+        return _MockStreamContext(resp, trace=trace)
 
     async def aclose(self):
         self.closed = True
@@ -393,7 +419,8 @@ _REQUEST_SEQ = itertools.count()
 async def _call_proxy(m, router: MockRouter, body: dict, api_key="k1", client_ip="1.1.1.1",
                       ingress_protocol="anthropic"):
     """模拟 server.py /v1/messages 或 OpenAI handler 的核心调用链。"""
-    # 注入 mock client
+    # conftest makes MockTransport emit HTTPcore's authoritative send-body
+    # boundary; proxy-specific fakes below do the same from their context owner.
     transport = httpx.MockTransport(router.handle)
     mock_client = httpx.AsyncClient(transport=transport, timeout=10.0)
     m["upstream"].set_client(mock_client)
@@ -531,11 +558,11 @@ async def test_all_fail_503(m):
     print("  [PASS] all_fail → 503")
 
 
-async def test_400_switches_no_cooldown(m):
-    """HTTP 400 应切下一个渠道但不记 cooldown（请求级问题）。"""
+async def test_channel_semantic_400_still_switches_and_cools_down(m):
+    """A structured channel-side 400 must remain on normal failover/health paths."""
     _setup(m)
     router = MockRouter()
-    router.register("https://cha", lambda r: http_400())
+    router.register("https://cha", lambda r: http_channel_400())
     router.register("https://chb", lambda r: json_ok_response())
     chA = _make_channel(m, "chA", "https://cha")
     chB = _make_channel(m, "chB", "https://chb")
@@ -546,11 +573,13 @@ async def test_400_switches_no_cooldown(m):
     resp, rid, sr, mc = await _call_proxy(m, router, body)
     assert resp.status_code == 200
     await mc.aclose()
-    # chA HTTP 400 仍记入 cooldown，按当前策略（outcome=http_error → should_cooldown=True）
-    # 测试目的：记录当前行为，确保切换发生
+
+    log = m["log_db"].log_detail(rid)
+    assert [item["outcome"] for item in log["retry_chain"]] == ["http_error", "success"]
+    assert m["cooldown"].is_blocked("api:chA", "glm-5")
     assert m["scorer"].get_stats("api:chA", "glm-5")["total_requests"] == 1
     assert m["scorer"].get_stats("api:chB", "glm-5")["success_count"] == 1
-    print("  [PASS] 400 switch → next success")
+    print("  [PASS] channel 400 → switch/cooldown → next success")
 
 
 async def test_context_length_error_short_circuits_failover(m):
@@ -758,7 +787,8 @@ async def test_stream_midstream_error_logs_upstream_error(m):
     assert log["log"]["status"] == "error", log["log"]
     assert "busy later" in log["log"]["error_message"]
     assert log["log"]["error_message"] != "client disconnected"
-    assert log["retry_chain"][0]["outcome"] == "success"
+    assert log["retry_chain"][0]["outcome"] == "stream_upstream_error"
+    assert log["retry_chain"][0]["total_ms"] is not None
     print("  [PASS] stream midstream error → DB records upstream error, not client disconnected")
 
 
@@ -817,6 +847,34 @@ async def test_responses_chunked_metadata_error_before_visible_chunk_switches(m)
     outcomes = [a["outcome"] for a in log["retry_chain"]]
     assert outcomes == ["upstream_error_json", "success"], outcomes
     print("  [PASS] responses chunked metadata→error before visible chunk → switch → chB ok")
+
+
+async def test_responses_precommit_eof_persists_received_sse(m):
+    """An EOF before Chat-visible output must still retain received Responses SSE."""
+    _setup(m)
+    router = MockRouter()
+    router.register("https://cha", lambda r: responses_sse_chunked_metadata_then_close())
+    chA = _make_openai_channel("chA", "https://cha", protocol="openai-responses")
+    _install_channels(m, [chA])
+
+    body = {"model": "gpt-5.5", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]}
+    resp, rid, sr, mc = await _call_proxy(m, router, body, ingress_protocol="chat")
+    assert resp.status_code == 503
+    await mc.aclose()
+
+    log = m["log_db"].log_detail(rid)
+    expected = (
+        'event: response.created\n'
+        'data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_eof","status":"in_progress"}}\n\n'
+        'event: response.in_progress\n'
+        'data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_eof","status":"in_progress"}}\n\n'
+    )
+    assert log["log"]["status"] == "error", log["log"]
+    assert log["log"]["error_message"] == "upstream closed stream before first downstream chunk"
+    assert log["retry_chain"][0]["outcome"] == "closed_before_first_byte"
+    assert log["detail"]["response_body"] == expected
+    print("  [PASS] pre-commit EOF retains received SSE in error log")
 
 
 async def test_responses_context_length_before_visible_chunk_short_circuits_failover(m):
@@ -1055,7 +1113,7 @@ async def amain():
         test_non_stream_success,
         test_non_stream_500_then_ok,
         test_all_fail_503,
-        test_400_switches_no_cooldown,
+        test_channel_semantic_400_still_switches_and_cools_down,
         test_context_length_error_short_circuits_failover,
         test_stream_success_full_forward,
         test_stream_first_event_error_switches,
@@ -1063,8 +1121,10 @@ async def amain():
         test_stream_midstream_error_logs_upstream_error,
         test_responses_error_before_visible_chunk_switches,
         test_responses_chunked_metadata_error_before_visible_chunk_switches,
+        test_responses_precommit_eof_persists_received_sse,
         test_responses_context_length_before_visible_chunk_short_circuits_failover,
         test_responses_to_chat_error_after_item_added_before_chat_bytes_switches,
+        test_invalid_encrypted_content_retries_same_channel_without_ec,
         test_stream_blacklist_switch,
         test_affinity_pins_channel,
         test_cooldown_excludes_from_next,

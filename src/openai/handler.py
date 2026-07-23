@@ -247,6 +247,36 @@ def _stable_prompt_cache_key(
     return f"{_auto_prompt_cache_prefix()}:stable:{digest}"
 
 
+def _claude_code_session_prompt_cache_key(
+    claude_code_session_id: str | None,
+    *,
+    api_key_name: str,
+    client_ip: str,
+    model: str,
+    ingress_protocol: str,
+) -> str | None:
+    """从 Claude Code 原生会话 ID 派生随机 fallback 的稳定替代值。
+
+    原始 header 不进入 PCK 或上游 payload；同时沿用 stable anchor 的调用方
+    隔离维度，避免不同 Key/IP/模型/入口共用缓存路由。
+    仅由 `_maybe_apply_auto_prompt_cache_key` 在其它稳定来源均不可用时调用。
+    """
+    session_id = str(claude_code_session_id or "").strip()
+    if not session_id:
+        return None
+    material = {
+        "v": 1,
+        "api_key_name": api_key_name or "",
+        "client_ip": client_ip or "",
+        "model": model or "",
+        "ingress_protocol": ingress_protocol or "",
+        "claude_code_session_id": session_id,
+    }
+    raw = json.dumps(material, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+    return f"{_auto_prompt_cache_prefix()}:claude-session:{digest}"
+
+
 def _maybe_apply_auto_prompt_cache_key(
     body: dict,
     *,
@@ -255,11 +285,13 @@ def _maybe_apply_auto_prompt_cache_key(
     client_ip: str = "",
     model: str = "",
     ingress_protocol: str = "chat",
+    claude_code_session_id: str | None = None,
 ) -> str | None:
     """OpenAI 协议专用：下游未传 prompt_cache_key 时自动补一个。
 
-    优先级：下游显式值 → fingerprint 亲和链值 → 稳定 anchor key → 随机兜底。
-    成功响应后由 failover 把最终 key 绑定到 fp_write。
+    优先级：下游显式值 → fingerprint 亲和链值 → 稳定 anchor key →
+    Claude Code session fallback → 随机兜底。成功响应后由 failover 把最终
+    key 绑定到 fp_write。
     """
     if not isinstance(body, dict):
         return None
@@ -288,6 +320,14 @@ def _maybe_apply_auto_prompt_cache_key(
             ingress_protocol=ingress_protocol,
         )
     if not key:
+        key = _claude_code_session_prompt_cache_key(
+            claude_code_session_id,
+            api_key_name=api_key_name,
+            client_ip=client_ip,
+            model=model,
+            ingress_protocol=ingress_protocol,
+        )
+    if not key:
         key = _new_auto_prompt_cache_key()
     body["prompt_cache_key"] = key
     internal = body.setdefault("_internal_injected_fields", [])
@@ -306,6 +346,7 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         )
 
     start_time = time.time()
+    start_monotonic = time.monotonic()
     request_id = str(uuid.uuid4())
     client_ip = get_client_ip(request)
 
@@ -408,6 +449,7 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         client_ip=client_ip,
         model=model,
         ingress_protocol=ingress_protocol,
+        claude_code_session_id=request.headers.get("x-claude-code-session-id"),
     )
 
     # 6. pending 日志；剥掉下划线前缀的内部 metadata（_api_key_name 等）后再落盘
@@ -439,17 +481,22 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
             await asyncio.to_thread(
                 log_db.finish_error, request_id, msg, 0,
                 http_status=400, affinity_hit=(1 if result.affinity_hit else 0),
-                total_ms=int((time.time() - start_time) * 1000),
+                total_ms=int((time.monotonic() - start_monotonic) * 1000),
             )
             return errors.json_error_openai(
                 400, errors.ErrTypeOpenAI.INVALID_REQUEST, msg
             )
 
         msg = f"No available upstream channels for model: {model} (ingress={ingress_protocol})"
+        exclusion_summary = result.exclusion_summary()
+        print(
+            f"[scheduler] no channels ingress={ingress_protocol} model={model}: "
+            f"{exclusion_summary}"
+        )
         await asyncio.to_thread(
             log_db.finish_error, request_id, msg, 0,
             http_status=503, affinity_hit=(1 if result.affinity_hit else 0),
-            total_ms=int((time.time() - start_time) * 1000),
+            total_ms=int((time.monotonic() - start_monotonic) * 1000),
         )
         # 节流告警
         ek = notifier.escape_html
@@ -459,7 +506,8 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
             f"🚨 <b>无可用渠道</b>（{notifier.provider_tag('openai')} 入口）\n"
             f"客户端: <code>{ek(client_ip)}</code> / Key <code>{ek(str(key_name))}</code>\n"
             f"入口: <code>{ingress_protocol}</code> / 模型: <code>{ek(model)}</code>\n"
-            "请检查该家族是否有启用且未冷却的渠道。",
+            f"筛选详情: <code>{ek(exclusion_summary)}</code>\n"
+            "请按筛选详情检查渠道状态。",
         )
         # 区分 model-not-exist（任何家族都没有的模型）与 no-candidates
         err_type = errors.ErrTypeOpenAI.NOT_FOUND if _model_never_supported(model) \
@@ -484,10 +532,11 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
             result, body, request_id, key_name or "", client_ip,
             is_stream=is_stream, start_time=start_time,
             ingress_protocol=ingress_protocol,
+            start_monotonic=start_monotonic,
         )
     except Exception as exc:
         traceback.print_exc()
-        total_ms = int((time.time() - start_time) * 1000)
+        total_ms = int((time.monotonic() - start_monotonic) * 1000)
         await asyncio.to_thread(
             log_db.finish_error, request_id, f"unexpected: {exc}", 0,
             http_status=500, total_ms=total_ms,

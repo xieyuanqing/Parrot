@@ -24,7 +24,8 @@
         "enabled": null,               // 优先级高于 apiKeyConcurrency.enabled
         "maxConcurrent": null,         // 0 = 不限并发
         "maxQueue": null,              // 0 = 不排队，满并发直接 429
-        "queueWaitSeconds": null       // 0 = 不等待，满并发直接 429
+        "queueWaitSeconds": null,      // 0 = 不等待，满并发直接 429
+        "maxQueuedBodySpoolBytes": null // 单 Key 临时磁盘预算；null 继承全局
       }
     }
   },
@@ -34,7 +35,14 @@
     "enabled": true,
     "defaultMaxConcurrent": 5,
     "defaultMaxQueue": 50,
-    "defaultQueueWaitSeconds": 1800
+    "defaultQueueWaitSeconds": 1800,
+    "defaultMaxRequestBodyBytes": 8388608,       // 单个排队请求最多预读/回放 8 MiB
+    "defaultMaxRequestBodyEvents": 4096,         // 单个排队请求最多缓存 4096 个 ASGI body 事件
+    "defaultMaxQueuedBodyBytesPerKey": 33554432, // 单 Key 排队请求体估算内存上限 32 MiB
+    "maxQueuedBodyBytes": 134217728,             // 全进程排队请求体估算内存上限 128 MiB
+    "queuedBodySpoolThresholdBytes": 1048576,    // 单请求超过 1 MiB 后转入临时文件
+    "defaultMaxQueuedBodySpoolBytesPerKey": 536870912, // 单 Key 临时磁盘上限 512 MiB
+    "maxQueuedBodySpoolBytes": 2147483648        // 全进程临时磁盘上限 2 GiB
   },
 
   // ─── OAuth 账户列表 ───
@@ -240,8 +248,12 @@
     }
   },
 
-  // ─── 路径 ───
+  // ─── 路径 / 请求日志留存 ───
   "logDir": "logs",
+  "logRetention": {
+    "mode": "forever",              // "forever" | "days"；默认永久保留
+    "days": null                      // mode="days" 时为整数，最少 1；无业务上限
+  },
   "stateDbPath": "state.db"
 }
 ```
@@ -250,7 +262,20 @@
 
 `apiKeys.<name>.enabled` 控制该 Key 是否可用，缺失或 `null` 时按 `true` 处理。`apiKeyConcurrency` 是 API Key 级限流默认值；`apiKeys.<name>.limits.enabled/maxConcurrent/maxQueue/queueWaitSeconds` 是单 Key 覆盖，其中 `limits.enabled` 优先级高于全局 `apiKeyConcurrency.enabled`。默认单 Key 5 并发、50 队列、最长等待 1800 秒；队列满、等待超时或客户端断开时请求会从队列移除并返回/结束。
 
+排队期间，限流器会独占并读取 ASGI `receive` 以尽早发现客户端断开，并把期间读到的 `http.request` 事件按原边界完整回放给下游。`defaultMaxRequestBodyBytes` 和 `defaultMaxRequestBodyEvents` 只约束这种排队预读/回放资源，超限返回 413；它们不会给非排队的 `/v1/messages`、`/v1/chat/completions`、`/v1/responses` 新增通用协议上限。图片 HTTP 入口有独立的 endpoint 协议上限：编辑端点会按 `images.maxInputImageBytes`、multipart/JSON（data URL 的 base64 膨胀）、标准多图与 mask 合同自动提高总 body 上限，保证合法图片请求不会被通用 8 MiB replay 默认值误拒绝。中间件只通过公开 ASGI `scope/receive/send` 交接所有权，不修改 Starlette `Request` 私有属性。
+
+待回放 body 不会全部常驻内存：单请求累计正文超过 `queuedBodySpoolThresholdBytes`（默认 1 MiB）时，已缓存和后续正文会迁移到数据目录下固定的 `queued-body-spool/` 私有临时目录。`defaultMaxQueuedBodyBytesPerKey` / `maxQueuedBodyBytes` 继续限制单 Key / 全进程的内存正文与 ASGI 事件开销；`defaultMaxQueuedBodySpoolBytesPerKey` / `maxQueuedBodySpoolBytes` 独立限制临时磁盘，单 Key 还可用 `limits.maxQueuedBodySpoolBytes` 覆盖。任一聚合资源达到上限均返回 429 并带 `Retry-After`；旧配置名 `maxQueuedBodyBytesTotal` 仅在没有公开键 `maxQueuedBodyBytes` 时作为兼容回退。请求获得并发槽位、缓存事件回放完毕后，后续 body 由下游直接读取；成功、异常、等待超时、任务取消、客户端断开、热禁用及 FIFO handoff 都会归零 accounting，并关闭、删除临时文件。
+
 ## 2.2 字段语义详解
+
+### 请求日志留存 `logRetention`
+
+- `mode="forever"`：默认值，永久保留 `logs/YYYY-MM.db` 的业务请求日志。
+- `mode="days"`：仅保留从当前时刻向前回溯 `days` 天内的数据；`days` 必须为整数且 `>= 1`，无业务上限。模式与天数是独立字段，已处于该模式时可单独修改 `days`。
+- 在按天留存模式增大 `days`（如 3 → 5）只更新配置、不触发即时清理；首次启用或缩短 `days`（如 5 → 3）会扩大删除范围，TG Bot 必须先展示警告、扫描并逐月列出待清理项，第二次确认后才写入配置并执行删除。确认页的计划短期有效，执行前会重新验证，避免确认期间数据范围变化。
+- 仅影响月度业务日志：请求摘要、原始请求/响应、重试链、代理链与本地 Web 明细；**不影响** `state.db`、图片日志/缓存和翻译缓存。
+- 完整过期月份会删除整个 DB 文件（及其 WAL/SHM sidecar）；留存临界落在某个月中间时，会精确删除关联记录并执行 SQLite 压缩，才能实际释放磁盘空间。压缩前会做磁盘余量预检，空间不足时 fail-closed。
+- 已启用的策略由后台维护循环每天最多执行一次到期检查；不会在正常 API 请求的同步写入路径执行大型删除或 `VACUUM`。
 
 ### 渠道 `disabled_reason` 状态机
 
@@ -340,7 +365,7 @@ TG Bot 修改的所有操作都走 `config.save()`，采用 `tmp + os.replace` �
 - 添加/编辑/删除渠道
 - 添加/编辑/删除 OAuth 账户
 - 添加/删除 API Key
-- 修改超时 / 错误阶梯 / 黑名单 / CCH 模式
+- 修改超时 / 错误阶梯 / 黑名单 / CCH 模式 / 请求日志留存
 
 写入后无需重启（热加载生效）。
 

@@ -122,7 +122,8 @@ def record_error(channel_key: str, model: str, message: str | None = None,
     now = _now_ms()
 
     with _lock:
-        state = _entries.get((channel_key, model)) or {
+        existing = _entries.get((channel_key, model))
+        state = dict(existing) if existing is not None else {
             "error_count": 0,
             "cooldown_until": None,
             "last_error_message": None,
@@ -185,10 +186,12 @@ def record_error(channel_key: str, model: str, message: str | None = None,
         state["last_error_message"] = message
         state["first_error_at"] = first_error_at
         state["last_advance_at"] = last_advance_at
+        # Persist before publishing the copied state, while holding the same
+        # lock used by clear(). This makes record and clear linearisable and a
+        # failed save cannot create a memory-only cooldown.
+        state_db.error_save(channel_key, model, new_count, cooldown_until, message)
         _entries[(channel_key, model)] = state
         result = dict(state)
-
-    state_db.error_save(channel_key, model, new_count, cooldown_until, message)
 
     if just_became_permanent:
         ek = notifier.escape_html
@@ -211,11 +214,13 @@ def _was_actively_blocked(state: dict, now: int) -> bool:
     return cd == _INF or cd > now
 
 
-def clear(channel_key: str, model: Optional[str] = None) -> None:
+def clear(channel_key: str, model: Optional[str] = None, *,
+          notify_recovered: bool = True) -> None:
     """清除冷却。model=None 清该 channel 下所有模型。
 
-    对每个清除前真的在冷却的条目，触发"channel_recovered"事件通知（避免每次成功
-    都报一次"恢复"——只有从"被锁中"变成"未锁"才算恢复）。
+    对每个清除前真的在冷却的条目，默认触发 ``channel_recovered`` 事件。
+    调用方若还要提交更高层状态（例如先清 cooldown 再持久化启用 OAuth 账号），
+    可用 ``notify_recovered=False`` 抑制这个中间态通知，由最终提交点统一回执。
     """
     now = _now_ms()
     recovered: list[tuple[str, str, bool]] = []   # (ck, model, was_permanent)
@@ -229,23 +234,27 @@ def clear(channel_key: str, model: Optional[str] = None) -> None:
             if entry and _was_actively_blocked(entry, now):
                 was_perm = entry.get("cooldown_until") == _INF
                 recovered.append((k[0], k[1], was_perm))
+        # Persistent deletion is the commit point. If it fails, leave every
+        # in-memory entry intact so current-process and restart behavior agree.
+        state_db.error_delete(channel_key, model)
+        for k in keys:
             _entries.pop(k, None)
-    state_db.error_delete(channel_key, model)
 
-    ek = notifier.escape_html
-    for ck, mdl, was_perm in recovered:
-        tag = "永久冻结" if was_perm else "冷却"
-        notifier.notify_event(
-            "channel_recovered",
-            f"✅ <b>渠道恢复</b>（从{tag}中）\n"
-            f"渠道: <code>{ek(ck)}</code> ({ek(mdl)})",
-        )
+    if notify_recovered:
+        ek = notifier.escape_html
+        for ck, mdl, was_perm in recovered:
+            tag = "永久冻结" if was_perm else "冷却"
+            notifier.notify_event(
+                "channel_recovered",
+                f"✅ <b>渠道恢复</b>（从{tag}中）\n"
+                f"渠道: <code>{ek(ck)}</code> ({ek(mdl)})",
+            )
 
 
 def clear_all() -> None:
     with _lock:
+        state_db.error_delete(None, None)
         _entries.clear()
-    state_db.error_delete(None, None)
 
 
 def rename_channel(old_key: str, new_key: str) -> None:

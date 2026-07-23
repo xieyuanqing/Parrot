@@ -25,6 +25,7 @@ _ap_sys.path.insert(0, _ap_os.path.dirname(_ap_os.path.dirname(
 from src.tests import _isolation
 _isolation.isolate()
 
+import json
 import os
 import sys
 import time
@@ -495,8 +496,8 @@ def test_openai_quota_ignores_expired_codex_snapshot_missing_reset(m):
     print("  [PASS] OpenAI quota ignores stale Codex over-threshold snapshot without reset")
 
 
-def test_openai_quota_resume_waits_for_future_disabled_until(m):
-    """OpenAI quota-disabled accounts must not resume before disabled_until expires."""
+def test_openai_quota_resume_uses_fresh_usage_over_future_disabled_until(m):
+    """Fresh low usage must override an obsolete predicted disabled_until."""
     _setup(m)
     email = "cooldown@openai.test"
     key = f"openai:{email}:acct-{email}"
@@ -515,11 +516,11 @@ def test_openai_quota_resume_waits_for_future_disabled_until(m):
         key, wham_below_threshold, threshold=95, fresh=True,
     )
     acc = m["oauth_manager"].get_account(key)
-    assert result["action"] == "quota_cooldown_keep_disabled", result
-    assert acc.get("disabled_reason") == "quota", acc
-    assert acc.get("enabled") is False, acc
-    assert acc.get("disabled_until") == "2099-01-01T00:00:00Z", acc
-    print("  [PASS] OpenAI quota resume waits for future disabled_until")
+    assert result["action"] == "resumed", result
+    assert acc.get("disabled_reason") is None, acc
+    assert acc.get("enabled") is True, acc
+    assert acc.get("disabled_until") is None, acc
+    print("  [PASS] OpenAI quota resume trusts fresh low usage over old disabled_until")
 
 
 def test_quota_monitor_notifies_when_openai_quota_really_resumes(m):
@@ -734,6 +735,459 @@ def test_status_menu_quota_warnings_tags_openai(m):
     print("  [PASS] status_menu _quota_warnings: openai accounts get custom emoji tag")
 
 
+def _low_wham(**openai_overrides):
+    openai = {"source": "wham_usage", "allowed": True, "limit_reached": False}
+    openai.update(openai_overrides)
+    return {
+        "five_hour": {"utilization": 1.0, "resets_at": "2099-01-01T00:01:00Z"},
+        "seven_day": {"utilization": 2.0, "resets_at": "2099-01-01T01:00:00Z"},
+        "seven_day_sonnet": {},
+        "seven_day_opus": {},
+        "extra_usage": {"is_enabled": False},
+        "openai": openai,
+    }
+
+
+def _disk_account(config, email):
+    with open(config.path(), "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    return next(acc for acc in raw.get("oauthAccounts", []) if acc.get("email") == email)
+
+
+def test_fresh_openai_recovery_clears_runtime_but_preserves_fresh_quota(m):
+    """A real recovery must unblock routing without deleting the new WHAM row."""
+    from src import cooldown
+
+    _setup(m)
+    email = "runtime-recovery@openai.test"
+    key = f"openai:{email}:acct-{email}"
+    channel_key = f"oauth:{key}"
+    _add_openai(m, email)
+    m["oauth_manager"].set_disabled_by_quota(key, "2099-01-01T00:00:00Z")
+    usage = _low_wham()
+    m["state_db"].quota_save(
+        key, m["oauth_manager"].flatten_usage(usage), email=email,
+    )
+    cooldown.record_error(
+        channel_key, "gpt-test", "429", cooldown_until=m["state_db"].now_ms() + 60_000,
+    )
+    assert cooldown.is_blocked(channel_key, "gpt-test")
+
+    result = m["oauth_manager"].evaluate_and_toggle_by_usage(
+        key, usage, threshold=95, fresh=True,
+    )
+
+    assert result["action"] == "resumed", result
+    assert result["runtime_state"]["cooldown_cleared"] is True, result
+    assert result["runtime_state"]["required_state_cleared"] is True, result
+    assert not cooldown.is_blocked(channel_key, "gpt-test")
+    assert m["state_db"].error_load(channel_key, "gpt-test") is None
+    assert m["state_db"].quota_load(key) is not None
+    assert result["runtime_state"]["quota_cache_cleared"] is False
+
+    # Simulated process reload must not resurrect the pre-recovery cooldown.
+    cooldown._entries.clear()
+    cooldown._initialized = False
+    cooldown.init()
+    assert not cooldown.is_blocked(channel_key, "gpt-test")
+    print("  [PASS] fresh OpenAI recovery clears runtime and survives reload")
+
+
+def test_fresh_openai_recovery_delete_failure_is_fail_closed_and_not_notified(
+    m, monkeypatch,
+):
+    """A failed persistent cooldown delete must never look like recovery."""
+    import asyncio
+    from src import cooldown
+
+    _setup(m)
+    email = "runtime-delete-failure@openai.test"
+    key = f"openai:{email}:acct-{email}"
+    channel_key = f"oauth:{key}"
+    _add_openai(m, email)
+    m["oauth_manager"].set_disabled_by_quota(key, "2099-01-01T00:00:00Z")
+    usage = _low_wham()
+    cooldown.record_error(
+        channel_key, "gpt-test", "429",
+        cooldown_until=m["state_db"].now_ms() + 60_000,
+    )
+    assert cooldown.is_blocked(channel_key, "gpt-test")
+    assert m["state_db"].error_load(channel_key, "gpt-test") is not None
+
+    original_delete = m["state_db"].error_delete
+
+    def fail_delete(_channel_key=None, _model=None):
+        raise RuntimeError("synthetic state DB delete failure")
+
+    async def fetch_usage(_account_key):
+        return usage
+
+    captured_results = []
+    real_evaluate = m["oauth_manager"].evaluate_and_toggle_by_usage
+
+    def capture_evaluate(*args, **kwargs):
+        result = real_evaluate(*args, **kwargs)
+        captured_results.append(result)
+        return result
+
+    notifications = []
+    monkeypatch.setattr(m["state_db"], "error_delete", fail_delete)
+    monkeypatch.setattr(m["oauth_manager"], "fetch_usage", fetch_usage)
+    monkeypatch.setattr(
+        m["oauth_manager"], "evaluate_and_toggle_by_usage", capture_evaluate,
+    )
+    monkeypatch.setattr(
+        m["oauth_manager"].notifier,
+        "throttled_notify_event_sync",
+        lambda *args, **kwargs: notifications.append((args, kwargs)),
+    )
+
+    outcomes = asyncio.run(m["oauth_manager"].quota_monitor_once())
+    result = captured_results[0]
+    account = m["oauth_manager"].get_account(key)
+    assert outcomes[email] == "resume_failed", outcomes
+    assert result["action"] == "resume_failed", result
+    assert result["error_code"] == "runtime_state_clear_failed", result
+    assert result["runtime_state"]["cooldown_cleared"] is False, result
+    assert result["runtime_state"]["required_state_cleared"] is False, result
+    assert account["enabled"] is False and account["disabled_reason"] == "quota"
+    assert notifications == []
+    assert cooldown.is_blocked(channel_key, "gpt-test")
+
+    # A simulated restart must reload the still-persisted cooldown and remain blocked.
+    cooldown._entries.clear()
+    cooldown._initialized = False
+    cooldown.init()
+    assert cooldown.is_blocked(channel_key, "gpt-test")
+
+    # Explicit cleanup keeps this standalone integration module isolated.
+    monkeypatch.setattr(m["state_db"], "error_delete", original_delete)
+    original_delete(channel_key, None)
+    cooldown._entries.clear()
+    print("  [PASS] failed cooldown delete stays disabled/current+reload/no notify")
+
+
+def test_fresh_openai_recovery_enable_write_failure_stays_disabled_and_silent(
+    m, monkeypatch,
+):
+    """Real set_enabled/config failure must not publish enable or recovery notices."""
+    import asyncio
+    from src import cooldown
+
+    _setup(m)
+    email = "runtime-enable-failure@openai.test"
+    key = f"openai:{email}:acct-{email}"
+    channel_key = f"oauth:{key}"
+    _add_openai(m, email)
+    m["oauth_manager"].set_disabled_by_quota(key, "2099-01-01T00:00:00Z")
+    cooldown.record_error(
+        channel_key, "gpt-test", "429",
+        cooldown_until=m["state_db"].now_ms() + 60_000,
+    )
+    usage = _low_wham()
+
+    async def fetch_usage(_account_key):
+        return usage
+
+    original_write = m["config"]._write_atomic
+
+    def fail_enabling_candidate(candidate):
+        target = next(
+            acc for acc in candidate.get("oauthAccounts", [])
+            if acc.get("email") == email
+        )
+        if target.get("enabled") is True:
+            raise OSError("synthetic config enable persistence failure")
+        return original_write(candidate)
+
+    evaluated = []
+    real_evaluate = m["oauth_manager"].evaluate_and_toggle_by_usage
+
+    def capture_evaluate(*args, **kwargs):
+        result = real_evaluate(*args, **kwargs)
+        evaluated.append(result)
+        return result
+
+    notices = []
+    with monkeypatch.context() as fault:
+        fault.setattr(m["oauth_manager"], "fetch_usage", fetch_usage)
+        fault.setattr(m["oauth_manager"], "evaluate_and_toggle_by_usage", capture_evaluate)
+        fault.setattr(m["config"], "_write_atomic", fail_enabling_candidate)
+        fault.setattr(
+            cooldown.notifier, "notify_event",
+            lambda event, *args, **kwargs: notices.append(event),
+        )
+        fault.setattr(
+            m["oauth_manager"].notifier, "throttled_notify_event_sync",
+            lambda event, *args, **kwargs: notices.append(event),
+        )
+        outcomes = asyncio.run(m["oauth_manager"].quota_monitor_once())
+
+    result = evaluated[0]
+    assert outcomes[email] == "resume_failed", outcomes
+    assert result["action"] == "resume_failed", result
+    assert result["error_code"] == "account_enable_failed", result
+    assert result["runtime_state"]["required_state_cleared"] is True, result
+    assert notices == []
+    current = m["oauth_manager"].get_account(key)
+    assert current["enabled"] is False and current["disabled_reason"] == "quota"
+    disk = _disk_account(m["config"], email)
+    assert disk["enabled"] is False and disk["disabled_reason"] == "quota"
+    m["config"].reload()
+    reloaded = m["oauth_manager"].get_account(key)
+    assert reloaded["enabled"] is False and reloaded["disabled_reason"] == "quota"
+
+
+def test_fresh_openai_recovery_notifies_once_only_after_durable_enable(m, monkeypatch):
+    """Monitor success emits one quota_resumed after live and disk are enabled."""
+    import asyncio
+    from src import cooldown
+
+    _setup(m)
+    email = "runtime-enable-success@openai.test"
+    key = f"openai:{email}:acct-{email}"
+    channel_key = f"oauth:{key}"
+    _add_openai(m, email)
+    m["oauth_manager"].set_disabled_by_quota(key, "2099-01-01T00:00:00Z")
+    cooldown.record_error(
+        channel_key, "gpt-test", "429",
+        cooldown_until=m["state_db"].now_ms() + 60_000,
+    )
+    usage = _low_wham()
+
+    async def fetch_usage(_account_key):
+        return usage
+
+    notices = []
+
+    def capture_notice(event, *args, **kwargs):
+        current = m["oauth_manager"].get_account(key)
+        disk = _disk_account(m["config"], email)
+        notices.append((event, current.get("enabled"), disk.get("enabled")))
+
+    with monkeypatch.context() as fault:
+        fault.setattr(m["oauth_manager"], "fetch_usage", fetch_usage)
+        fault.setattr(cooldown.notifier, "notify_event", capture_notice)
+        fault.setattr(
+            m["oauth_manager"].notifier, "throttled_notify_event_sync", capture_notice,
+        )
+        outcomes = asyncio.run(m["oauth_manager"].quota_monitor_once())
+
+    assert outcomes[email] == "resumed", outcomes
+    assert notices == [("quota_resumed", True, True)], notices
+    assert not cooldown.is_blocked(channel_key, "gpt-test")
+    m["config"].reload()
+    assert m["oauth_manager"].get_account(key)["enabled"] is True
+
+
+def test_cooldown_record_then_clear_is_linearized_across_db_and_memory(m, monkeypatch):
+    """clear cannot slip between record_error persistence and memory publish."""
+    import threading
+    from src import cooldown
+
+    _setup(m)
+    channel_key = "oauth:openai:record-before-clear@test:acct-rbc"
+    model = "gpt-test"
+    cooldown._entries.clear()
+    original_save = m["state_db"].error_save
+    original_delete = m["state_db"].error_delete
+    original_delete(channel_key, None)
+    save_entered = threading.Event()
+    allow_save = threading.Event()
+    delete_called = threading.Event()
+    errors = []
+
+    def delayed_save(*args, **kwargs):
+        save_entered.set()
+        assert allow_save.wait(2)
+        return original_save(*args, **kwargs)
+
+    def observed_delete(*args, **kwargs):
+        delete_called.set()
+        return original_delete(*args, **kwargs)
+
+    def run(call):
+        try:
+            call()
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(m["state_db"], "error_save", delayed_save)
+    monkeypatch.setattr(m["state_db"], "error_delete", observed_delete)
+    monkeypatch.setattr(cooldown.notifier, "notify_event", lambda *a, **kw: None)
+    record = threading.Thread(target=lambda: run(lambda: cooldown.record_error(
+        channel_key, model, "429",
+        cooldown_until=m["state_db"].now_ms() + 60_000,
+    )))
+    record.start()
+    assert save_entered.wait(2)
+    clear = threading.Thread(target=lambda: run(lambda: cooldown.clear(channel_key)))
+    clear.start()
+    clear.join(0.05)
+    assert clear.is_alive()
+    assert not delete_called.is_set()
+    allow_save.set()
+    record.join(2)
+    clear.join(2)
+    assert not record.is_alive() and not clear.is_alive() and errors == []
+    assert cooldown.get_state(channel_key, model) is None
+    assert m["state_db"].error_load(channel_key, model) is None
+
+    cooldown._entries.clear()
+    cooldown._initialized = False
+    cooldown.init()
+    assert not cooldown.is_blocked(channel_key, model)
+    monkeypatch.setattr(m["state_db"], "error_save", original_save)
+    monkeypatch.setattr(m["state_db"], "error_delete", original_delete)
+    print("  [PASS] record commit linearizes before clear; reload stays clear")
+
+
+def test_cooldown_clear_then_new_record_is_consistent_after_reload(m, monkeypatch):
+    """A genuinely new error after clear is present in both memory and DB."""
+    import threading
+    from src import cooldown
+
+    _setup(m)
+    channel_key = "oauth:openai:clear-before-record@test:acct-cbr"
+    model = "gpt-test"
+    cooldown._entries.clear()
+    original_save = m["state_db"].error_save
+    original_delete = m["state_db"].error_delete
+    original_delete(channel_key, None)
+    cooldown.record_error(
+        channel_key, model, "old",
+        cooldown_until=m["state_db"].now_ms() + 60_000,
+    )
+    delete_entered = threading.Event()
+    allow_delete = threading.Event()
+    save_called = threading.Event()
+    errors = []
+
+    def delayed_delete(*args, **kwargs):
+        delete_entered.set()
+        assert allow_delete.wait(2)
+        return original_delete(*args, **kwargs)
+
+    def observed_save(*args, **kwargs):
+        save_called.set()
+        return original_save(*args, **kwargs)
+
+    def run(call):
+        try:
+            call()
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(m["state_db"], "error_delete", delayed_delete)
+    monkeypatch.setattr(m["state_db"], "error_save", observed_save)
+    monkeypatch.setattr(cooldown.notifier, "notify_event", lambda *a, **kw: None)
+    clear = threading.Thread(target=lambda: run(lambda: cooldown.clear(channel_key)))
+    clear.start()
+    assert delete_entered.wait(2)
+    record = threading.Thread(target=lambda: run(lambda: cooldown.record_error(
+        channel_key, model, "new",
+        cooldown_until=m["state_db"].now_ms() + 120_000,
+    )))
+    record.start()
+    record.join(0.05)
+    assert record.is_alive()
+    assert not save_called.is_set()
+    allow_delete.set()
+    clear.join(2)
+    record.join(2)
+    assert not clear.is_alive() and not record.is_alive() and errors == []
+    assert cooldown.is_blocked(channel_key, model)
+    assert m["state_db"].error_load(channel_key, model) is not None
+
+    cooldown._entries.clear()
+    cooldown._initialized = False
+    cooldown.init()
+    assert cooldown.is_blocked(channel_key, model)
+    monkeypatch.setattr(m["state_db"], "error_save", original_save)
+    monkeypatch.setattr(m["state_db"], "error_delete", original_delete)
+    original_delete(channel_key, None)
+    cooldown._entries.clear()
+    print("  [PASS] clear linearizes before a new record; reload keeps new block")
+
+
+def test_cooldown_error_save_failure_does_not_publish_memory_state(m, monkeypatch):
+    import pytest
+    from src import cooldown
+
+    _setup(m)
+    channel_key = "oauth:openai:save-failure@test:acct-save"
+    model = "gpt-test"
+    cooldown._entries.clear()
+    m["state_db"].error_delete(channel_key, None)
+
+    def fail_save(*_args, **_kwargs):
+        raise RuntimeError("synthetic state DB save failure")
+
+    monkeypatch.setattr(m["state_db"], "error_save", fail_save)
+    with pytest.raises(RuntimeError, match="synthetic state DB save failure"):
+        cooldown.record_error(
+            channel_key, model, "429",
+            cooldown_until=m["state_db"].now_ms() + 60_000,
+        )
+    assert cooldown.get_state(channel_key, model) is None
+    assert m["state_db"].error_load(channel_key, model) is None
+    print("  [PASS] failed error_save publishes neither DB nor memory state")
+
+
+def test_non_genuine_openai_recovery_never_clears_runtime(m):
+    """Stale, unknown and still-over-limit observations must leave cooldowns intact."""
+    from src import cooldown
+
+    scenarios = [
+        ("stale", _low_wham(), False, "quota_stale_keep_disabled"),
+        ("unknown", {"openai": {"source": "wham_usage"}}, True, "quota_unknown_keep_disabled"),
+        (
+            "over",
+            {**_low_wham(), "five_hour": {"utilization": 99.0}},
+            True,
+            "still_over_quota",
+        ),
+    ]
+    for suffix, usage, fresh, expected_action in scenarios:
+        _setup(m)
+        email = f"no-runtime-clear-{suffix}@openai.test"
+        key = f"openai:{email}:acct-{email}"
+        channel_key = f"oauth:{key}"
+        _add_openai(m, email)
+        m["oauth_manager"].set_disabled_by_quota(key, "2099-01-01T00:00:00Z")
+        cooldown.record_error(
+            channel_key, "gpt-test", "429",
+            cooldown_until=m["state_db"].now_ms() + 60_000,
+        )
+
+        result = m["oauth_manager"].evaluate_and_toggle_by_usage(
+            key, usage, threshold=95, fresh=fresh,
+        )
+        assert result["action"] == expected_action, result
+        assert cooldown.is_blocked(channel_key, "gpt-test"), (suffix, result)
+        cooldown.clear(channel_key, model=None)
+    print("  [PASS] stale/unknown/over-limit observations never clear runtime")
+
+
+def test_explicit_wham_gate_keeps_quota_disabled_with_distinct_action(m):
+    for field, value in (("allowed", False), ("limit_reached", True)):
+        _setup(m)
+        email = f"wham-{field}@openai.test"
+        key = f"openai:{email}:acct-{email}"
+        _add_openai(m, email)
+        m["oauth_manager"].set_disabled_by_quota(key, "2099-01-01T00:00:00Z")
+        usage = _low_wham(**{field: value})
+
+        result = m["oauth_manager"].evaluate_and_toggle_by_usage(
+            key, usage, threshold=95, fresh=True,
+        )
+        acc = m["oauth_manager"].get_account(key)
+        assert result["action"] == "wham_limit_keep_disabled", result
+        assert result["any_over"] is True, result
+        assert acc["enabled"] is False and acc["disabled_reason"] == "quota", acc
+    print("  [PASS] explicit WHAM gate keeps quota disabled with distinct action")
+
+
 # ─── main ────────────────────────────────────────────────────────
 
 def main():
@@ -757,7 +1211,7 @@ def main():
         test_oauth_menu_refresh_usage_openai_auto_disables_over_quota,
         test_openai_quota_resume_respects_active_codex_snapshot,
         test_openai_quota_ignores_expired_codex_snapshot_missing_reset,
-        test_openai_quota_resume_waits_for_future_disabled_until,
+        test_openai_quota_resume_uses_fresh_usage_over_future_disabled_until,
         test_quota_monitor_notifies_when_openai_quota_really_resumes,
         test_openai_plan_workspace_label_disambiguates_same_email,
         test_oauth_menu_refresh_all_uses_wham_for_openai,
@@ -765,6 +1219,9 @@ def main():
         test_delete_account_clears_codex_snapshot_throttle,
         test_on_refresh_token_openai_updates_usage_via_wham,
         test_status_menu_quota_warnings_tags_openai,
+        test_fresh_openai_recovery_clears_runtime_but_preserves_fresh_quota,
+        test_non_genuine_openai_recovery_never_clears_runtime,
+        test_explicit_wham_gate_keeps_quota_disabled_with_distinct_action,
     ]
 
     passed = 0

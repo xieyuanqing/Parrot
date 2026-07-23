@@ -7,10 +7,9 @@ semantics in callers while moving reusable WS transport mechanics here.
 from __future__ import annotations
 
 import asyncio
-import socket
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlparse, urlunparse
 
 import websockets
@@ -23,7 +22,13 @@ from ..protocols.runtime import (
     parse_wrapped_responses_ws_error,
     responses_ws_error_detail,
 )
-from ..proxy.connector import DirectConnector, SOCKS5Connector, SS2022Connector
+from ..proxy.connector import (
+    DirectConnector,
+    SOCKS5Connector,
+    SS2022Connector,
+    SS2022DuplexBridge,
+)
+from .timing import BusinessTimeoutError, RoundTimeouts, WsAttemptTiming
 from .websocket import event_type as ws_event_type, frame_size as ws_frame_size
 
 
@@ -38,23 +43,77 @@ class WsProxyBytes:
 
 
 class ManagedWsConnection:
-    """WebSocket connection with an attached async cleanup hook."""
+    """WebSocket transport owner followed by its SS2022 bridge owner."""
 
-    def __init__(self, ws, cleanup):
+    def __init__(self, ws, bridge: SS2022DuplexBridge):
         self._ws = ws
-        self._cleanup = cleanup
-        self._cleanup_done = False
+        self._bridge = bridge
+        self._close_task: asyncio.Task[None] | None = None
 
     def __getattr__(self, name: str):
         return getattr(self._ws, name)
 
-    async def close(self, *args, **kwargs):
+    @property
+    def bridge(self) -> SS2022DuplexBridge:
+        return self._bridge
+
+    def _abort_transport(self) -> BaseException | None:
+        transport = getattr(self._ws, "transport", None)
+        if transport is None:
+            protocol = getattr(self._ws, "protocol", None)
+            transport = getattr(protocol, "transport", None)
+        abort = getattr(transport, "abort", None)
+        if abort is None:
+            return None
         try:
-            return await self._ws.close(*args, **kwargs)
-        finally:
-            if not self._cleanup_done:
-                self._cleanup_done = True
-                await self._cleanup()
+            abort()
+        except Exception as exc:
+            return exc
+        return None
+
+    async def _close_impl(self, *args, **kwargs) -> None:
+        close_error: BaseException | None = None
+        try:
+            await self._ws.close(*args, **kwargs)
+        except BaseException as exc:
+            close_error = exc
+
+        wait_closed = getattr(self._ws, "wait_closed", None)
+        if wait_closed is not None:
+            try:
+                await wait_closed()
+            except BaseException as exc:
+                if close_error is None:
+                    close_error = exc
+
+        if close_error is not None:
+            # Preserve the websocket close/wait_closed cause; abort is only a
+            # best-effort wake-up when the graceful close path already failed.
+            self._abort_transport()
+
+        await self._bridge.aclose(
+            cause=close_error,
+            direction=(
+                "websocket_close_error" if close_error is not None
+                else "websocket_close"
+            ),
+        )
+        if close_error is not None:
+            raise close_error
+
+    async def close(self, *args, **kwargs):
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                self._close_impl(*args, **kwargs),
+                name="managed-websocket-close",
+            )
+        try:
+            await asyncio.shield(self._close_task)
+        except asyncio.CancelledError:
+            try:
+                await self._close_task
+            finally:
+                raise
 
 
 @dataclass
@@ -122,27 +181,43 @@ def legacy_socks5_connector() -> SOCKS5Connector | None:
 
 
 def resolve_ws_route_chain(channel, resolved_model: str) -> list[tuple[str, Any | None]]:
+    """Resolve a WS route with the same explicit-direct policy as HTTP."""
+    from ..proxy import manager as pm
+
+    configured = False
     try:
-        from ..proxy import manager as pm
         pm.init()
-        if pm.is_configured():
+        configured = pm.is_configured()
+        if configured:
+            source_chain = pm.resolve_proxy_chain(**ws_route_kwargs(channel, resolved_model))
             route_chain: list[tuple[str, Any | None]] = []
-            valid_seen = False
-            for name in pm.resolve_proxy_chain(**ws_route_kwargs(channel, resolved_model)):
+            for name in source_chain:
                 conn = pm.get_connector(name)
                 if conn is None:
                     continue
-                valid_seen = True
                 if getattr(conn, "type", "") == "direct":
                     route_chain.append(("direct", None))
                 else:
                     route_chain.append((name, conn))
-            if valid_seen:
+            if route_chain:
+                if pm.direct_fallback_enabled() and not any(name == "direct" for name, _ in route_chain):
+                    route_chain.append(("direct", None))
                 return route_chain
+            if pm.direct_fallback_enabled():
+                print(f"[proxy] WS route has no usable target; using enabled direct fallback: {source_chain}")
+                return [("direct", None)]
             return []
-    except Exception:
-        pass
+        if pm.has_non_direct_routing_rules():
+            return []
+    except Exception as exc:
+        if pm.direct_fallback_enabled():
+            print(f"[proxy] WS route resolution failed; using enabled direct fallback: {exc}")
+            return [("direct", None)]
+        if configured or pm.has_non_direct_routing_rules():
+            print(f"[proxy] WS route resolution failed closed: {exc}")
+            return []
 
+    # No configured new-proxy route: preserve the normal legacy/direct path.
     legacy = legacy_socks5_connector()
     if legacy is not None:
         return [("legacy-socks5", legacy)]
@@ -155,7 +230,7 @@ async def open_socket_via_ss2022(
     proxy_bytes,
     *,
     timeout: float,
-) -> tuple[socket.socket, Callable[[], Awaitable[None]]]:
+) -> SS2022DuplexBridge:
     p = urlparse(url)
     host = p.hostname
     if not host:
@@ -164,80 +239,14 @@ async def open_socket_via_ss2022(
 
     from ..proxy.ss2022 import SS2022Connection
 
-    conn = SS2022Connection(connector.cipher, connector.password, connector.server, connector.port)
+    conn = SS2022Connection(
+        connector.cipher,
+        connector.password,
+        connector.server,
+        connector.port,
+    )
     await conn.connect(host, port, timeout=timeout)
-
-    loop = asyncio.get_running_loop()
-    left, right = socket.socketpair()
-    left.setblocking(False)
-    right.setblocking(False)
-    stop = asyncio.Event()
-    tasks: list[asyncio.Task] = []
-    cleanup_lock = asyncio.Lock()
-    cleanup_done = False
-
-    def shutdown_sock(sock) -> None:
-        try:
-            sock.shutdown(socket.SHUT_RDWR)
-        except Exception:
-            pass
-        try:
-            sock.close()
-        except Exception:
-            pass
-
-    async def pump_sock_to_ss() -> None:
-        try:
-            while not stop.is_set():
-                data = await loop.sock_recv(right, 65536)
-                if not data:
-                    return
-                proxy_bytes.count(up=len(data))
-                await conn.write(data)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            pass
-        finally:
-            stop.set()
-
-    async def pump_ss_to_sock() -> None:
-        try:
-            while not stop.is_set():
-                data = await conn.read(65536)
-                if not data:
-                    return
-                proxy_bytes.count(down=len(data))
-                await loop.sock_sendall(right, data)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            pass
-        finally:
-            stop.set()
-            shutdown_sock(right)
-
-    async def cleanup() -> None:
-        nonlocal cleanup_done
-        async with cleanup_lock:
-            if cleanup_done:
-                return
-            cleanup_done = True
-            stop.set()
-            for task in tasks:
-                task.cancel()
-            shutdown_sock(right)
-            shutdown_sock(left)
-            try:
-                await conn.close()
-            except Exception:
-                pass
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-    tasks.append(asyncio.create_task(pump_sock_to_ss()))
-    tasks.append(asyncio.create_task(pump_ss_to_sock()))
-    return left, cleanup
+    return await SS2022DuplexBridge.create(conn, byte_counter=proxy_bytes)
 
 
 async def connect_upstream_ws(
@@ -247,14 +256,19 @@ async def connect_upstream_ws(
     connector,
     proxy_bytes,
     open_timeout: float,
+    timing: WsAttemptTiming | None = None,
+    round_timeouts: RoundTimeouts | None = None,
     open_socket_func=None,
     connect_func=None,
 ):
-    """Open a WS connection through direct/SOCKS5/SS2022 transport."""
+    """Open one WS route; caller constructs ``timing`` immediately beforehand."""
+
     connect = connect_func or websockets.connect
     kwargs = dict(
         additional_headers=headers,
         user_agent_header=None,
+        # Keep the library's transport timer later than the business connection
+        # deadline so the unique business winner isn't relabelled by a tie.
         open_timeout=open_timeout,
         ping_interval=20,
         ping_timeout=20,
@@ -263,28 +277,85 @@ async def connect_upstream_ws(
         max_queue=64,
         compression="deflate",
     )
-    if connector is None or isinstance(connector, DirectConnector):
+
+    async def _connect_once():
+        if connector is None or isinstance(connector, DirectConnector):
+            return await connect(url, proxy=None, **kwargs)
+        if isinstance(connector, SOCKS5Connector):
+            return await connect(url, proxy=socks5h_url(connector.url), **kwargs)
+        if isinstance(connector, SS2022Connector):
+            opener = open_socket_func or open_socket_via_ss2022
+            bridge = await opener(
+                url, connector, proxy_bytes, timeout=open_timeout,
+            )
+            sock = bridge.handoff_socket()
+            try:
+                ws = await connect(url, proxy=None, sock=sock, **kwargs)
+            except BaseException as exc:
+                # websockets received sock= and owns its selector transport even
+                # when the handshake fails or is cancelled. The bridge closes
+                # only its internal peer and raw SS connection.
+                await bridge.aclose(
+                    cause=exc,
+                    direction="websocket_handshake_error",
+                )
+                raise
+            return ManagedWsConnection(ws, bridge)
         return await connect(url, proxy=None, **kwargs)
-    if isinstance(connector, SOCKS5Connector):
-        return await connect(url, proxy=socks5h_url(connector.url), **kwargs)
-    if isinstance(connector, SS2022Connector):
-        opener = open_socket_func or open_socket_via_ss2022
-        opened = await opener(url, connector, proxy_bytes, timeout=open_timeout)
-        cleanup = None
-        if isinstance(opened, tuple) and len(opened) == 2:
-            sock, cleanup = opened
-        else:
-            sock = opened
-        try:
-            ws = await connect(url, proxy=None, sock=sock, **kwargs)
-        except BaseException:
-            if cleanup is not None:
-                await cleanup()
-            raise
-        if cleanup is not None:
-            return ManagedWsConnection(ws, cleanup)
+
+    if timing is not None and round_timeouts is not None:
+        ws = await timing.wait_for(_connect_once(), round_timeouts)
+        timing.mark_handshake_complete()
         return ws
-    return await connect(url, proxy=None, **kwargs)
+    return await _connect_once()
+
+
+async def await_ws_owned(awaitable):
+    """Finish one WS terminal/cleanup owner even if its caller is cancelled."""
+
+    task = asyncio.ensure_future(awaitable)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await task
+        finally:
+            raise
+
+
+async def wait_ws_round_io(
+    awaitable,
+    *,
+    timing: WsAttemptTiming | None,
+    round_timeouts: RoundTimeouts | None,
+):
+    """Await send/recv while the WS round's dynamic business deadlines compete."""
+
+    if timing is not None and round_timeouts is not None:
+        return await timing.wait_for(awaitable, round_timeouts)
+    return await awaitable
+
+
+async def _next_nonempty_ws_frame(
+    upstream_ws,
+    *,
+    timing: WsAttemptTiming | None,
+    round_timeouts: RoundTimeouts | None,
+):
+    """Receive the next non-empty frame; only it is response activity."""
+
+    while True:
+        data = await wait_ws_round_io(
+            upstream_ws.recv(), timing=timing, round_timeouts=round_timeouts,
+        )
+        if isinstance(data, str):
+            if not data.encode("utf-8"):
+                continue
+        elif not data:
+            continue
+        if timing is not None:
+            timing.mark_ws_frame(data)
+        return data
 
 
 async def read_until_first_responses_ws_visible_event(
@@ -297,10 +368,13 @@ async def read_until_first_responses_ws_visible_event(
     idle_timeout: int,
     proxy_bytes: WsProxyBytes | None = None,
     start_time: float | None = None,
+    start_monotonic: float | None = None,
     parse_wrapped_errors: bool = False,
     timeout_detail_mode: str = "event",
     timeout_label_seconds: float | int | None = None,
     use_tracker_error_detail: bool = False,
+    timing: WsAttemptTiming | None = None,
+    round_timeouts: RoundTimeouts | None = None,
 ) -> ResponsesWsPreVisibleResult:
     """Read Responses WS frames until the first downstream-visible frame.
 
@@ -309,26 +383,24 @@ async def read_until_first_responses_ws_visible_event(
     logging, cooldown/scorer, affinity, and local result mapping.
     """
     result = ResponsesWsPreVisibleResult()
-    wait_sec = first_wait
-    timeout_label = timeout_label_seconds if timeout_label_seconds is not None else first_wait
 
     while True:
         try:
-            data = await asyncio.wait_for(upstream_ws.recv(), timeout=wait_sec)
+            data = await _next_nonempty_ws_frame(
+                upstream_ws, timing=timing, round_timeouts=round_timeouts,
+            )
+        except BusinessTimeoutError as exc:
+            result.outcome = exc.outcome
+            result.error_detail = exc.outcome
+            return result
         except asyncio.TimeoutError:
-            result.outcome = "first_byte_timeout"
-            if timeout_detail_mode == "packet_or_visible":
-                result.error_detail = (
-                    f"first websocket packet timeout > {timeout_label}s"
-                    if result.first_packet_ms is None else
-                    f"first websocket visible event timeout > {timeout_label}s"
-                )
-            else:
-                result.error_detail = f"first websocket event timeout > {timeout_label}s"
+            # Compatibility fallback for callers not yet supplying a round.
+            result.outcome = "transport_timeout"
+            result.error_detail = "websocket transport timeout before first frame"
             return result
 
-        if result.first_packet_ms is None and start_time is not None:
-            result.first_packet_ms = int((time.time() - start_time) * 1000)
+        if result.first_packet_ms is None and timing is not None:
+            result.first_packet_ms = timing.snapshot().first_byte_ms
         if proxy_bytes is not None:
             proxy_bytes.count(down=ws_frame_size(data))
 
@@ -348,6 +420,8 @@ async def read_until_first_responses_ws_visible_event(
             tracker.feed_text(data)
 
             if getattr(tracker, "response_failed", False):
+                if timing is not None:
+                    timing.mark_io_complete()
                 result.outcome = "stream_upstream_error" if event_type == "response.failed" else "upstream_error_json"
                 if use_tracker_error_detail:
                     result.error_detail = getattr(tracker, "stream_error_message", None) or data[:2000]
@@ -380,6 +454,8 @@ async def read_until_first_responses_ws_visible_event(
 
             result.pending.append(data)
             if getattr(tracker, "response_completed", False):
+                if timing is not None:
+                    timing.mark_io_complete()
                 result.ok = True
                 result.outcome = "success"
                 result.closed_after_accept = True
@@ -390,13 +466,6 @@ async def read_until_first_responses_ws_visible_event(
             result.pending.append(data)
             result.visible_frame = data
             return result
-
-        remaining = deadline_ts - time.time()
-        if remaining <= 0:
-            result.outcome = "total_timeout"
-            result.error_detail = "upstream total timeout before first visible websocket event"
-            return result
-        wait_sec = min(float(idle_timeout), max(1.0, remaining))
 
 
 async def read_next_responses_ws_step(
@@ -412,26 +481,29 @@ async def read_next_responses_ws_step(
     closed_error_detail: str | None = None,
     blacklist_before_error: bool = False,
     check_blacklist: bool = True,
+    timing: WsAttemptTiming | None = None,
+    round_timeouts: RoundTimeouts | None = None,
 ) -> ResponsesWsReadStep:
     """Read and classify one post-accept Responses WS frame."""
-    remaining = deadline_ts - time.time()
-    if remaining <= 0:
+    try:
+        data = await _next_nonempty_ws_frame(
+            upstream_ws, timing=timing, round_timeouts=round_timeouts,
+        )
+    except BusinessTimeoutError as exc:
         return ResponsesWsReadStep(
-            outcome="total_timeout",
-            error_detail="upstream total timeout",
+            outcome=exc.outcome,
+            error_detail=exc.outcome,
             http_status=504,
         )
-
-    wait_sec = min(float(idle_timeout), max(1.0, remaining))
-    try:
-        data = await asyncio.wait_for(upstream_ws.recv(), timeout=wait_sec)
     except asyncio.TimeoutError:
         return ResponsesWsReadStep(
-            outcome="idle_timeout",
-            error_detail=f"upstream idle timeout > {idle_timeout}s",
+            outcome="transport_timeout",
+            error_detail="websocket transport timeout",
             http_status=504,
         )
     except websockets.ConnectionClosed as exc:
+        if timing is not None:
+            timing.mark_io_complete()
         close_code = int(exc.rcvd.code if exc.rcvd else 1000)
         close_reason = str(exc.rcvd.reason if exc.rcvd else "")
         if getattr(tracker, "response_completed", False):
@@ -489,6 +561,8 @@ async def read_next_responses_ws_step(
                 step.http_status = 503
                 return step
         if getattr(tracker, "response_failed", False):
+            if timing is not None:
+                timing.mark_io_complete()
             if getattr(tracker, "stream_error_code", None) == protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE:
                 step.outcome = "request_invalid"
                 step.error_detail = (
@@ -511,6 +585,8 @@ async def read_next_responses_ws_step(
                 step.http_status = 503
                 return step
         if getattr(tracker, "response_completed", False):
+            if timing is not None:
+                timing.mark_io_complete()
             step.outcome = "success"
             step.response_completed = True
             return step

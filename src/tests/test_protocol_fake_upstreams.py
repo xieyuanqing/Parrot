@@ -28,6 +28,7 @@ import time
 from types import SimpleNamespace
 
 import httpx
+import pytest
 
 
 def _import_modules():
@@ -112,6 +113,23 @@ class ChunkedByteStream(httpx.AsyncByteStream):
         for chunk in self.chunks:
             await asyncio.sleep(0)
             yield chunk
+
+
+class TerminalThenHangByteStream(httpx.AsyncByteStream):
+    """Yield one complete Responses payload but deliberately never send EOF."""
+
+    def __init__(self, payload: bytes):
+        self.payload = payload
+        self.release = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    async def __aiter__(self):
+        yield self.payload
+        await self.release.wait()
+
+    async def aclose(self):
+        self.closed.set()
+        self.release.set()
 
 
 def _json_request(req: httpx.Request) -> dict:
@@ -1085,6 +1103,321 @@ async def test_anthropic_client_to_openai_responses_stream_fake_upstream(m):
     assert '"type":"content_block_delta"' in text
     assert '"text":"responses stream pong"' in text
     assert '"stop_reason":"end_turn"' in text
+
+
+async def test_responses_terminal_event_finishes_without_waiting_for_http_eof(m):
+    _setup(m)
+    router = MockRouter()
+    terminal_payload = _responses_sse_response("terminal without eof").content
+    hanging = TerminalThenHangByteStream(terminal_payload)
+
+    def handler(req: httpx.Request):
+        return httpx.Response(
+            200,
+            stream=hanging,
+            headers={"content-type": "text/event-stream"},
+        )
+
+    router.register("https://responses-no-eof.example", handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "responses-no-eof",
+            "https://responses-no-eof.example",
+            protocol="openai-responses",
+            alias="sonnet",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "sonnet",
+        "stream": True,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    resp, mc, _route = await _call_anthropic_core(m, router, body)
+    text = await asyncio.wait_for(_consume_streaming_to_string(resp), timeout=1.0)
+    await mc.aclose()
+
+    assert "terminal without eof" in text
+    assert hanging.closed.is_set()
+
+
+async def test_stream_generator_aclose_records_cancelled_without_cooldown(m, monkeypatch):
+    _setup(m)
+    router = MockRouter()
+    partial_payload = b"".join([
+        _responses_sse_event("response.created", {
+            "type": "response.created",
+            "response": {"id": "resp_partial", "status": "in_progress"},
+        }),
+        _responses_sse_event("response.output_text.delta", {
+            "type": "response.output_text.delta",
+            "item_id": "msg_partial",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "partial",
+        }),
+    ])
+    hanging = TerminalThenHangByteStream(partial_payload)
+    router.register(
+        "https://responses-aclose.example",
+        lambda req: httpx.Response(
+            200,
+            stream=hanging,
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+    _install_channels(m, [
+        _make_openai_channel(
+            "responses-aclose",
+            "https://responses-aclose.example",
+            protocol="openai-responses",
+            alias="sonnet",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "sonnet",
+        "stream": True,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    resp, mc, _route = await _call_anthropic_core(m, router, body)
+    finish_statuses: list[str] = []
+    original_finish_error = m["log_db"].finish_error
+
+    def recorded_finish_error(*args, **kwargs):
+        finish_statuses.append(str(kwargs.get("status") or "error"))
+        return original_finish_error(*args, **kwargs)
+
+    monkeypatch.setattr(m["log_db"], "finish_error", recorded_finish_error)
+    iterator = resp.body_iterator
+    emitted = b""
+    for _ in range(10):
+        item = await asyncio.wait_for(anext(iterator), timeout=1.0)
+        emitted += item.encode() if isinstance(item, str) else item
+        if b"partial" in emitted:
+            break
+    assert b"partial" in emitted
+    await iterator.aclose()
+    await mc.aclose()
+
+    latest = m["log_db"]._get_conn().execute(
+        "SELECT status, error_message FROM request_log ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert finish_statuses == ["cancelled"]
+    assert latest is not None and latest["status"] == "cancelled"
+    assert latest["error_message"] == "client disconnected"
+    assert hanging.closed.is_set()
+    assert m["cooldown"].get_state("api:responses-aclose", "gpt-real") is None
+
+
+async def test_terminal_finalization_survives_consumer_cancellation_between_db_writes(m, monkeypatch):
+    _setup(m)
+    router = MockRouter()
+    router.register(
+        "https://responses-cancel.example",
+        lambda req: _responses_sse_response("cancel after terminal"),
+    )
+    _install_channels(m, [
+        _make_openai_channel(
+            "responses-cancel",
+            "https://responses-cancel.example",
+            protocol="openai-responses",
+            alias="sonnet",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "sonnet",
+        "stream": True,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    resp, mc, _route = await _call_anthropic_core(m, router, body)
+
+    retry_write_entered = asyncio.Event()
+    release_retry_write = asyncio.Event()
+    finish_success_calls: list[str] = []
+    original_to_thread = asyncio.to_thread
+    original_finish_success = m["log_db"].finish_success
+
+    async def controlled_to_thread(func, /, *args, **kwargs):
+        if func is m["log_db"].update_retry_attempt:
+            retry_write_entered.set()
+            await release_retry_write.wait()
+        return func(*args, **kwargs)
+
+    def recorded_finish_success(request_id, *args, **kwargs):
+        finish_success_calls.append(str(request_id))
+        return original_finish_success(request_id, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", controlled_to_thread)
+    monkeypatch.setattr(m["log_db"], "finish_success", recorded_finish_success)
+    consumer = asyncio.create_task(_consume_streaming_to_string(resp))
+    await asyncio.wait_for(retry_write_entered.wait(), timeout=1.0)
+    consumer.cancel()
+    await asyncio.sleep(0)
+    assert not consumer.done()
+
+    release_retry_write.set()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+    await mc.aclose()
+    monkeypatch.setattr(asyncio, "to_thread", original_to_thread)
+
+    assert len(finish_success_calls) == 1
+
+
+async def test_anthropic_messages_stream_invalid_image_http_400_short_circuits(m):
+    _setup(m)
+    router = MockRouter()
+    fallback_calls = {"count": 0}
+
+    def invalid_image_handler(req: httpx.Request):
+        assert str(req.url) == "https://invalid-image.example/v1/responses"
+        return httpx.Response(400, json={
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_value",
+                "param": "input",
+                "message": "Invalid image data: expected a base64-encoded image.",
+            }
+        })
+
+    def fallback_handler(req: httpx.Request):
+        fallback_calls["count"] += 1
+        return _responses_sse_response("must not fail over")
+
+    router.register("https://invalid-image.example", invalid_image_handler)
+    router.register("https://invalid-image-fallback.example", fallback_handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "invalid-image",
+            "https://invalid-image.example",
+            protocol="openai-responses",
+            alias="sonnet",
+            real="gpt-real",
+        ),
+        _make_openai_channel(
+            "invalid-image-fallback",
+            "https://invalid-image-fallback.example",
+            protocol="openai-responses",
+            alias="sonnet",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "sonnet",
+        "stream": True,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "invalid image request"}],
+    }
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    await mc.aclose()
+
+    assert route.candidates[0][0].protocol == "openai-responses"
+    assert [str(req.url) for req in router.requests] == [
+        "https://invalid-image.example/v1/responses",
+    ]
+    assert fallback_calls["count"] == 0
+    assert resp.status_code == 400
+    assert resp.headers["content-type"].startswith("application/json")
+    assert b"event: error" not in resp.body
+    payload = json.loads(resp.body)
+    assert payload == {
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "Invalid image data: expected a base64-encoded image.",
+            "code": "invalid_value",
+        },
+    }
+
+    conn = m["log_db"]._get_conn()
+    request_row = dict(conn.execute(
+        "SELECT request_id, http_status, retry_count FROM request_log ORDER BY id DESC LIMIT 1"
+    ).fetchone())
+    attempts = [dict(row) for row in conn.execute(
+        "SELECT channel_key, outcome FROM retry_chain WHERE request_id = ? ORDER BY attempt_order",
+        (request_row["request_id"],),
+    ).fetchall()]
+    assert request_row["http_status"] == 400
+    assert request_row["retry_count"] == 0
+    assert attempts == [{
+        "channel_key": route.candidates[0][0].key,
+        "outcome": "request_invalid",
+    }]
+    assert not m["cooldown"].is_blocked(route.candidates[0][0].key, "gpt-real")
+    assert m["scorer"].get_stats(route.candidates[0][0].key, "gpt-real") is None
+
+
+@pytest.mark.parametrize("status,error_type", [(429, "rate_limit_error"), (503, "server_error")])
+async def test_anthropic_messages_stream_retryable_http_errors_still_fail_over_and_cool_down(
+    m,
+    status,
+    error_type,
+):
+    _setup(m)
+    router = MockRouter()
+    bad_base = f"https://retryable-{status}.example"
+    good_base = f"https://retryable-{status}-fallback.example"
+
+    def bad_handler(req: httpx.Request):
+        return httpx.Response(status, json={
+            "error": {
+                "type": error_type,
+                "code": "temporarily_unavailable",
+                "message": "retry later",
+            }
+        })
+
+    router.register(bad_base, bad_handler)
+    router.register(good_base, lambda req: _responses_sse_response("retry succeeded"))
+    _install_channels(m, [
+        _make_openai_channel(
+            f"retryable-{status}", bad_base, protocol="openai-responses", alias="sonnet", real="gpt-real",
+        ),
+        _make_openai_channel(
+            f"retryable-{status}-fallback",
+            good_base,
+            protocol="openai-responses",
+            alias="sonnet",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "sonnet",
+        "stream": True,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert "retry succeeded" in text
+    assert [str(req.url) for req in router.requests] == [
+        f"{bad_base}/v1/responses",
+        f"{good_base}/v1/responses",
+    ]
+    conn = m["log_db"]._get_conn()
+    request_id = conn.execute(
+        "SELECT request_id FROM request_log ORDER BY id DESC LIMIT 1"
+    ).fetchone()[0]
+    outcomes = [row[0] for row in conn.execute(
+        "SELECT outcome FROM retry_chain WHERE request_id = ? ORDER BY attempt_order",
+        (request_id,),
+    ).fetchall()]
+    assert outcomes == ["http_error", "success"]
+    assert m["cooldown"].is_blocked(route.candidates[0][0].key, "gpt-real")
+    assert m["scorer"].get_stats(route.candidates[0][0].key, "gpt-real")["total_requests"] == 1
 
 
 async def test_anthropic_client_to_openai_responses_stream_pre_visible_error_fails_over(m):
@@ -2911,7 +3244,7 @@ async def test_http_responses_client_to_ws_fake_upstream(monkeypatch, m):
     ])
     captured: dict[str, object] = {}
 
-    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
         captured["url"] = url
         captured["headers"] = dict(headers)
         captured["connector"] = connector
