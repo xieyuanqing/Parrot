@@ -123,6 +123,8 @@ def test_fmt_helpers(m):
     assert ui.fmt_tokens(500) == "500"
     assert ui.fmt_tokens(1500) == "1.5K"
     assert ui.fmt_tokens(2_500_000) == "2.5M"
+    assert ui.fmt_tokens(12_325_000_000) == "12.3B"
+    assert ui.fmt_tokens(2_500_000_000_000) == "2.5T"
     assert ui.fmt_tokens(None) == "0"
 
     assert ui.fmt_rate(50, 200) == "25.0%"
@@ -264,22 +266,27 @@ def test_logs_list(m):
     # 错误摘要解包
     assert "down" in text
 
-    assert "最近日志 · 第 1/1 页 · 共 3 条" in text
+    assert "最近日志 · 请求日志 · 第 1/1 页 · 共 3 条" in text
     assert "Token: ↑ 160 · ↓ 20 · 缓存 50 (31.2%)" in text
     assert "耗时: 连接 150ms · 首字 600ms · 总 3.0s" in text
 
-    # 按钮中应包含 3 个 detail 短码，且单行 3 列紧凑排列
+    # 顶部可切换请求/多媒体日志；详情按钮仍单行 3 列紧凑排列。
     kb_rows = edit["reply_markup"]["inline_keyboard"]
-    first_detail_row = [b for b in kb_rows[0] if b.get("callback_data", "").startswith("logs:detail:")]
+    assert any(b.get("callback_data") == "media:logs" for b in kb_rows[0])
+    first_detail_row = next(
+        row for row in kb_rows
+        if any(b.get("callback_data", "").startswith("logs:detail:") for b in row)
+    )
     assert len(first_detail_row) == 3
     btns = [b["callback_data"] for row in kb_rows for b in row if "callback_data" in b]
     assert sum(1 for b in btns if b.startswith("logs:detail:")) >= 3
     assert any(b.startswith("logs:list:") for b in btns)
     labels = [b["text"] for row in kb_rows for b in row if "text" in b]
     assert "🏠 首页" in labels
-    assert any(t.startswith("🔑 账号：") for t in labels)
-    assert any(t.startswith("🤖 模型：") for t in labels)
-    assert any(t.startswith("📡 渠道：") for t in labels)
+    assert "🔎 查询" in labels
+    assert not any(t.startswith(("🔑 账号：", "🤖 模型：", "📡 渠道：")) for t in labels)
+    bottom_row = next(row for row in kb_rows if any(b.get("text") == "🔄 刷新" for b in row))
+    assert [b.get("text") for b in bottom_row] == ["🔄 刷新", "🔎 查询", "◀ 返回主菜单"]
     print("  [PASS] logs list")
 
 
@@ -305,6 +312,26 @@ def test_logs_list_marks_responses_websocket(m):
     assert "传输协议: <b>↑WS</b>" in text
     assert "gpt-5.5" in text
     print("  [PASS] logs WS marker")
+
+
+def test_logs_list_combines_transport_and_proxy(m):
+    ui = m["ui"]
+    ws_and_proxy = ui.fmt_log_entry_body({
+        "requested_model": "gpt-5.6-terra",
+        "ingress_protocol": "responses",
+        "upstream_transport": "ws",
+        "proxy_name": "misaka-lax",
+    })
+    assert "  传输协议: <b>↑WS</b> · 出站代理: misaka-lax" in ws_and_proxy
+    assert "\n  出站代理: misaka-lax" not in ws_and_proxy
+
+    proxy_only = ui.fmt_log_entry_body({
+        "requested_model": "gpt-5.6-terra",
+        "proxy_name": "misaka-lax",
+    })
+    assert "  出站代理: misaka-lax" in proxy_only
+    assert "传输协议:" not in proxy_only
+    print("  [PASS] logs compact transport + proxy line")
 
 
 def test_logs_pagination(m):
@@ -374,20 +401,37 @@ def test_logs_filters_preserve_state(m):
     rec = _install_recorder(m)
     m["logs_menu"].show(42, 100, "cb")
     edit = rec.last("editMessageText")
-    account_cb = next(
+    query_cb = next(
         b["callback_data"]
         for row in edit["reply_markup"]["inline_keyboard"]
-        for b in row if b.get("text", "").startswith("🔑 账号：")
+        for b in row if b.get("text") == "🔎 查询"
+    )
+
+    rec.clear()
+    m["logs_menu"].handle_callback(42, 100, "cb-query", query_cb)
+    query_menu = rec.last("editMessageText")
+    assert "查询日志" in query_menu["text"]
+    assert "请选择查询方式" in query_menu["text"]
+    query_rows = query_menu["reply_markup"]["inline_keyboard"]
+    query_labels = [b.get("text", "") for row in query_rows for b in row]
+    assert "🔑 账号" in query_labels and "🤖 模型" in query_labels and "📡 渠道" in query_labels
+    query_methods_row = next(row for row in query_rows if any(b.get("text") == "🔑 账号" for b in row))
+    assert [b.get("text") for b in query_methods_row] == ["🔑 账号", "🤖 模型", "📡 渠道"]
+    assert "🧹 清空查询条件" in query_labels
+    account_cb = next(
+        b["callback_data"]
+        for row in query_menu["reply_markup"]["inline_keyboard"]
+        for b in row if b.get("text") == "🔑 账号"
     )
     model_cb = next(
         b["callback_data"]
-        for row in edit["reply_markup"]["inline_keyboard"]
-        for b in row if b.get("text", "").startswith("🤖 模型：")
+        for row in query_menu["reply_markup"]["inline_keyboard"]
+        for b in row if b.get("text") == "🤖 模型"
     )
     channel_cb = next(
         b["callback_data"]
-        for row in edit["reply_markup"]["inline_keyboard"]
-        for b in row if b.get("text", "").startswith("📡 渠道：")
+        for row in query_menu["reply_markup"]["inline_keyboard"]
+        for b in row if b.get("text") == "📡 渠道"
     )
 
     rec.clear()
@@ -435,7 +479,24 @@ def test_logs_filters_preserve_state(m):
     assert "m1" in filtered["text"] and "m2" in filtered["text"]
     assert "Key <code>k2</code>" not in filtered["text"]
     btns = [b for row in filtered["reply_markup"]["inline_keyboard"] for b in row]
-    assert any(b.get("text") == "🔑 账号：k1" for b in btns)
+    assert any(b.get("text") == "🔎 查询" for b in btns)
+    query_cb = next(b["callback_data"] for b in btns if b.get("text") == "🔎 查询")
+
+    rec.clear()
+    m["logs_menu"].handle_callback(42, 100, "cb-query-filtered", query_cb)
+    active_query_menu = rec.last("editMessageText")
+    assert "账号：k1" in active_query_menu["text"]
+    back_to_list_cb = next(
+        b["callback_data"]
+        for row in active_query_menu["reply_markup"]["inline_keyboard"]
+        for b in row if b.get("text") == "◀ 返回日志"
+    )
+
+    rec.clear()
+    m["logs_menu"].handle_callback(42, 100, "cb-query-back", back_to_list_cb)
+    filtered = rec.last("editMessageText")
+    assert "共 2 条" in filtered["text"]
+    btns = [b for row in filtered["reply_markup"]["inline_keyboard"] for b in row]
     detail_cb = next(b["callback_data"] for b in btns if b.get("callback_data", "").startswith("logs:detail:"))
 
     rec.clear()
@@ -453,8 +514,23 @@ def test_logs_filters_preserve_state(m):
     back = rec.last("editMessageText")
     assert "共 2 条" in back["text"]
     btns_back = [b for row in back["reply_markup"]["inline_keyboard"] for b in row]
-    assert any(b.get("text") == "🔑 账号：k1" for b in btns_back)
-    print("  [PASS] logs filters multi-select and preserve state through detail back")
+    assert any(b.get("text") == "🔎 查询" for b in btns_back)
+
+    query_cb = next(b["callback_data"] for b in btns_back if b.get("text") == "🔎 查询")
+    rec.clear()
+    m["logs_menu"].handle_callback(42, 100, "cb-query-clear-open", query_cb)
+    active_query_menu = rec.last("editMessageText")
+    clear_cb = next(
+        b["callback_data"]
+        for row in active_query_menu["reply_markup"]["inline_keyboard"]
+        for b in row if b.get("text") == "🧹 清空查询条件"
+    )
+
+    rec.clear()
+    m["logs_menu"].handle_callback(42, 100, "cb-query-clear", clear_cb)
+    cleared = rec.last("editMessageText")
+    assert "共 4 条" in cleared["text"]
+    print("  [PASS] logs filters multi-select, clear, and preserve state through detail back")
 
 
 def test_logs_detail_with_execution_chain(m):

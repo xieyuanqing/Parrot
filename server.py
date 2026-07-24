@@ -328,7 +328,23 @@ _API_KEY_LIMITED_HTTP_PATHS = {
     "/images/generations",
     "/v1/images/edits",
     "/images/edits",
+    "/v1/videos",
+    "/v1/videos/generations",
+    "/v1/videos/edits",
+    "/v1/videos/extensions",
+    # Codex WebRTC call creation uses the ChatGPT-backend-shaped request body;
+    # WebSocket realtime sessions acquire their API-key lease in their handler.
+    "/backend-api/codex/realtime/calls",
 }
+
+
+def _is_api_key_limited_http_request(method: str, path: str) -> bool:
+    if method.upper() == "POST":
+        return path in _API_KEY_LIMITED_HTTP_PATHS
+    if method.upper() == "GET" and path.startswith("/v1/videos/"):
+        request_id = path[len("/v1/videos/"):]
+        return bool(request_id and "/" not in request_id)
+    return False
 
 
 def _api_key_limit_error_response(path: str, exc: apikey_limiter.ApiKeyLimitError):
@@ -513,7 +529,7 @@ class _DrainHttpMiddleware:
 
         try:
             request = Request(scope, receive=receive)
-            if method.upper() == "POST" and path in _API_KEY_LIMITED_HTTP_PATHS:
+            if _is_api_key_limited_http_request(method, path):
                 key_name, _allowed_models, err = auth.validate(request.headers)
                 if not err and key_name:
                     key_lease = await apikey_limiter.acquire(
@@ -759,6 +775,46 @@ async def proxy_responses_websocket(websocket: WebSocket):
         await handle_responses_ws(websocket)
 
 
+@app.websocket("/v1/realtime")
+async def proxy_realtime_websocket(websocket: WebSocket):
+    """Codex Realtime V1/V2 transparent WebSocket relay."""
+    if drain.is_draining():
+        await websocket.close(code=1013, reason="Parrot is draining for graceful restart")
+        return
+    from src.openai.realtime import handle_realtime_ws
+    async with drain.active("ws /v1/realtime"):
+        await handle_realtime_ws(websocket, path="/v1/realtime")
+
+
+@app.websocket("/v1/live")
+async def proxy_realtime_live_websocket(websocket: WebSocket):
+    """Codex Realtime V3 transparent WebSocket relay."""
+    if drain.is_draining():
+        await websocket.close(code=1013, reason="Parrot is draining for graceful restart")
+        return
+    from src.openai.realtime import handle_realtime_ws
+    async with drain.active("ws /v1/live"):
+        await handle_realtime_ws(websocket, path="/v1/live")
+
+
+@app.websocket("/v1/live/{call_id}")
+async def proxy_realtime_live_sideband_websocket(websocket: WebSocket, call_id: str):
+    """Codex Realtime V3 WebRTC sideband relay for an existing call."""
+    if drain.is_draining():
+        await websocket.close(code=1013, reason="Parrot is draining for graceful restart")
+        return
+    from src.openai.realtime import handle_realtime_ws
+    async with drain.active("ws /v1/live/{call_id}"):
+        await handle_realtime_ws(websocket, path=f"/v1/live/{call_id}", live_call_id=call_id)
+
+
+@app.post("/backend-api/codex/realtime/calls")
+async def proxy_realtime_call(request: Request):
+    """Codex backend-shaped WebRTC call creation relay."""
+    from src.openai.realtime import handle_realtime_call
+    return await handle_realtime_call(request)
+
+
 @app.post("/v1/images/generate")
 async def proxy_images_generate(request: Request):
     """Parrot 封装版图片生成入口：prompt + 可选 size。"""
@@ -773,7 +829,7 @@ async def proxy_images_edit(request: Request):
     return await handle_edit(request)
 
 
-# OpenAI Images API 兼容入口：标准 schema、对接现有 OAuth 账号管线。
+# OpenAI Images API 兼容入口：按 model 在 GPT/Codex 与 xAI OAuth 间分流。
 @app.post(
     "/v1/images/generations",
     summary="OpenAI-compatible image generation",
@@ -781,9 +837,9 @@ async def proxy_images_edit(request: Request):
         "Standard OpenAI `/v1/images/generations` endpoint. Accepts `prompt`, "
         "`model`, `n`, `size`, `response_format`, `quality`, `background`, "
         "`output_format`, `moderation`, `style`, `output_compression`, "
-        "`partial_images`. Internally uses Parrot's OpenAI OAuth account pool. "
-        "`n > 1` is downgraded to 1 (one image per upstream call) and the "
-        "response includes a `parrot_warning` field."
+        "`partial_images`. Configured `grok-imagine-image*` models use the xAI "
+        "OAuth pool; all other models retain the GPT/Codex image pipeline. "
+        "Only the GPT/Codex path downgrades `n > 1` to one image."
     ),
     tags=["images"],
 )
@@ -808,6 +864,47 @@ async def proxy_images_generations_openai(request: Request):
 async def proxy_images_edits_openai(request: Request):
     from src.openai.images_openai_compat import handle_edits
     return await handle_edits(request)
+
+
+@app.post(
+    "/v1/videos/generations",
+    summary="Generate a video with xAI Imagine",
+    tags=["videos"],
+)
+@app.post("/v1/videos", include_in_schema=False)
+async def proxy_xai_video_generation(request: Request):
+    from src.xai.imagine import handle_video_create
+    return await handle_video_create(request, action="generate")
+
+
+@app.post(
+    "/v1/videos/edits",
+    summary="Edit a video with xAI Imagine",
+    tags=["videos"],
+)
+async def proxy_xai_video_edit(request: Request):
+    from src.xai.imagine import handle_video_create
+    return await handle_video_create(request, action="edit")
+
+
+@app.post(
+    "/v1/videos/extensions",
+    summary="Extend a video with xAI Imagine",
+    tags=["videos"],
+)
+async def proxy_xai_video_extension(request: Request):
+    from src.xai.imagine import handle_video_create
+    return await handle_video_create(request, action="extend")
+
+
+@app.get(
+    "/v1/videos/{request_id}",
+    summary="Get an xAI Imagine video task",
+    tags=["videos"],
+)
+async def proxy_xai_video_result(request: Request, request_id: str):
+    from src.xai.imagine import handle_video_result
+    return await handle_video_result(request, request_id)
 
 
 @app.post("/v1/messages")

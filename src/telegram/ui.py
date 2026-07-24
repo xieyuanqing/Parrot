@@ -283,6 +283,36 @@ def send_photo(chat_id: int, path: str, caption: str = "") -> Optional[dict]:
         return None
 
 
+def send_video(chat_id: int, path: str, caption: str = "") -> Optional[dict]:
+    """发送本地视频文件。用于多媒体日志的「查看视频」按钮。"""
+    if not _bot_token:
+        return None
+    url = f"https://api.telegram.org/bot{_bot_token}/sendVideo"
+    try:
+        session = _get_session()
+        with open(path, "rb") as f:
+            data: dict[str, Any] = {
+                "chat_id": chat_id,
+                "supports_streaming": "true",
+            }
+            if caption:
+                data["caption"] = caption
+                data["parse_mode"] = "HTML"
+            resp = session.post(
+                url,
+                data=data,
+                files={"video": (path.rsplit("/", 1)[-1], f, "video/mp4")},
+            )
+        result = resp.json()
+        if isinstance(result, dict) and result.get("ok"):
+            return result
+        print(f"[tg] sendVideo not ok: {str(result)[:200]}")
+        return result
+    except Exception as exc:
+        print(f"[tg] sendVideo failed: {exc}")
+        return None
+
+
 def send_document_bytes(chat_id: int, data_bytes: bytes, *, filename: str,
                         caption: str = "", content_type: str = "text/plain; charset=utf-8") -> Optional[dict]:
     """发送内存中的文件。用于超长日志导出等场景。"""
@@ -831,10 +861,13 @@ def fmt_log_entry_body(r: dict) -> str:
         search_count = int(r.get("local_web_count") or 0)
     except Exception:
         search_count = 0
+    network_parts: list[str] = []
     if transport in {"WS", "↑WS"}:
-        lines.append(f"  传输协议: <b>{transport}</b>")
+        network_parts.append(f"传输协议: <b>{transport}</b>")
     if proxy_name:
-        lines.append(f"  出站代理: {escape_html(proxy_name)}")
+        network_parts.append(f"出站代理: {escape_html(proxy_name)}")
+    if network_parts:
+        lines.append("  " + " · ".join(network_parts))
     if search_count:
         lines.append(f"  搜索: {search_count} 次")
 
