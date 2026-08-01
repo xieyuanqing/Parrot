@@ -80,14 +80,14 @@ def test_main_page(m):
     expected = {"sys:show:timeouts", "sys:show:errwin", "sys:show:scoring",
                 "sys:show:affinity", "sys:show:notif", "menu:status_alert", "sys:show:retention",
                 "sys:show:blacklist", "sys:show:aklim", "sys:show:ws_mode", "sys:show:retry",
-                "menu:main"}
+                "sys:show:custom", "menu:main"}
     for e in expected:
         assert e in btns, f"missing btn {e}"
     assert "menu:loadbalancing" not in btns
     assert "sys:show:cch" not in btns
     assert "sys:show:quota" not in btns
     bottom = edit["reply_markup"]["inline_keyboard"][-1]
-    assert [button["callback_data"] for button in bottom] == ["sys:show:retry", "menu:main"]
+    assert [button["callback_data"] for button in bottom] == ["menu:main"]
     assert "候选按序故障转移" in text
     print("  [PASS] main settings page")
 
