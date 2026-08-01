@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import copy
 import json
+import sqlite3
 import time
 import uuid
 from typing import Any, Optional
 
+from ...sqlite_errors import is_availability_error
 from . import guard
 
 
@@ -216,6 +218,14 @@ def _resolve_input(body: dict, *, api_key_name: str = "") -> list:
                 f"previous_response_id '{prev_id}' does not belong to this API key",
                 param="previous_response_id",
             )
+        except sqlite3.Error as exc:
+            if not is_availability_error(exc):
+                raise
+            raise _guard.GuardError(
+                503, "server_error",
+                "previous_response_id store is temporarily unavailable",
+                param="previous_response_id",
+            ) from exc
 
     cur = body.get("input")
     if isinstance(cur, str):
@@ -340,14 +350,22 @@ def _input_items_to_messages(items: list) -> list:
                 # 回喂 chat 上游时要把 refusal parts 单独提取到 message.refusal 字段，
                 # 避免信息被折叠成空 text 丢失
                 refusal_texts: list[str] = []
-                non_refusal_parts: list = []
-                for p in content_parts:
-                    if isinstance(p, dict) and p.get("type") == "refusal":
-                        r = p.get("refusal")
-                        if isinstance(r, str) and r:
-                            refusal_texts.append(r)
-                    else:
-                        non_refusal_parts.append(p)
+                if isinstance(content_parts, str):
+                    # EasyInputMessage.content may be a plain string.  Hermes
+                    # uses this form for locally generated fallback/final
+                    # assistant messages.  Iterating it as content parts would
+                    # drop every character and emit an empty Anthropic text
+                    # block after the Responses→Chat→Anthropic bridge.
+                    non_refusal_parts: Any = content_parts
+                else:
+                    non_refusal_parts = []
+                    for p in content_parts:
+                        if isinstance(p, dict) and p.get("type") == "refusal":
+                            r = p.get("refusal")
+                            if isinstance(r, str) and r:
+                                refusal_texts.append(r)
+                        else:
+                            non_refusal_parts.append(p)
                 # 纯 refusal（无文本/图片 parts）→ content 必须是 null，
                 # 否则严格上游（如官方 gpt-*）会因 assistant.content 为空列表而 400
                 msg_out: dict = {
@@ -701,21 +719,26 @@ def translate_response(chat: dict, *, model: str,
                     output_items=output_items,
                 )
         except Exception as exc:
-            import traceback as _tb
-            _tb.print_exc()
             from ... import notifier as _notifier
             ek = _notifier.escape_html
-            _notifier.throttled_notify_event_sync(
-                "openai_store_save_failed",
-                f"openai_store_save_failed:{api_key_name}",
-                f"❌ {_notifier.provider_custom_emoji_html('openai')} <b>OpenAI Store 写入失败</b>（非流式）\n"
-                f"API Key: <code>{ek(api_key_name)}</code>\n"
-                f"模型: <code>{ek(model)}</code> · 渠道: <code>{ek(channel_key or '?')}</code>\n"
-                f"resp_id: <code>{ek(resp_id)}</code>\n"
-                f"原因: <code>{ek(str(exc))[:300]}</code>\n"
-                "⚠ 下一次带该 previous_response_id 的请求会 404；"
-                "请检查 state.db 读写权限与磁盘空间。",
-            )
+            should_log = True
+            try:
+                should_log = _notifier.throttled_notify_event_sync(
+                    "openai_store_save_failed",
+                    f"openai_store_save_failed:{api_key_name}",
+                    f"❌ {_notifier.provider_custom_emoji_html('openai')} <b>OpenAI Store 写入失败</b>（非流式）\n"
+                    f"API Key: <code>{ek(api_key_name)}</code>\n"
+                    f"模型: <code>{ek(model)}</code> · 渠道: <code>{ek(channel_key or '?')}</code>\n"
+                    f"resp_id: <code>{ek(resp_id)}</code>\n"
+                    f"原因: <code>{ek(str(exc))[:300]}</code>\n"
+                    "⚠ 下一次带该 previous_response_id 的请求会 404；"
+                    "请检查 openai.store.dbPath 配置、对应文件权限与磁盘空间。",
+                )
+            except Exception:
+                pass
+            if should_log:
+                import traceback as _tb
+                _tb.print_exc()
 
     return resp
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Optional
 
 import httpx
@@ -504,6 +505,74 @@ def fmt_cache_phrase_from_row(row: dict, *, aggregate: bool = False) -> str:
     return cache_display.cache_read_phrase_from_row(row, aggregate=aggregate)
 
 
+def fmt_cost(
+    metrics: dict | None,
+    *,
+    show_source: bool = True,
+    decimal_places: int = 2,
+) -> str:
+    """Format the combined USD amount without exposing settlement sources."""
+    from .. import config
+
+    pricing_cfg = config.get().get("pricing", {})
+    if isinstance(pricing_cfg, dict) and not bool(pricing_cfg.get("enabled", True)):
+        return "已关闭"
+    data = metrics if isinstance(metrics, dict) else {}
+
+    def nonnegative_int(name: str) -> int:
+        try:
+            return max(0, int(data.get(name) or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    # ``cost_ticks`` is the authoritative sum of provider-reported and
+    # token-priced amounts.  Keep ``show_source`` for call-site compatibility,
+    # but every Telegram surface now intentionally renders only that total.
+    _ = show_source
+    if "cost_ticks" in data:
+        ticks = nonnegative_int("cost_ticks")
+    else:
+        ticks = nonnegative_int("actual_cost_ticks") + nonnegative_int(
+            "estimated_cost_ticks"
+        )
+    return fmt_usd(
+        Decimal(ticks) / Decimal(10_000_000_000),
+        decimal_places=decimal_places,
+    )
+
+
+def fmt_usd(value, *, decimal_places: int = 2) -> str:
+    """Format a USD value using decimal half-up rounding."""
+    places = max(0, int(decimal_places))
+    try:
+        amount = Decimal(str(value or 0))
+    except (InvalidOperation, TypeError, ValueError):
+        amount = Decimal(0)
+    if not amount.is_finite() or amount < 0:
+        amount = Decimal(0)
+    try:
+        amount = amount.quantize(
+            Decimal(1).scaleb(-places),
+            rounding=ROUND_HALF_UP,
+        )
+    except InvalidOperation:
+        amount = Decimal(0)
+    return f"${amount:,.{places}f}"
+
+
+def cost_metrics_from_row(row: dict | None) -> dict:
+    """Return one request's immutable/fallback cost metrics."""
+    from .. import log_db
+
+    return log_db.cost_for_log(row)
+
+
+def fmt_cost_from_row(row: dict | None) -> str:
+    """Format one request row's combined cost amount."""
+
+    return fmt_cost(cost_metrics_from_row(row))
+
+
 def fmt_ms(ms) -> str:
     if ms is None:
         return "-"
@@ -798,11 +867,12 @@ def log_fast_mode_badge(r: dict) -> str:
     return "⚡ Fast" if log_fast_mode_enabled(r) else ""
 
 
-def fmt_log_entry_body(r: dict) -> str:
+def fmt_log_entry_body(r: dict, *, separate_billing: bool = False) -> str:
     """渲染日志条目的 body 部分。
 
     列表首行只放编号/时间/Key/状态，模型、渠道、Token、耗时、代理分行展示，
-    避免长模型名把 Telegram 单行撑爆。
+    避免长模型名把 Telegram 单行撑爆。最近日志列表保留紧凑金额；嵌入其他
+    统计页面时可将金额独立成行。
     """
     lines: list[str] = []
 
@@ -829,14 +899,31 @@ def fmt_log_entry_body(r: dict) -> str:
             ch_line += " · ★亲和"
         lines.append(ch_line)
 
-    # Token
-    if r.get("status") == "success":
+    # Token / billing. Failed attempts can still be billed, so surface an
+    # immutable actual/estimated/unpriced fact even when request_log has no
+    # final-response Token summary.
+    row_status = r.get("status")
+    cost_metrics = (
+        cost_metrics_from_row(r)
+        if row_status in ("success", "error", "cancelled") else {}
+    )
+    if row_status == "success":
         inp = prompt_total_from_row(r)
         cr = r.get("cache_read_tokens") or 0
         tok = f"↑ {fmt_tokens(inp)} · ↓ {fmt_tokens(r.get('output_tokens'))}"
         if cr > 0:
             tok += f" · {fmt_cache_phrase_from_row(r)}"
-        lines.append(f"  Token: {tok}")
+        cost_text = fmt_cost(cost_metrics, show_source=False, decimal_places=3)
+        if separate_billing:
+            lines.append(f"  Token: {tok}")
+            lines.append(f"  金额: {cost_text}")
+        else:
+            lines.append(f"  Token: {tok} · {cost_text}")
+    elif row_status in ("error", "cancelled") and (
+        int(cost_metrics.get("costed_success") or 0) > 0
+        or int(cost_metrics.get("unpriced_success") or 0) > 0
+    ):
+        lines.append(f"  计费: {fmt_cost(cost_metrics, show_source=False, decimal_places=3)}")
 
     # 耗时
     timing_parts: list[str] = []

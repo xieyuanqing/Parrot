@@ -253,6 +253,32 @@
     }
   },
 
+  // ─── models.dev 元数据绑定 / 独立压缩模型 ───
+  "modelBindings": {
+    "defaults": {
+      "gpt-5.4": {"target": "openai/gpt-5.4", "source": "auto"}
+    },
+    "scoped": {
+      "api:Vendor": {
+        "client-alias": {
+          "target": "openai/gpt-5.4",
+          "outboundModel": "Vendor-Real-Model",
+          "source": "manual"
+        }
+      }
+    }
+  },
+  "compressionModel": "gpt-5.4",
+
+  // ─── models.dev 目录刷新 / Token 金额统计 ───
+  "pricing": {
+    "enabled": true,
+    "autoUpdate": true,
+    "sourceUrl": "https://models.dev/api.json",
+    "modelsUrl": "https://models.dev/models.json",
+    "refreshHours": 24
+  },
+
   // ─── 路径 / 请求日志留存 ───
   "logDir": "logs",
   "logRetention": {
@@ -335,6 +361,27 @@ GLM-5:glm-5, GLM-5-Turbo:glm-5-turbo ; gpt-5.4 ， gpt-5.3-codex:codex
 - 客户端请求 `model=glm-5` → 匹配 `alias` → 向上游发 `model=GLM-5`（真实名）
 - 客户端请求 `model=GLM-5`（真实名）→ 若 `alias` 列表中无此值，视为不支持（**除非 real==alias 同值**）
 
+### 模型元数据绑定 `modelBindings` 与压缩模型 `compressionModel`
+
+- `defaults`：键为客户端可见模型名/渠道 alias，值只保存 models.dev `provider/model` identity 与来源；不复制全量目录记录。
+- `scoped`：先按稳定 scope key（`api:<name>` / `oauth:<provider>:<identity>`），再按客户端可见模型名索引；API alias 同时保存当时的 `outboundModel`，alias 被改指后旧专属绑定不再误用。
+- 有效解析固定为 `scoped > default > none`。context window、max output、压缩阈值、能力展示和估算价格均从该绑定指向的同一份 models.dev 目录取得；没有有效绑定时保持无元数据/未计价，不按 provider 或模型前缀猜测。压缩阈值优先取 models.dev 第一档 context 价格阶梯的起点；没有该阶梯时按 `floor((contextWindow - maxOutputTokens) × 80%)` 计算。
+- Telegram「自动同步元数据」会先拉取最新的 `api.json` 与 `models.json`：两份均下载、校验成功后原子保存为本地 gzip 目录；任一拉取失败则保留并继续使用上次成功保存的本地目录。随后从该本地目录扫描每个 OAuth/API scope 的已有客户端模型，去重后只按 `models.json` canonical 官方根与 `api.json` 的 exact 同名记录建立/更新默认绑定，不覆盖专属绑定。专属流程按 OAuth/API 账户或渠道 → 该 scope 内模型 → exact 同名候选优先选择；找不到合适候选时才按名称筛选或浏览 provider 与其模型。
+- `compressionModel` 是独立的客户端可见模型名。运行时按实际 compact 路由解析相同的有效绑定来取得 context、max output 和压缩阈值；普通请求的 compact 预检、直连压缩判断和 map-reduce 分段目标都会使用该阈值。旧 `modelMetadata[*].compressionModel=true` 会一次性迁移，旧手工元数据只有 exact canonical 命中时才迁成默认绑定。
+
+### Token 金额统计 `pricing`
+
+- `enabled`：是否在 Telegram 的统计、日志和账户等页面计算金额；关闭后不读取响应正文做费用聚合。
+- `autoUpdate`：是否后台同时刷新 models.dev 的供应商 API 目录与规范模型目录。启动时先读取 `$ANTHROPIC_PROXY_DATA_DIR/models_dev_catalog.json.gz`（Docker 默认 `/app/data/models_dev_catalog.json.gz`）缓存，缓存不存在或损坏时使用仓库内置 gzip 快照；任一远端失败都不会替换当前目录或影响代理请求。
+- `sourceUrl`：models.dev 供应商模型与价格目录，默认 `https://models.dev/api.json`，只接受 `https://`。金额只从这里读取，单位为 USD / 1M Token。
+- `modelsUrl`：规范模型身份目录，默认 `https://models.dev/models.json`，只接受 `https://`。该文件不提供价格，仅用于 canonical 官方 exact 同名匹配。
+- `refreshHours`：远端刷新间隔，最小 1 小时。
+- 旧 `channelProviders` / `aliases` / `overrides` 字段可继续留在配置中，避免升级时丢配置；新的 dispatch-time 估算不使用它们绕过元数据绑定，也不接受手工价格覆盖。
+
+新请求在每次上游尝试 dispatch 时按真实 scope、客户端可见 model 和出站真实 model 解析有效元数据绑定，并冻结其 models.dev provider/model、费率与目录版本；之后配置或目录更新不会重算该结算。没有有效绑定或绑定记录没有可用 Token 价格时保持 `unpriced`。只有没有尝试账本的历史请求才会按当前有效绑定做兼容估算。xAI OAuth 响应包含 `usage.cost_in_usd_ticks` 时优先采用该次尝试的真实上游金额。长上下文阶梯按**单次请求**的 `input + cache creation + cache read` 判断；当前结算结构只支持一档 context tier，目录若为同一模型提供多档阈值则该模型 fail-closed 为未计价。`experimental.modes.fast.cost` 是完整替换价，不与标准长上下文价叠加；没有响应/真实出站 fast 事实时不会从下游 intent 臆测加速价，实际为 priority/fast 但目录没有对应 tariff、或上游返回 `flex` 等未知计费档位时同样保持未计价。数据库只保存缓存写入总 Token、没有保存 Anthropic 5 分钟 / 1 小时 TTL 拆分，因此 Claude 请求只要包含 cache creation 就标记为“未计价”。目录若要求单独计费 reasoning/audio Token、但价格与聚合 input/output 不同，也会保持未计价，避免用缺失的 Token 维度生成假精确金额。
+
+Telegram 界面只显示合并后的 USD 金额，不展示金额来源分类或未计价次数；统计页面保留两位小数，最近日志紧凑列表保留三位小数，均不加约等号。models.dev 计价结果与 xAI 上游金额会直接合并到同一个总额，内部仍保留各自结算来源及无法计价记录，以保证账本和聚合口径不变。Parrot 不做实时汇率换算。旧版 OpenAI 日志曾把缓存读取 Token 同时包含在 `input_tokens` 中；若历史行缺少明确的 usage 口径且无法确认新旧语义，内部不会把它作为已知金额计入总额。
+
 ### 超时语义（关键）
 
 四段超时**独立**运行，任一段超时即中止：
@@ -363,7 +410,7 @@ GLM-5:glm-5, GLM-5-Turbo:glm-5-turbo ; gpt-5.4 ， gpt-5.3-codex:codex
 - 大部分字段（channels / oauthAccounts / timeouts / scoring / ...）热加载即生效
 - **不热加载**：
   - `listen.host` / `listen.port`（需重启）
-  - `stateDbPath` / `logDir`（需重启）
+  - `stateDbPath` / `logDir` / `openai.store.dbPath`（需重启）
   - `telegram.botToken` / `telegram.adminIds`（需重启）
 
 ## 2.4 TG Bot 对 config.json 的写入

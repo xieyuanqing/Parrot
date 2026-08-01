@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
+import re
 import time
 import traceback
 import uuid
@@ -25,7 +27,7 @@ import threading
 
 from . import (
     affinity, blacklist, compact_rescue, concurrency, config, cooldown, errors, fingerprint,
-    local_web_tools, log_db, model_metadata, notifier, oauth_manager, scorer, state_db,
+    local_web_tools, log_db, model_metadata, model_pricing, notifier, oauth_manager, quota_errors, scorer, state_db,
     token_counter, upstream,
 )
 from .channel.base import Channel
@@ -50,16 +52,26 @@ from .protocols import finalize as finalize_policy
 from .protocols import errors as protocol_errors
 from .protocols.runtime import (
     AttemptResult,
+    DEFAULT_TRANSIENT_RETRY_DELAYS_S,
+    MAX_CONFIGURED_TRANSIENT_RETRIES,
     apply_non_stream_response_translator,
+    bounded_account_quota_error,
+    configured_transient_retry_delays,
     failover_final_http_status,
     is_context_1m_credit_error,
     is_responses_ws_visible_event_type,
     json_error_for_ingress,
     make_stream_translator,
+    parse_retry_after_seconds,
     prepare_non_stream_response,
+    recovery_retry_allowed,
     is_context_length_exceeded_error,
     is_invalid_encrypted_content_error,
+    retryable_transient_error_kind,
     responses_ws_error_detail,
+    transient_retry_allowed,
+    transient_retry_config,
+    transient_retry_limit,
     request_invalid_result_if_needed,
     retry_body_without_encrypted_content,
     retry_body_without_context_1m,
@@ -111,6 +123,7 @@ from .transports import policy as transport_policy
 _CODEX_SNAPSHOT_WRITE_INTERVAL_S = 30.0
 _codex_snapshot_last: dict[str, float] = {}
 _codex_snapshot_lock = threading.Lock()
+_codex_snapshot_inflight: set[str] = set()
 
 
 def _maybe_record_codex_snapshot(ch: Channel, resp: Any) -> None:
@@ -122,21 +135,39 @@ def _maybe_record_codex_snapshot(ch: Channel, resp: Any) -> None:
             return
         account_key = getattr(ch, "account_key", None) or ch.email
         email = ch.email
+
+        # Auto-disable is based on this response, not on whether the auxiliary
+        # SQLite snapshot can be persisted. A BUSY/FULL/READONLY cache must
+        # never leave an explicitly over-limit account enabled.
+        _maybe_auto_disable_by_codex_snapshot(account_key, email, snap)
+
         # throttle bucket 用 account_key 作 key；OpenAI 同一邮箱可能有多个
-        # workspace，不能按 email 合并。
+        # workspace，不能按 email 合并。只在成功写入后推进 last；inflight
+        # 防止多个并发响应同时穿透，但写失败会立刻允许下一次重试。
         now = time.time()
         with _codex_snapshot_lock:
             last = _codex_snapshot_last.get(account_key, 0.0)
-            if now - last < _CODEX_SNAPSHOT_WRITE_INTERVAL_S:
+            if (
+                now - last < _CODEX_SNAPSHOT_WRITE_INTERVAL_S
+                or account_key in _codex_snapshot_inflight
+            ):
                 return
-            _codex_snapshot_last[account_key] = now
-        normalized = openai_provider.normalize_codex_snapshot(snap)
-        state_db.quota_save_openai_snapshot(account_key, snap, normalized, email=email)
-
-        # 🚨 响应头超限自动禁用（2026-04-20 新增）
-        # Codex 无 surpassed-threshold，但有 primary/secondary used percent；
-        # 判断任一 ≥ disableThresholdPercent 则触发（与 quota_monitor_once 语义一致）
-        _maybe_auto_disable_by_codex_snapshot(account_key, email, snap)
+            _codex_snapshot_inflight.add(account_key)
+        try:
+            normalized = openai_provider.normalize_codex_snapshot(snap)
+            state_db.quota_save_openai_snapshot(
+                account_key, snap, normalized, email=email,
+            )
+        except BaseException:
+            # Do not advance the throttle bucket: a following response should
+            # retry the cache write instead of waiting 30 seconds.
+            raise
+        else:
+            with _codex_snapshot_lock:
+                _codex_snapshot_last[account_key] = time.time()
+        finally:
+            with _codex_snapshot_lock:
+                _codex_snapshot_inflight.discard(account_key)
     except Exception as exc:
         print(f"[failover] codex snapshot record failed for {getattr(ch, 'email', '?')}: {exc}")
 
@@ -154,6 +185,7 @@ def _maybe_record_codex_snapshot(ch: Channel, resp: Any) -> None:
 _ANTHROPIC_SNAPSHOT_WRITE_INTERVAL_S = 30.0
 _anthropic_snapshot_last: dict[str, float] = {}
 _anthropic_snapshot_lock = threading.Lock()
+_anthropic_snapshot_inflight: set[str] = set()
 
 
 def _maybe_record_anthropic_snapshot(ch: Channel, resp: httpx.Response) -> None:
@@ -169,21 +201,32 @@ def _maybe_record_anthropic_snapshot(ch: Channel, resp: httpx.Response) -> None:
             return
         account_key = getattr(ch, "account_key", None) or ch.email
         email = ch.email
-        now = time.time()
-        with _anthropic_snapshot_lock:
-            last = _anthropic_snapshot_last.get(account_key, 0.0)
-            if now - last < _ANTHROPIC_SNAPSHOT_WRITE_INTERVAL_S:
-                return
-            _anthropic_snapshot_last[account_key] = now
-        state_db.quota_patch_passive(account_key, patch, email=email)
 
-        # 🚨 响应头超限自动禁用（2026-04-20 新增）
-        # 5h/7d 任一超限且账号当前未被禁用 → 立即置为 quota disabled
-        # 这比 quota_monitor_loop 的轮询快得多（下一次请求前就禁用，不用等 30min）
+        # Keep realtime disable independent from the best-effort quota cache.
         _maybe_auto_disable_by_headers(
             account_key, ch.email, dict(resp.headers),
             provider="claude",
         )
+
+        now = time.time()
+        with _anthropic_snapshot_lock:
+            last = _anthropic_snapshot_last.get(account_key, 0.0)
+            if (
+                now - last < _ANTHROPIC_SNAPSHOT_WRITE_INTERVAL_S
+                or account_key in _anthropic_snapshot_inflight
+            ):
+                return
+            _anthropic_snapshot_inflight.add(account_key)
+        try:
+            state_db.quota_patch_passive(account_key, patch, email=email)
+        except BaseException:
+            raise
+        else:
+            with _anthropic_snapshot_lock:
+                _anthropic_snapshot_last[account_key] = time.time()
+        finally:
+            with _anthropic_snapshot_lock:
+                _anthropic_snapshot_inflight.discard(account_key)
     except Exception as exc:
         print(f"[failover] anthropic snapshot record failed for "
               f"{getattr(ch, 'email', '?')}: {exc}")
@@ -202,6 +245,8 @@ def forget_anthropic_snapshot(account_key_or_email: str) -> None:
     with _anthropic_snapshot_lock:
         _anthropic_snapshot_last.pop(email, None)
         _anthropic_snapshot_last.pop(key, None)
+        _anthropic_snapshot_inflight.discard(email)
+        _anthropic_snapshot_inflight.discard(key)
 
 
 # ─── 响应头超限自动禁用（2026-04-20 新增） ───────────────────────
@@ -368,6 +413,8 @@ def forget_codex_snapshot(account_key_or_email: str) -> None:
     with _codex_snapshot_lock:
         _codex_snapshot_last.pop(email, None)
         _codex_snapshot_last.pop(key, None)
+        _codex_snapshot_inflight.discard(email)
+        _codex_snapshot_inflight.discard(key)
 
 
 def _toolkit_for(ch: Channel) -> dict:
@@ -393,6 +440,7 @@ def _write_affinity_non_stream(
     channel_key: str,
     resolved_model: str,
     client_key: Optional[str] = None,
+    fp_query: Optional[str] = None,
 ) -> None:
     """成功完成非流式请求后按 ingress 走对应家族的 fingerprint_write。"""
     fp_write: Optional[str] = None
@@ -413,10 +461,19 @@ def _write_affinity_non_stream(
         fp_write = fingerprint.fingerprint_write_responses(
             api_key_name or "", client_ip or "", cur_input, ds_output,
         )
+    prompt_cache_key = _openai_prompt_cache_key_from_body(ingress_protocol, body)
+    # Stable session fp_query must follow the channel that actually succeeded.
+    # This is also safe for legacy transcript fp_query and closes the stale-owner
+    # window during failover; fp_write remains the forward transcript bridge.
+    if fp_query:
+        affinity.upsert(
+            fp_query, channel_key, resolved_model,
+            prompt_cache_key=prompt_cache_key,
+        )
     if fp_write:
         affinity.upsert(
             fp_write, channel_key, resolved_model,
-            prompt_cache_key=_openai_prompt_cache_key_from_body(ingress_protocol, body),
+            prompt_cache_key=prompt_cache_key,
         )
     # 同步更新 client-level soft affinity
     if client_key:
@@ -469,10 +526,10 @@ def _maybe_save_native_responses_store(
             output_items=output_items,
         )
     except Exception as exc:
-        traceback.print_exc()
+        should_log = True
         try:
             ek = notifier.escape_html
-            notifier.throttled_notify_event_sync(
+            should_log = notifier.throttled_notify_event_sync(
                 "openai_store_save_failed",
                 f"openai_store_save_failed:{api_key_name}",
                 f"❌ {notifier.provider_custom_emoji_html('openai')} <b>OpenAI Store 写入失败</b>（native Responses）\n"
@@ -484,6 +541,8 @@ def _maybe_save_native_responses_store(
             )
         except Exception:
             pass
+        if should_log:
+            traceback.print_exc()
 
 
 def _make_stream_translator(translator_ctx: Optional[dict]):
@@ -511,8 +570,11 @@ def _json_error_for_ingress(
     message: str,
     *,
     code: Optional[str] = None,
+    details: Optional[dict] = None,
 ):
-    return json_error_for_ingress(ingress, status, anth_err_type, message, code=code)
+    return json_error_for_ingress(
+        ingress, status, anth_err_type, message, code=code, details=details,
+    )
 
 
 def _should_cooldown(outcome: str) -> bool:
@@ -573,12 +635,34 @@ def _retry_body_without_encrypted_content(body: dict) -> tuple[dict, int]:
     return retry_body_without_encrypted_content(body)
 
 
+def _attempt_body_for_channel(
+    body: dict,
+    channel_key: str,
+    bound_channel_key: Optional[str],
+    portable_body: Optional[dict] = None,
+) -> dict:
+    """Return the body safe for one candidate without mutating request state."""
+    if channel_key == bound_channel_key:
+        return body
+    if portable_body is not None:
+        return portable_body
+    if bound_channel_key:
+        stripped, _ = _retry_body_without_encrypted_content(body)
+        return stripped
+    return body
+
+
 def _is_context_1m_credit_error(result: AttemptResult, resolved_model: str, body: dict) -> bool:
     return is_context_1m_credit_error(result, resolved_model, body)
 
 
 def _retry_body_without_context_1m(body: dict) -> dict:
     return retry_body_without_context_1m(body)
+
+
+def _channel_forces_context_1m(ch: Channel, resolved_model: str) -> bool:
+    check = getattr(ch, "forces_context_1m", None)
+    return bool(callable(check) and check(resolved_model))
 
 
 def _proxy_route_kwargs(ch: Channel, resolved_model: str) -> dict:
@@ -649,6 +733,271 @@ def _elapsed_ms(start_monotonic: float) -> int:
     return max(0, int((time.monotonic() - start_monotonic) * 1000))
 
 
+_EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+_BEARER_RE = re.compile(r"(?i)\bbearer\s+[^\s,;\"']+")
+_SECRET_RE = re.compile(r"(?i)\b(?:sk|sess|key)-[A-Za-z0-9_-]{8,}\b")
+_FIELD_SECRET_RE = re.compile(
+    r"(?i)\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization)"
+    r"\s*[:=]\s*[^\s,;]+"
+)
+
+
+def _sanitize_upstream_message(value: Any) -> str:
+    """Extract one readable, bounded message without nested JSON or credentials."""
+    text = str(value or "").strip()
+    text = re.sub(r"^HTTP\s+\d{3}\s*:\s*", "", text, flags=re.IGNORECASE)
+    code_message = text
+    for _ in range(2):
+        candidate = code_message.strip()
+        start = candidate.find("{")
+        if start < 0:
+            break
+        try:
+            obj = json.loads(candidate[start:])
+        except Exception:
+            break
+        if not isinstance(obj, dict):
+            break
+        error_obj = obj.get("error")
+        if isinstance(error_obj, dict):
+            next_value = (
+                error_obj.get("message") or error_obj.get("detail")
+                or obj.get("message") or obj.get("detail")
+            )
+        elif isinstance(error_obj, str):
+            next_value = error_obj
+        else:
+            next_value = obj.get("message") or obj.get("detail")
+        if next_value is None:
+            code_message = "Upstream returned an error"
+            break
+        code_message = str(next_value)
+    if code_message.lstrip().startswith(("{", "[")):
+        code_message = "Upstream returned an error"
+    code_message = _BEARER_RE.sub("Bearer [redacted]", code_message)
+    code_message = _FIELD_SECRET_RE.sub("credential=[redacted]", code_message)
+    code_message = _SECRET_RE.sub("[redacted credential]", code_message)
+    code_message = _EMAIL_RE.sub("[redacted account]", code_message)
+    code_message = re.sub(r"\s+", " ", code_message).strip()
+    return (code_message or "Unknown upstream error")[:500]
+
+
+def _structured_attempt_error(
+    result: AttemptResult,
+    ordinal: int,
+    channel: Optional[Channel] = None,
+) -> dict:
+    quota = bounded_account_quota_error(result)
+    status = int(result.http_status) if isinstance(result.http_status, int) else None
+    detail = str(result.error_detail or "")
+    code = str(result.error_code or "").strip() or None
+    if code is None:
+        start = detail.find("{")
+        if start >= 0:
+            try:
+                obj = json.loads(detail[start:])
+            except Exception:
+                obj = None
+            if isinstance(obj, dict):
+                error_obj = obj.get("error") if isinstance(obj.get("error"), dict) else obj
+                if isinstance(error_obj, dict):
+                    raw_code = error_obj.get("code") or error_obj.get("type") or obj.get("code")
+                    code = str(raw_code).strip() if raw_code is not None else None
+    if code and (
+        len(code) > 120
+        or _EMAIL_RE.search(code)
+        or _SECRET_RE.search(code)
+        or _FIELD_SECRET_RE.search(code)
+    ):
+        code = None
+    if quota is not None:
+        classification = "quota_exhausted"
+    elif result.outcome in ("request_invalid", "guard_error", "candidate_guard"):
+        classification = "invalid_request"
+    elif status == 401:
+        classification = "authentication_error"
+    elif status == 403:
+        classification = "permission_error"
+    elif status == 429:
+        classification = "rate_limit_error"
+    elif status is not None and status >= 500:
+        classification = "upstream_server_error"
+    elif status is not None:
+        classification = "upstream_http_error"
+    elif "timeout" in str(result.outcome or ""):
+        classification = "timeout"
+    elif result.outcome in ("connect_error", "transport_error", "proxy_connect_error"):
+        classification = "transport_error"
+    else:
+        classification = str(result.outcome or "upstream_error")
+
+    transient_kind = retryable_transient_error_kind(channel, result) if channel is not None else None
+    if quota is not None:
+        retryable, retry_scope = True, "next_candidate"
+    elif transient_kind:
+        retryable, retry_scope = True, "same_candidate"
+    elif classification == "invalid_request":
+        retryable, retry_scope = False, "none"
+    else:
+        retryable, retry_scope = True, "next_candidate"
+    return {
+        "attempt": int(ordinal),
+        "status": status,
+        "classification": classification,
+        "code": code,
+        "message": _sanitize_upstream_message(
+            quota.get("message") if quota is not None else detail
+        ),
+        "retryable": retryable,
+        "retry_scope": retry_scope,
+    }
+
+
+def _structured_failure_details(attempts: list[dict]) -> dict:
+    safe_attempts = [dict(item) for item in attempts]
+    if not safe_attempts:
+        safe_attempts = [{
+            "attempt": 0,
+            "status": None,
+            "classification": "no_candidates",
+            "code": None,
+            "message": "No upstream candidate produced a response",
+            "retryable": False,
+            "retry_scope": "none",
+        }]
+    priority = {
+        "invalid_request": 100,
+        "quota_exhausted": 95,
+        "authentication_error": 90,
+        "permission_error": 85,
+        "rate_limit_error": 80,
+        "upstream_http_error": 75,
+        "upstream_server_error": 70,
+        "timeout": 60,
+        "transport_error": 50,
+    }
+    root_attempt = max(
+        safe_attempts,
+        key=lambda item: priority.get(str(item.get("classification") or ""), 40),
+    )
+    root_cause = {
+        key: root_attempt.get(key)
+        for key in ("status", "classification", "code", "message")
+    }
+    # Attempt entries describe Parrot's internal candidate progression.  The
+    # terminal root cause instead tells the downstream whether replaying the
+    # whole Parrot request is useful after every candidate has been exhausted.
+    if root_cause.get("classification") == "quota_exhausted":
+        root_cause.update(retryable=False, retry_scope="none")
+    elif bool(root_attempt.get("retryable")):
+        root_cause.update(retryable=True, retry_scope="request")
+    else:
+        root_cause.update(retryable=False, retry_scope="none")
+    status_text = f" {root_cause['status']}" if root_cause.get("status") is not None else ""
+    summary = (
+        f"Upstream{status_text} {root_cause['classification']}: "
+        f"{root_cause['message']}"
+    )
+    if len(safe_attempts) > 1:
+        summary += f" ({len(safe_attempts)} upstream attempts failed)"
+    return {
+        "summary": summary[:700],
+        "root_cause": root_cause,
+        "attempts": safe_attempts,
+    }
+
+
+# Only explicit transient provider signals are retried on the same candidate.
+# The request-scoped budget prevents candidate count from multiplying retries.
+_DEFAULT_TRANSIENT_RETRY_DELAYS_S = DEFAULT_TRANSIENT_RETRY_DELAYS_S
+_MAX_CONFIGURED_TRANSIENT_RETRIES = MAX_CONFIGURED_TRANSIENT_RETRIES
+
+
+def _effective_retry_cfg(cfg: Optional[dict] = None) -> dict:
+    return cfg if isinstance(cfg, dict) else config.get()
+
+
+def _transient_retry_config(cfg: Optional[dict] = None) -> dict:
+    return transient_retry_config(_effective_retry_cfg(cfg))
+
+
+def _transient_retry_limit(cfg: Optional[dict] = None) -> int:
+    return transient_retry_limit(_effective_retry_cfg(cfg))
+
+
+def _transient_retry_allowed(kind: str | None, cfg: Optional[dict] = None) -> bool:
+    return transient_retry_allowed(kind, _effective_retry_cfg(cfg))
+
+
+def _recovery_retry_allowed(name: str, cfg: Optional[dict] = None) -> bool:
+    return recovery_retry_allowed(name, _effective_retry_cfg(cfg))
+
+
+def _configured_transient_retry_delays() -> tuple[float, ...]:
+    return configured_transient_retry_delays(config.get())
+
+
+def _overload_retry_delay_seconds(retry_ordinal: int) -> float:
+    """Compatibility-named delay hook, now shared by all transient retry kinds."""
+    delays = _configured_transient_retry_delays()
+    index = min(max(0, int(retry_ordinal)), len(delays) - 1)
+    return delays[index] + random.uniform(0.0, 0.25)
+
+
+async def _wait_for_overload_retry(
+    retry_ordinal: int,
+    deadline_ts: float,
+    *,
+    retry_after_seconds: float | None = None,
+) -> float | None:
+    """Wait Retry-After or configured jittered backoff within the request deadline."""
+    if retry_after_seconds is None:
+        delay = _overload_retry_delay_seconds(retry_ordinal)
+    else:
+        parsed = parse_retry_after_seconds(retry_after_seconds)
+        delay = (
+            _overload_retry_delay_seconds(retry_ordinal)
+            if parsed is None
+            else parsed
+        )
+    if deadline_ts > 0 and time.time() + delay >= deadline_ts:
+        return None
+    await asyncio.sleep(delay)
+    return delay
+
+
+def _notify_zhipu_quota_cooldown(ch: Channel, model: str, reset_ms: int) -> None:
+    """Best-effort TG notice with a direct link to an API channel's detail page."""
+    channel_name = str(getattr(ch, "display_name", None) or getattr(ch, "key", "?"))
+    reset_text = quota_errors.format_bjt_ms(reset_ms)
+    ek = notifier.escape_html
+    reply_markup = None
+    if getattr(ch, "type", "") == "api":
+        try:
+            from .telegram import ui as telegram_ui
+            short = telegram_ui.register_code(channel_name)
+            reply_markup = telegram_ui.inline_kb([
+                [telegram_ui.btn("🔀 查看渠道详情", f"ch:view:{short}:1")],
+            ])
+        except Exception:
+            reply_markup = None
+    notifier.throttled_notify_event_sync(
+        "quota_cooldown",
+        f"quota_cooldown:{getattr(ch, 'key', channel_name)}:{model}:{reset_ms}",
+        "🟠 <b>渠道模型进入配额冷却</b>\n"
+        f"渠道: <code>{ek(channel_name)}</code>\n"
+        f"模型: <code>{ek(model)}</code>\n"
+        "原因: <b>周/月使用额度已达上限</b>（上游 <code>1310</code>）\n"
+        f"自动恢复: <code>{ek(reset_text)}</code>（北京时间）\n\n"
+        "<b>调度影响</b>\n"
+        f"恢复前仅跳过 <code>{ek(channel_name)} / {ek(model)}</code>；"
+        "同模型的其他渠道仍可继续承接请求。\n\n"
+        "<i>这不是手动禁用，也不是永久冻结。到达上游给出的重置时间后自动恢复调度。</i>",
+        cooldown_seconds=86_400,
+        reply_markup=reply_markup,
+    )
+
+
 def _err_type_from_outcome(outcome: str, http_status: Optional[int]) -> str:
     return protocol_errors.classify_attempt_outcome(outcome, http_status).anthropic_error_type
 
@@ -656,6 +1005,22 @@ def _err_type_from_outcome(outcome: str, http_status: Optional[int]) -> str:
 def _pick_upstream_headers(resp: httpx.Response) -> dict:
     """转发部分上游 headers 到下游（限定范围）。"""
     return metadata_from_response(resp).forward_headers()
+
+
+def _attach_retry_after_from_response(
+    result: AttemptResult,
+    response: httpx.Response | None,
+) -> AttemptResult:
+    if result.retry_after_seconds is not None or response is None:
+        return result
+    try:
+        raw = response.headers.get("Retry-After")
+    except Exception:
+        raw = None
+    parsed = parse_retry_after_seconds(raw)
+    if parsed is not None:
+        result.retry_after_seconds = parsed
+    return result
 
 
 def _response_body_text(response: Response) -> str | None:
@@ -773,32 +1138,59 @@ async def _run_compact_direct_rescue_with_compression_model(
     if not compression_model:
         return None, "no compression model configured"
 
-    direct_body = compact_rescue.build_direct_summary_body(
-        body,
-        model=compression_model,
-        max_tokens=model_metadata.summary_reserve_tokens(compression_model),
-    )
-
-    prompt_tokens = token_counter.count_request_tokens(direct_body, model=compression_model)
-    if not model_metadata.can_fit_for_compact(compression_model, prompt_tokens):
-        required = model_metadata.required_context_for_compact(prompt_tokens, compression_model)
-        window = model_metadata.context_window(compression_model)
-        return (
-            None,
-            f"compression model {compression_model} context not enough: "
-            f"required={required} window={window}",
-        )
-
     from . import scheduler as scheduler_mod
 
+    probe_body, _ = compact_rescue.sanitized_compact_base(body)
+    probe_body.update({
+        "model": compression_model,
+        "stream": False,
+        "_client_visible_model": compression_model,
+    })
     route = scheduler_mod.schedule(
-        direct_body,
+        probe_body,
         api_key_name=api_key_name or "",
         client_ip=client_ip,
         ingress_protocol=ingress_protocol,
     )
     if not route:
         return None, f"compression model {compression_model} has no available route"
+    first_routes = list(route.candidates) + list(route.saturated)
+    metadata_channel, metadata_outbound = first_routes[0]
+    scope_key = str(metadata_channel.key)
+    reserve = model_metadata.summary_reserve_tokens(
+        compression_model, scope_key=scope_key, outbound_model=metadata_outbound,
+    )
+    direct_body = compact_rescue.build_direct_summary_body(
+        body,
+        model=compression_model,
+        max_tokens=reserve,
+    )
+    direct_body["_client_visible_model"] = compression_model
+
+    prompt_tokens = token_counter.count_request_tokens(direct_body, model=compression_model)
+    if not model_metadata.can_fit_for_compact(
+        compression_model, prompt_tokens,
+        scope_key=scope_key, outbound_model=metadata_outbound,
+    ):
+        required = model_metadata.required_context_for_compact(
+            prompt_tokens, compression_model,
+            scope_key=scope_key, outbound_model=metadata_outbound,
+        )
+        window = model_metadata.context_window(
+            compression_model, scope_key=scope_key, outbound_model=metadata_outbound,
+        )
+        trigger = model_metadata.compact_trigger_tokens(
+            compression_model, scope_key=scope_key, outbound_model=metadata_outbound,
+        )
+        safe_limit = model_metadata.safe_prompt_limit(
+            compression_model, scope_key=scope_key, outbound_model=metadata_outbound,
+        )
+        return (
+            None,
+            f"compression model {compression_model} prompt exceeds compact limit: "
+            f"prompt={prompt_tokens} limit={safe_limit} trigger={trigger} "
+            f"required={required} window={window}",
+        )
 
     print(
         f"[compact-rescue] direct compression request={request_id} "
@@ -850,6 +1242,7 @@ def _schedule_compact_compression_model_for_map_reduce(
     probe_body, _meta = compact_rescue.sanitized_compact_base(body)
     probe_body["stream"] = False
     probe_body["model"] = compression_model
+    probe_body["_client_visible_model"] = compression_model
     probe_body["max_tokens"] = compact_rescue.reduce_max_tokens()
     probe_body.pop("max_output_tokens", None)
     route = scheduler_mod.schedule(
@@ -860,6 +1253,19 @@ def _schedule_compact_compression_model_for_map_reduce(
     )
     if not route:
         return compression_model, None, f"compression model {compression_model} has no available route"
+    first_routes = list(route.candidates) + list(route.saturated)
+    metadata_channel, metadata_outbound = first_routes[0]
+    binding = model_metadata.resolve_binding(
+        compression_model,
+        scope_key=str(metadata_channel.key),
+        outbound_model=str(metadata_outbound),
+    )
+    if binding is None:
+        return (
+            compression_model,
+            None,
+            f"compression model {compression_model} has no effective metadata binding",
+        )
     return compression_model, route, None
 
 
@@ -914,9 +1320,26 @@ async def _run_compact_map_reduce_rescue(
         print(f"[compact-rescue] map-reduce compression model skipped request={request_id}: {map_reduce_skip_reason}")
     active_schedule_result = map_reduce_route or schedule_result
     active_model = map_reduce_model if map_reduce_route is not None else str(body.get("model") or "")
+    active_routes = list(active_schedule_result.candidates) + list(active_schedule_result.saturated)
+    active_channel, active_outbound = active_routes[0] if active_routes else (None, None)
+    active_scope = str(getattr(active_channel, "key", "") or "")
+    bound_output_limit = model_metadata.max_output_tokens(
+        active_model,
+        scope_key=active_scope,
+        outbound_model=str(active_outbound or ""),
+    )
+    bound_prompt_limit = model_metadata.safe_prompt_limit(
+        active_model,
+        scope_key=active_scope,
+        outbound_model=str(active_outbound or ""),
+    )
+    segment_target = compact_rescue.chunk_target_tokens()
+    if map_reduce_route is not None and bound_prompt_limit is not None:
+        segment_target = max(1, min(segment_target, bound_prompt_limit))
 
     chunks = compact_rescue.split_messages_for_compact(
         messages,
+        target_tokens=segment_target,
         model=active_model,
     )
     print(
@@ -935,6 +1358,12 @@ async def _run_compact_map_reduce_rescue(
             )
             if map_reduce_route is not None and map_reduce_model:
                 chunk_body["model"] = map_reduce_model
+            chunk_body["_client_visible_model"] = active_model
+            if bound_output_limit is not None:
+                chunk_body["max_tokens"] = min(
+                    int(chunk_body.get("max_tokens") or bound_output_limit),
+                    bound_output_limit,
+                )
             sub_id = f"{request_id}:compact:{idx}"
             response = await run_failover(
                 active_schedule_result,
@@ -985,6 +1414,12 @@ async def _run_compact_map_reduce_rescue(
         reduce_body = compact_rescue.build_reduce_summary_body(body, summaries)
         if map_reduce_route is not None and map_reduce_model:
             reduce_body["model"] = map_reduce_model
+        reduce_body["_client_visible_model"] = active_model
+        if bound_output_limit is not None:
+            reduce_body["max_tokens"] = min(
+                int(reduce_body.get("max_tokens") or bound_output_limit),
+                bound_output_limit,
+            )
         final_response = await run_failover(
             active_schedule_result,
             reduce_body,
@@ -1057,9 +1492,21 @@ async def run_failover(
         # Legacy callers start outer elapsed at entry; wall time never enters durations.
         start_monotonic = time.monotonic()
     candidates = list(schedule_result.candidates)
+    client_visible_model = str(
+        body.get("_client_visible_model") or body.get("model") or ""
+    ).strip()
     affinity_hit = 1 if schedule_result.affinity_hit else 0
     fp_query = schedule_result.fp_query
     client_key = getattr(schedule_result, "client_key", None)
+    bound_channel_key = getattr(schedule_result, "bound_channel_key", None)
+    encrypted_content_count = int(
+        getattr(schedule_result, "encrypted_content_count", 0) or 0
+    )
+    portable_body: Optional[dict] = None
+    if encrypted_content_count > 0:
+        stripped_body, removed_ec = _retry_body_without_encrypted_content(body)
+        if removed_ec > 0:
+            portable_body = stripped_body
 
     cfg = config.get()
     timeouts = cfg.get("timeouts") or {}
@@ -1153,10 +1600,15 @@ async def run_failover(
     local_web_limit_reported = False
 
     retry_count = 0
+    # Shared across the whole request: changing candidates must not replenish
+    # the configured same-candidate transient retry budget.
+    transient_retry_limit = _transient_retry_limit(cfg)
+    transient_retries_used = 0
     refreshed_once: set[str] = set()
     retried_without_context_1m: set[tuple[str, str]] = set()
     retried_without_encrypted_content = False
     last_result: Optional[AttemptResult] = None
+    structured_attempts: list[dict] = []
     # 跟踪真实最后尝试的渠道（不同于"候选列表最后一条"，因为 OAuth 重刷会重试同 ch）
     last_ch_key: Optional[str] = None
     last_ch_type: Optional[str] = None
@@ -1192,6 +1644,8 @@ async def run_failover(
         attempt_id = log_db.record_retry_attempt(
             request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
             proxy_name=_attempt_proxy,
+            upstream_protocol=getattr(ch, "protocol", "anthropic"),
+            client_visible_model=client_visible_model,
         )
         if _attempt_proxy:
             log_db.update_pending(request_id, proxy_name=_attempt_proxy)
@@ -1208,9 +1662,11 @@ async def run_failover(
             candidate_local_web_loop = local_web_loop_active and getattr(ch, "protocol", "anthropic") != "anthropic"
             candidate_openai_local_web_loop = openai_local_web_loop_active
             effective_is_stream = is_stream and not (candidate_local_web_loop or candidate_openai_local_web_loop)
-            attempt_body = body
-            if (candidate_local_web_loop or candidate_openai_local_web_loop) and body.get("stream"):
-                attempt_body = dict(body)
+            attempt_body = _attempt_body_for_channel(
+                body, ch.key, bound_channel_key, portable_body,
+            )
+            if (candidate_local_web_loop or candidate_openai_local_web_loop) and attempt_body.get("stream"):
+                attempt_body = dict(attempt_body)
                 attempt_body["stream"] = False
             if _should_use_responses_upstream_ws(ch, ingress_protocol=ingress_protocol, cfg=cfg):
                 result = await _try_openai_oauth_responses_ws_channel(
@@ -1237,6 +1693,11 @@ async def run_failover(
             raise
         result = _request_invalid_result_if_needed(result)
         last_result = result
+        quota_exhaustion = bounded_account_quota_error(result)
+        if not result.success and not result.stream_started:
+            structured_attempts.append(
+                _structured_attempt_error(result, attempt_order, ch),
+            )
         if _attempt_proxy and not result.proxy_name:
             result.proxy_name = _attempt_proxy
 
@@ -1259,6 +1720,9 @@ async def run_failover(
             proxy_name=result.proxy_name,
             bytes_up=int(getattr(result, "proxy_bytes_up", 0) or 0),
             bytes_down=int(getattr(result, "proxy_bytes_down", 0) or 0),
+            response_body=getattr(result, "full_response_text", None),
+            usage=getattr(result, "usage", None),
+            usage_observed=getattr(result, "usage_observed", None),
         )
 
         if result.success and candidate_local_web_loop:
@@ -1271,6 +1735,10 @@ async def run_failover(
             )
             tool_use_total = local_web_tools.tool_use_count(assistant_msg)
             if local_calls and len(local_calls) == tool_use_total:
+                # finish_success() has recorded this real upstream call and
+                # released the terminal handle. The tool loop proves another
+                # round is needed, so keep subsequent rows in the same month.
+                log_db.retain_request_handle(request_id, attempt_id)
                 max_rounds = local_web_tools.max_tool_rounds()
                 if local_web_rounds >= max_rounds:
                     if local_web_limit_reported:
@@ -1344,6 +1812,7 @@ async def run_failover(
             )
             tool_use_total = local_web_tools.tool_use_count(assistant_msg)
             if local_calls and len(local_calls) == tool_use_total:
+                log_db.retain_request_handle(request_id, attempt_id)
                 max_rounds = local_web_tools.max_tool_rounds()
                 if local_web_rounds >= max_rounds:
                     if local_web_limit_reported:
@@ -1402,6 +1871,14 @@ async def run_failover(
                 continue
 
         if result.success or result.stream_started:
+            # Non-stream success is also rebound at the orchestration boundary so
+            # every successful candidate (including specialized transports) moves
+            # the stable session owner.  Streaming success rebinds on completion.
+            if result.success and not result.stream_started and fp_query:
+                affinity.upsert(
+                    fp_query, ch.key, resolved_model,
+                    prompt_cache_key=_openai_prompt_cache_key_from_body(ingress_protocol, body),
+                )
             # 成功已完成；或已发首包但出错（已用 SSE error 收尾）
             # 注意：scorer / cooldown / affinity / log_db 在 _try_channel 内完成
             # 并发 slot release 挂到响应体 finally：stream 消费完 / 客户端断开都会释放
@@ -1437,7 +1914,8 @@ async def run_failover(
         if result.outcome == "request_invalid":
             msg = result.error_detail or "invalid request"
             if (
-                _is_invalid_encrypted_content_error(msg)
+                _recovery_retry_allowed("invalidEncryptedContent", cfg)
+                and _is_invalid_encrypted_content_error(msg)
                 and not retried_without_encrypted_content
             ):
                 cleared_replay = _maybe_clear_codex_reasoning_replay(result.translator_ctx)
@@ -1461,6 +1939,8 @@ async def run_failover(
                 final_round_id=result.round_id, request_elapsed_ms=request_elapsed_ms,
                 http_status=status, affinity_hit=affinity_hit,
                 response_body=result.full_response_text,
+                usage=result.usage,
+                usage_observed=result.usage_observed,
                 upstream_protocol=getattr(ch, "protocol", "anthropic"),
                 **_request_stage_kwargs(result),
             )
@@ -1481,8 +1961,10 @@ async def run_failover(
 
         # 未发首包失败：判断是否 OAuth 401/403 可刷一次
         if (
-            ch.type == "oauth"
+            _recovery_retry_allowed("oauthRefresh", cfg)
+            and ch.type == "oauth"
             and result.http_status in (401, 403)
+            and quota_exhaustion is None
             and ch.key not in refreshed_once
         ):
             refreshed_once.add(ch.key)
@@ -1513,11 +1995,13 @@ async def run_failover(
                     pass
                 # fallthrough 到普通失败处理
 
-        # Sonnet 1M entitlement 不足不是渠道故障：同渠道去掉 context-1m 重试一次，
-        # 避免显式 1M 下游持续请求时把健康渠道打进 cooldown/禁用。
+        # 自动透传的 1M entitlement 不足不是渠道故障：同渠道去掉 context-1m
+        # 重试一次；渠道明确强制 1M 时不能反向撤销该兼容策略。
         context_retry_key = (ch.key, resolved_model)
         if (
-            _is_context_1m_credit_error(result, resolved_model, body)
+            _recovery_retry_allowed("claudeContext1mFallback", cfg)
+            and not _channel_forces_context_1m(ch, resolved_model)
+            and _is_context_1m_credit_error(result, resolved_model, body)
             and context_retry_key not in retried_without_context_1m
         ):
             retried_without_context_1m.add(context_retry_key)
@@ -1525,6 +2009,62 @@ async def run_failover(
             print(f"[failover] context-1m rejected for {ch.key}/{resolved_model}; retrying same channel without context-1m")
             retry_count += 1
             continue
+
+        # Zhipu's explicit weekly/monthly quota signal is not a short rate limit.
+        # Park only this channel/model until the validated upstream reset time,
+        # then continue the normal candidate failover without disabling the channel.
+        quota_reset_ms = quota_errors.zhipu_1310_reset_ms(
+            ch,
+            http_status=result.http_status,
+            error_detail=result.error_detail,
+        )
+        if quota_reset_ms is not None:
+            plan = finalize_policy.error_plan(result.outcome, failure_policy="runtime")
+            if plan.record_cooldown_error:
+                cooldown.record_error(
+                    ch.key,
+                    resolved_model,
+                    result.error_detail,
+                    cooldown_until=quota_reset_ms,
+                )
+            if plan.record_failure:
+                scorer.record_failure(
+                    ch.key,
+                    resolved_model,
+                    connect_ms=_scorer_connect_ms(result),
+                )
+            try:
+                _notify_zhipu_quota_cooldown(ch, resolved_model, quota_reset_ms)
+            except Exception as exc:
+                print(f"[failover] quota cooldown notification failed for {ch.key}: {exc}")
+            retry_count += 1
+            idx += 1
+            continue
+
+        # OpenAI server_is_overloaded/server_error, Claude overloaded_error/529,
+        # and direct xAI 503 are explicit transient signals.  The slot is already
+        # released, so backoff does not occupy channel concurrency.  Intermediate
+        # retries do not score/cool down; the terminal failure below does so once.
+        transient_kind = retryable_transient_error_kind(ch, result)
+        if (
+            quota_exhaustion is None
+            and transient_retries_used < transient_retry_limit
+            and _transient_retry_allowed(transient_kind, cfg)
+        ):
+            delay = await _wait_for_overload_retry(
+                transient_retries_used,
+                deadline_ts,
+                retry_after_seconds=result.retry_after_seconds,
+            )
+            if delay is not None:
+                transient_retries_used += 1
+                retry_count += 1
+                print(
+                    f"[failover] transient {transient_kind} on {ch.key}/{resolved_model}; "
+                    f"retrying same channel ({transient_retries_used}/"
+                    f"{transient_retry_limit}) after {delay:.2f}s"
+                )
+                continue
 
         # 普通失败处理
         plan = finalize_policy.error_plan(result.outcome, failure_policy="runtime")
@@ -1575,6 +2115,8 @@ async def run_failover(
                 attempt_id = log_db.record_retry_attempt(
                     request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
                     proxy_name=_attempt_proxy2,
+                    upstream_protocol=getattr(ch, "protocol", "anthropic"),
+                    client_visible_model=client_visible_model,
                 )
                 release_done2 = False
                 def _release_q(_key=ch.key):
@@ -1587,9 +2129,11 @@ async def run_failover(
                     candidate_local_web_loop = local_web_loop_active and getattr(ch, "protocol", "anthropic") != "anthropic"
                     candidate_openai_local_web_loop = openai_local_web_loop_active
                     effective_is_stream = is_stream and not (candidate_local_web_loop or candidate_openai_local_web_loop)
-                    attempt_body = body
-                    if (candidate_local_web_loop or candidate_openai_local_web_loop) and body.get("stream"):
-                        attempt_body = dict(body)
+                    attempt_body = _attempt_body_for_channel(
+                        body, ch.key, bound_channel_key, portable_body,
+                    )
+                    if (candidate_local_web_loop or candidate_openai_local_web_loop) and attempt_body.get("stream"):
+                        attempt_body = dict(attempt_body)
                         attempt_body["stream"] = False
                     if _should_use_responses_upstream_ws(ch, ingress_protocol=ingress_protocol, cfg=cfg):
                         result = await _try_openai_oauth_responses_ws_channel(
@@ -1616,6 +2160,10 @@ async def run_failover(
                     raise
                 result = _request_invalid_result_if_needed(result)
                 last_result = result
+                if not result.success and not result.stream_started:
+                    structured_attempts.append(
+                        _structured_attempt_error(result, attempt_order, ch),
+                    )
                 if _attempt_proxy2 and not result.proxy_name:
                     result.proxy_name = _attempt_proxy2
                 log_db.update_retry_attempt(
@@ -1637,12 +2185,20 @@ async def run_failover(
                     proxy_name=result.proxy_name,
                     bytes_up=int(getattr(result, "proxy_bytes_up", 0) or 0),
                     bytes_down=int(getattr(result, "proxy_bytes_down", 0) or 0),
+                    response_body=getattr(result, "full_response_text", None),
+                    usage=getattr(result, "usage", None),
+                    usage_observed=getattr(result, "usage_observed", None),
                 )
                 if result.success and candidate_local_web_loop and downstream_stream_requested:
                     result.response = local_web_tools.maybe_wrap_anthropic_json_response_as_sse(result.response)
                 if result.success and candidate_openai_local_web_loop and downstream_stream_requested:
                     result.response = local_web_tools.maybe_wrap_responses_json_response_as_sse(result.response)
                 if result.success or result.stream_started:
+                    if result.success and not result.stream_started and fp_query:
+                        affinity.upsert(
+                            fp_query, ch.key, resolved_model,
+                            prompt_cache_key=_openai_prompt_cache_key_from_body(ingress_protocol, body),
+                        )
                     _attach_release_to_response(result.response, _release_q)
                     return result.response
                 _release_q()
@@ -1658,6 +2214,8 @@ async def run_failover(
                         final_round_id=result.round_id, request_elapsed_ms=request_elapsed_ms,
                         http_status=status, affinity_hit=affinity_hit,
                         response_body=result.full_response_text,
+                        usage=result.usage,
+                        usage_observed=result.usage_observed,
                         upstream_protocol=getattr(ch, "protocol", "anthropic"),
                         **_request_stage_kwargs(result),
                     )
@@ -1719,7 +2277,8 @@ async def run_failover(
     if last_result and last_result.outcome == "candidate_guard":
         status = int(last_result.http_status or 400)
         err_type = protocol_errors.legacy_anthropic_error_type_for_http_status(status)
-    msg = f"All upstream channels failed. Last error: {err_detail[:400]}"
+    failure_details = _structured_failure_details(structured_attempts)
+    msg = str(failure_details["summary"])
 
     request_elapsed_ms = _elapsed_ms(start_monotonic)
     await asyncio.to_thread(
@@ -1735,13 +2294,22 @@ async def run_failover(
         request_elapsed_ms=request_elapsed_ms,
         http_status=status, affinity_hit=affinity_hit,
         response_body=(last_result.full_response_text if last_result else None),
+        usage=(last_result.usage if last_result else None),
+        usage_observed=(last_result.usage_observed if last_result else None),
         upstream_protocol=last_ch_protocol,
         proxy_name=(last_result.proxy_name if last_result else None),
         proxy_bytes_up=(last_result.proxy_bytes_up if last_result else None),
         proxy_bytes_down=(last_result.proxy_bytes_down if last_result else None),
         **_request_stage_kwargs(last_result),
     )
-    return _json_error_for_ingress(ingress_protocol, status, err_type, msg)
+    return _json_error_for_ingress(
+        ingress_protocol,
+        status,
+        err_type,
+        msg,
+        code=failure_details["root_cause"].get("code"),
+        details=failure_details,
+    )
 
 
 # ─── 并发 slot release 辅助 ──────────────────────────────────────
@@ -2003,6 +2571,10 @@ class _WsResponsesTracker:
     def __init__(self, channel: OpenAIOAuthChannel | None = None) -> None:
         self.channel = channel
         self.usage = {"input_tokens": 0, "output_tokens": 0, "cache_creation": 0, "cache_read": 0}
+        self.usage_observed = False
+        self.actual_service_tier: Optional[str] = None
+        self.actual_cost_ticks: Optional[int] = None
+        self._billing_event_type: Optional[str] = None
         self.response_completed = False
         self.response_failed = False
         self.stream_error_message: Optional[str] = None
@@ -2029,6 +2601,30 @@ class _WsResponsesTracker:
             _maybe_record_codex_rate_limits_event(self.channel, evt)
             return
         self._frames.append(text)
+        response_obj = evt.get("response") if isinstance(evt.get("response"), dict) else None
+        usage_present = "usage" in evt or (
+            isinstance(response_obj, dict) and "usage" in response_obj
+        )
+        normalized = model_pricing.normalize_response_billing(evt)
+        if normalized.service_tier is not None:
+            self.actual_service_tier = normalized.service_tier
+        if normalized.actual_cost_ticks is not None:
+            self.actual_cost_ticks = normalized.actual_cost_ticks
+        if usage_present or normalized.service_tier is not None:
+            self._billing_event_type = typ or "response.in_progress"
+        if usage_present:
+            self.usage_observed = normalized.usage_observed
+            self.usage = {
+                "input_tokens": normalized.input_tokens,
+                "output_tokens": normalized.output_tokens,
+                "cache_creation": normalized.cache_creation_tokens,
+                "cache_read": normalized.cache_read_tokens,
+            } if self.usage_observed else {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation": 0,
+                "cache_read": 0,
+            }
         if typ == "error" or isinstance(evt.get("error"), dict):
             self.response_failed = True
             _status, self.stream_error_message = _ws_error_detail(text)
@@ -2051,12 +2647,9 @@ class _WsResponsesTracker:
             self.response_completed = True
 
         if typ in ("response.completed", "response.failed", "response.incomplete"):
-            resp = evt.get("response") if isinstance(evt.get("response"), dict) else None
+            resp = response_obj
             if isinstance(resp, dict):
                 self._response_obj = resp
-                usage = resp.get("usage")
-                if isinstance(usage, dict):
-                    self.usage = upstream.extract_usage_responses_json({"usage": usage})
                 if isinstance(resp.get("output"), list):
                     for idx, item in enumerate(resp.get("output") or []):
                         if isinstance(item, dict):
@@ -2110,7 +2703,7 @@ class _WsResponsesTracker:
         base.setdefault("object", "response")
         base.setdefault("status", "completed" if self.response_completed else "incomplete")
         base.setdefault("model", fallback_model)
-        if self.usage:
+        if self.usage_observed:
             base.setdefault("usage", {
                 "input_tokens": int(self.usage.get("input_tokens") or 0) + int(self.usage.get("cache_read") or 0),
                 "output_tokens": int(self.usage.get("output_tokens") or 0),
@@ -2119,7 +2712,39 @@ class _WsResponsesTracker:
         return base
 
     def get_full_response(self) -> str:
-        return "\n".join(self._frames)[-200000:]
+        return model_pricing.preserve_billing_evidence_tail(
+            "\n".join(self._frames),
+            usage=self.usage,
+            usage_observed=self.usage_observed,
+            service_tier=self.actual_service_tier,
+            actual_cost_ticks=self.actual_cost_ticks,
+            event_type=self._billing_event_type,
+        )
+
+
+def _hydrate_oauth_ws_attempt_result(
+    result: AttemptResult,
+    tracker: _WsResponsesTracker,
+    *,
+    identity_state: ConfuseState | None = None,
+    proxy_name: str | None = None,
+    proxy_bytes: _WsProxyBytes | None = None,
+    translator_ctx: dict | None = None,
+) -> AttemptResult:
+    """Copy observed WS facts before immutable attempt settlement."""
+
+    result.usage = dict(tracker.usage)
+    result.usage_observed = tracker.usage_observed
+    response_text = tracker.get_full_response()
+    if identity_state is not None:
+        response_text = identity_log_text(response_text, identity_state)
+    result.full_response_text = response_text or None
+    result.proxy_name = proxy_name
+    if proxy_bytes is not None:
+        result.proxy_bytes_up = proxy_bytes.up
+        result.proxy_bytes_down = proxy_bytes.down
+    result.translator_ctx = translator_ctx
+    return result
 
 
 def _safe_int(v: Any, default: int = 0) -> int:
@@ -2229,6 +2854,8 @@ async def _try_openai_oauth_responses_ws_channel(
 
         upstream_ws = None
         timing = WsAttemptTiming(route_type=route_type, round_id=round_id)
+        route_state = {"dispatched": False}
+        tracker = _WsResponsesTracker(ch)
         try:
             if connector is not None:
                 connector.stats.total_attempts += 1
@@ -2259,6 +2886,7 @@ async def _try_openai_oauth_responses_ws_channel(
             _maybe_record_codex_ws_snapshot(ch, getattr(upstream_ws, "response", None))
             result = await _consume_oauth_responses_ws(
                 upstream_ws,
+                tracker=tracker,
                 first_frame=first_frame,
                 ch=ch,
                 resolved_model=resolved_model,
@@ -2287,6 +2915,11 @@ async def _try_openai_oauth_responses_ws_channel(
                 proxy_attempt_id=proxy_attempt_id,
                 retry_attempt_id=retry_attempt_id,
                 attempt_start_monotonic=attempt_start_monotonic,
+                on_dispatch=lambda: route_state.__setitem__("dispatched", True),
+            )
+            result = _attach_retry_after_from_response(
+                result,
+                getattr(upstream_ws, "response", None),
             )
             if result.stream_started and isinstance(result.response, StreamingResponse):
                 # The post-commit generator owns WS + round terminalization.
@@ -2312,12 +2945,70 @@ async def _try_openai_oauth_responses_ws_channel(
                 error_detail="cancelled",
                 proxy_name=proxy_name,
             )
-            _finalize_ws_attempt_result(
+            _hydrate_oauth_ws_attempt_result(
+                cancelled,
+                tracker,
+                identity_state=identity_state,
+                proxy_name=proxy_name,
+                proxy_bytes=proxy_bytes,
+                translator_ctx=translator_ctx,
+            )
+            cancelled = _finalize_ws_attempt_result(
                 cancelled,
                 proxy_attempt_id=proxy_attempt_id,
                 timing=timing,
                 proxy_bytes=proxy_bytes,
             )
+            async def finish_cancelled_attempt() -> None:
+                if retry_attempt_id is not None:
+                    await asyncio.to_thread(
+                        log_db.update_retry_attempt,
+                        retry_attempt_id,
+                        final_round_id=cancelled.round_id,
+                        connect_ms=cancelled.connect_ms,
+                        first_byte_ms=cancelled.first_byte_ms,
+                        idle_ms=cancelled.idle_ms,
+                        total_ms=cancelled.total_ms,
+                        attempt_elapsed_ms=_elapsed_ms(attempt_start_monotonic),
+                        ended_at=time.time(),
+                        outcome="cancelled",
+                        error_detail="cancelled",
+                        proxy_name=proxy_name,
+                        bytes_up=proxy_bytes.up,
+                        bytes_down=proxy_bytes.down,
+                        response_body=cancelled.full_response_text,
+                        usage=cancelled.usage,
+                        usage_observed=cancelled.usage_observed,
+                        settle=False,
+                    )
+                await asyncio.to_thread(
+                    log_db.finish_error,
+                    request_id,
+                    "client disconnected",
+                    retry_count_so_far,
+                    final_channel_key=ch.key,
+                    final_channel_type=ch.type,
+                    final_model=resolved_model,
+                    connect_ms=cancelled.connect_ms,
+                    first_token_ms=cancelled.first_byte_ms,
+                    idle_ms=cancelled.idle_ms,
+                    total_ms=cancelled.total_ms,
+                    final_round_id=cancelled.round_id,
+                    request_elapsed_ms=_elapsed_ms(start_monotonic),
+                    http_status=499,
+                    response_body=cancelled.full_response_text,
+                    usage=cancelled.usage,
+                    usage_observed=cancelled.usage_observed,
+                    affinity_hit=affinity_hit,
+                    upstream_protocol="openai-responses",
+                    upstream_transport="ws",
+                    proxy_name=proxy_name,
+                    proxy_bytes_up=proxy_bytes.up,
+                    proxy_bytes_down=proxy_bytes.down,
+                    status="cancelled",
+                )
+
+            await await_ws_owned(finish_cancelled_attempt())
             raise
         except BusinessTimeoutError as exc:
             last_error = AttemptResult(
@@ -2332,6 +3023,7 @@ async def _try_openai_oauth_responses_ws_channel(
                 proxy_name=proxy_name,
             )
         except InvalidStatus as exc:
+            invalid_response = getattr(exc, "response", None)
             status, detail = _invalid_ws_status_detail(exc)
             last_error = AttemptResult(
                 outcome="http_auth_error" if status in (401, 403) else "http_error",
@@ -2339,6 +3031,7 @@ async def _try_openai_oauth_responses_ws_channel(
                 http_status=status,
                 proxy_name=proxy_name,
             )
+            last_error = _attach_retry_after_from_response(last_error, invalid_response)
         except Exception as exc:
             connected = timing.connection_complete
             last_error = AttemptResult(
@@ -2362,6 +3055,10 @@ async def _try_openai_oauth_responses_ws_channel(
         if connector is not None and last_error is not None:
             connector.stats.total_failures += 1
             connector.stats.last_error = (last_error.error_detail or last_error.outcome)[:200]
+        # Do not replay one logical retry row over another proxy route after a
+        # create frame may have reached the upstream.
+        if last_error is not None and route_state["dispatched"]:
+            return last_error
         continue
 
     return last_error or AttemptResult(outcome="proxy_connect_error", error_detail="proxy route has no usable target")
@@ -2370,6 +3067,7 @@ async def _try_openai_oauth_responses_ws_channel(
 async def _consume_oauth_responses_ws(
     upstream_ws,
     *,
+    tracker: _WsResponsesTracker,
     first_frame: str,
     ch: OpenAIOAuthChannel,
     resolved_model: str,
@@ -2398,9 +3096,16 @@ async def _consume_oauth_responses_ws(
     proxy_attempt_id,
     retry_attempt_id,
     attempt_start_monotonic: float,
+    on_dispatch,
 ) -> AttemptResult:
-    tracker = _WsResponsesTracker(ch)
     try:
+        log_db.update_pending_fast_mode_from_upstream(request_id, first_frame)
+        if retry_attempt_id is not None:
+            try:
+                log_db.mark_retry_attempt_dispatch(retry_attempt_id, first_frame)
+            except Exception:
+                pass
+        on_dispatch()
         proxy_bytes.count(up=_frame_size(first_frame))
         await wait_ws_round_io(
             upstream_ws.send(first_frame),
@@ -2537,6 +3242,7 @@ async def _recv_oauth_ws_until_visible(
     return step.pending, AttemptResult(
         outcome=step.outcome,
         error_detail=step.error_detail,
+        error_code=step.error_code,
         http_status=step.http_status,
         stream_started=step.stream_started,
     ), step.first_packet_ms
@@ -2599,32 +3305,35 @@ async def _consume_oauth_responses_ws_non_stream(
         timing=timing, round_timeouts=round_timeouts,
     )
     first_byte_ms = timing.snapshot().first_byte_ms
-    if pre_error is not None and not pre_error.stream_started:
-        pre_error.connect_ms = connect_ms
-        pre_error.first_byte_ms = first_byte_ms
-        pre_error.proxy_name = proxy_name
-        pre_error.proxy_bytes_up = proxy_bytes.up
-        pre_error.proxy_bytes_down = proxy_bytes.down
-        pre_error.translator_ctx = translator_ctx
-        return pre_error
 
-    # pre_error.stream_started 只会来自 response.failed：这是终态错误，不能再透明 failover。
-    if pre_error is not None:
-        _persist_ws_route_round(
-            proxy_attempt_id, timing, proxy_bytes,
-            outcome=pre_error.outcome,
-            error_detail=pre_error.error_detail,
-            terminal=True,
+    def hydrate(result: AttemptResult) -> AttemptResult:
+        result.connect_ms = connect_ms
+        result.first_byte_ms = first_byte_ms
+        return _hydrate_oauth_ws_attempt_result(
+            result,
+            tracker,
+            identity_state=identity_state,
+            proxy_name=proxy_name,
+            proxy_bytes=proxy_bytes,
+            translator_ctx=translator_ctx,
         )
-        await await_ws_owned(_finalize_oauth_ws_error(
-            pre_error, ch, resolved_model, request_id, retry_count_so_far,
-            affinity_hit, start_time, start_monotonic, connect_ms, first_byte_ms,
-            tracker, proxy_name, proxy_bytes, identity_state, timing,
-        ))
-        pre_error.proxy_name = proxy_name
-        pre_error.proxy_bytes_up = proxy_bytes.up
-        pre_error.proxy_bytes_down = proxy_bytes.down
-        return pre_error
+
+    async def finalize_terminal_error(result: AttemptResult) -> AttemptResult:
+        # No downstream bytes have been emitted for this HTTP non-stream call.
+        # ``stream_started`` from the shared pre-visible helper means the
+        # upstream terminal frame was protocol-visible, not that an HTTP body
+        # was committed. Return a normal failed attempt so outer failover owns
+        # channel selection, root finalization, and the month-bound handle.
+        result.stream_started = False
+        return hydrate(result)
+
+    if pre_error is not None and not pre_error.stream_started:
+        return hydrate(pre_error)
+
+    # ``response.failed`` may set the helper's stream flag, but this non-stream
+    # caller has not committed anything downstream and can still fail over.
+    if pre_error is not None:
+        return await finalize_terminal_error(pre_error)
 
     while not tracker.response_completed and not tracker.response_failed:
         step = await read_next_responses_ws_step(
@@ -2643,50 +3352,32 @@ async def _consume_oauth_responses_ws_non_stream(
             "connection_timeout", "first_byte_timeout", "idle_timeout",
             "total_timeout", "transport_timeout",
         ):
-            return AttemptResult(
+            return await finalize_terminal_error(AttemptResult(
                 outcome=step.outcome,
                 error_detail=step.error_detail,
-                connect_ms=connect_ms,
-                first_byte_ms=first_byte_ms,
-            )
+                http_status=504,
+            ))
         if step.outcome == "upstream_closed":
-            break
+            return await finalize_terminal_error(AttemptResult(
+                outcome="upstream_closed",
+                error_detail=step.error_detail or "upstream websocket closed",
+                http_status=502,
+            ))
         if step.outcome == "stream_upstream_error":
-            err = AttemptResult(outcome="stream_upstream_error", error_detail=step.error_detail or "upstream stream error", connect_ms=connect_ms, first_byte_ms=first_byte_ms, http_status=503)
-            _persist_ws_route_round(
-                proxy_attempt_id, timing, proxy_bytes,
-                outcome=err.outcome, error_detail=err.error_detail, terminal=True,
-            )
-            await await_ws_owned(_finalize_oauth_ws_error(
-                err, ch, resolved_model, request_id, retry_count_so_far,
-                affinity_hit, start_time, start_monotonic, connect_ms, first_byte_ms,
-                tracker, proxy_name, proxy_bytes, identity_state, timing,
+            return await finalize_terminal_error(AttemptResult(
+                outcome="stream_upstream_error",
+                error_detail=step.error_detail or "upstream stream error",
+                http_status=503,
             ))
-            err.proxy_name = proxy_name
-            err.proxy_bytes_up = proxy_bytes.up
-            err.proxy_bytes_down = proxy_bytes.down
-            return err
         if step.outcome == "request_invalid":
-            err = AttemptResult(
+            return await finalize_terminal_error(AttemptResult(
                 outcome="request_invalid",
-                error_detail=step.error_detail or protocol_errors.responses_max_output_context_error_message(),
-                connect_ms=connect_ms,
-                first_byte_ms=first_byte_ms,
+                error_detail=(
+                    step.error_detail
+                    or protocol_errors.responses_max_output_context_error_message()
+                ),
                 http_status=400,
-            )
-            _persist_ws_route_round(
-                proxy_attempt_id, timing, proxy_bytes,
-                outcome=err.outcome, error_detail=err.error_detail, terminal=True,
-            )
-            await await_ws_owned(_finalize_oauth_ws_error(
-                err, ch, resolved_model, request_id, retry_count_so_far,
-                affinity_hit, start_time, start_monotonic, connect_ms, first_byte_ms,
-                tracker, proxy_name, proxy_bytes, identity_state, timing,
             ))
-            err.proxy_name = proxy_name
-            err.proxy_bytes_up = proxy_bytes.up
-            err.proxy_bytes_down = proxy_bytes.down
-            return err
         if step.outcome == "success":
             break
         if step.skip_downstream:
@@ -2724,6 +3415,7 @@ async def _consume_oauth_responses_ws_non_stream(
         "responses", api_key_name, client_ip, messages,
         {"role": "assistant", "content": obj.get("output") or []},
         body, out_obj, ch.key, resolved_model, client_key=client_key,
+        fp_query=fp_query,
     )
     await await_ws_owned(asyncio.to_thread(
         log_db.finish_success, request_id, ch.key, ch.type, resolved_model,
@@ -2737,6 +3429,7 @@ async def _consume_oauth_responses_ws_non_stream(
         request_elapsed_ms=request_elapsed_ms,
         retry_count=retry_count_so_far, affinity_hit=affinity_hit,
         response_body=_identity_log_text(tracker.get_full_response(), identity_state), http_status=200,
+        usage_observed=tracker.usage_observed,
         upstream_protocol="openai-responses", upstream_transport="ws",
         proxy_name=proxy_name, proxy_bytes_up=proxy_bytes.up, proxy_bytes_down=proxy_bytes.down,
     ))
@@ -2749,7 +3442,9 @@ async def _consume_oauth_responses_ws_non_stream(
         first_byte_ms=timing_snapshot.first_byte_ms,
         idle_ms=timing_snapshot.idle_ms,
         total_ms=timing_snapshot.total_ms,
-        usage=usage, full_response_text=_identity_log_text(tracker.get_full_response(), identity_state),
+        usage=usage,
+        usage_observed=tracker.usage_observed,
+        full_response_text=_identity_log_text(tracker.get_full_response(), identity_state),
         proxy_name=proxy_name, proxy_bytes_up=proxy_bytes.up, proxy_bytes_down=proxy_bytes.down,
         translator_ctx=translator_ctx,
     )
@@ -2798,6 +3493,8 @@ async def _finalize_oauth_ws_error(
         request_elapsed_ms=request_elapsed_ms,
         http_status=_ws_http_status_from_outcome(result), affinity_hit=affinity_hit,
         response_body=_identity_log_text(tracker.get_full_response(), identity_state) or None,
+        usage=tracker.usage,
+        usage_observed=tracker.usage_observed,
         upstream_protocol="openai-responses", upstream_transport="ws",
         proxy_name=proxy_name, proxy_bytes_up=proxy_bytes.up, proxy_bytes_down=proxy_bytes.down,
     ))
@@ -2842,14 +3539,21 @@ async def _consume_oauth_responses_ws_stream(
         timing=timing, round_timeouts=round_timeouts,
     )
     first_byte_ms = timing.snapshot().first_byte_ms
+
+    def hydrate(result: AttemptResult) -> AttemptResult:
+        result.connect_ms = connect_ms
+        result.first_byte_ms = first_byte_ms
+        return _hydrate_oauth_ws_attempt_result(
+            result,
+            tracker,
+            identity_state=identity_state,
+            proxy_name=proxy_name,
+            proxy_bytes=proxy_bytes,
+            translator_ctx=translator_ctx,
+        )
+
     if pre_error is not None and not pre_error.stream_started:
-        pre_error.connect_ms = connect_ms
-        pre_error.first_byte_ms = first_byte_ms
-        pre_error.proxy_name = proxy_name
-        pre_error.proxy_bytes_up = proxy_bytes.up
-        pre_error.proxy_bytes_down = proxy_bytes.down
-        pre_error.translator_ctx = translator_ctx
-        return pre_error
+        return hydrate(pre_error)
 
     state = {"finalized": False}
 
@@ -2879,6 +3583,7 @@ async def _consume_oauth_responses_ws_stream(
                     proxy_name=proxy_name,
                     bytes_up=proxy_bytes.up,
                     bytes_down=proxy_bytes.down,
+                    settle=False,
                 )
             except Exception:
                 pass
@@ -2906,7 +3611,7 @@ async def _consume_oauth_responses_ws_stream(
             "responses", api_key_name, client_ip, messages,
             {"role": "assistant", "content": tracker.get_output_items()},
             body, tracker.to_full_json(fallback_model=resolved_model), ch.key, resolved_model,
-            client_key=client_key,
+            client_key=client_key, fp_query=fp_query,
         )
         # encrypted_content 透明透传：上游产出的 reasoning 只返回给下游，
         # Parrot 不做本地持久化或后续回填。
@@ -2923,6 +3628,7 @@ async def _consume_oauth_responses_ws_stream(
             request_elapsed_ms=request_elapsed_ms,
             retry_count=retry_count_so_far, affinity_hit=affinity_hit,
             response_body=_identity_log_text(tracker.get_full_response(), identity_state), http_status=200,
+            usage_observed=tracker.usage_observed,
             upstream_protocol="openai-responses", upstream_transport="ws",
             proxy_name=proxy_name, proxy_bytes_up=proxy_bytes.up, proxy_bytes_down=proxy_bytes.down,
         ))
@@ -2959,6 +3665,8 @@ async def _consume_oauth_responses_ws_stream(
             request_elapsed_ms=request_elapsed_ms,
             http_status=499, affinity_hit=affinity_hit,
             response_body=_identity_log_text(tracker.get_full_response(), identity_state) or None,
+            usage=tracker.usage,
+            usage_observed=tracker.usage_observed,
             upstream_protocol="openai-responses", upstream_transport="ws",
             proxy_name=proxy_name, proxy_bytes_up=proxy_bytes.up, proxy_bytes_down=proxy_bytes.down,
         )
@@ -3136,6 +3844,9 @@ async def _try_channel(
         upstream_req = await ch.build_upstream_request(
             body, resolved_model, ingress_protocol=ingress_protocol,
         )
+        log_db.update_pending_fast_mode_from_upstream(
+            request_id, upstream_req.body, upstream_req.headers,
+        )
     except Exception as exc:
         # GuardError（OpenAI 跨变体死角）带 .status / .err_type / .message 属性；
         # scope=request 表示请求级 guard，可短路到客户端 4xx；scope=candidate
@@ -3156,23 +3867,130 @@ async def _try_channel(
 
     # 与本次请求一一对应的工具名映射；不再依赖 channel 实例属性，避免并发覆盖
     dynamic_map = upstream_req.dynamic_tool_map
+    cancel_state: dict[str, Any] = {}
 
-    opened = await open_response_with_proxy_chain(
-        channel=ch,
-        resolved_model=resolved_model,
-        upstream_req=upstream_req,
-        connect_timeout=connect_timeout,
-        first_byte_timeout=first_byte_timeout,
-        idle_timeout=idle_timeout,
-        total_timeout=total_timeout,
-        response_mode=(
-            "stream"
-            if is_stream or getattr(ch, "upstream_stream_only", False)
-            else "non_stream"
-        ),
-        request_id=request_id,
-        retry_attempt_id=retry_attempt_id,
-    )
+    async def finish_cancelled_http_attempt(
+        result: AttemptResult,
+        *,
+        proxy_name: str | None = None,
+        proxy_bytes: dict | None = None,
+    ) -> None:
+        raw_buf = cancel_state.get("raw_buf")
+        parts = cancel_state.get("parts")
+        partial = (
+            bytes(raw_buf)
+            if isinstance(raw_buf, (bytes, bytearray)) and raw_buf
+            else b"".join(parts)
+            if isinstance(parts, list) and all(
+                isinstance(item, (bytes, bytearray)) for item in parts
+            )
+            else b""
+        )
+        if not partial:
+            tracker = cancel_state.get("tracker")
+            if tracker is not None:
+                try:
+                    tracked = tracker.get_full_response()
+                except Exception:
+                    tracked = None
+                if isinstance(tracked, str):
+                    partial = tracked.encode("utf-8", errors="replace")
+                elif isinstance(tracked, (bytes, bytearray)):
+                    partial = bytes(tracked)
+        if partial and not result.full_response_text:
+            result.full_response_text = partial.decode("utf-8", errors="replace")
+            normalized = model_pricing.normalize_response_billing(
+                result.full_response_text
+            )
+            result.usage = {
+                "input_tokens": normalized.input_tokens,
+                "output_tokens": normalized.output_tokens,
+                "cache_creation": normalized.cache_creation_tokens,
+                "cache_read": normalized.cache_read_tokens,
+            }
+            if (
+                normalized.cache_creation_5m_tokens is not None
+                and normalized.cache_creation_1h_tokens is not None
+            ):
+                result.usage["cache_creation_5m"] = normalized.cache_creation_5m_tokens
+                result.usage["cache_creation_1h"] = normalized.cache_creation_1h_tokens
+            result.usage_observed = normalized.usage_observed
+        bytes_up, bytes_down = _proxy_byte_snapshot(proxy_bytes)
+        if retry_attempt_id is not None:
+            await asyncio.to_thread(
+                log_db.update_retry_attempt,
+                retry_attempt_id,
+                final_round_id=result.round_id,
+                connect_ms=result.connect_ms,
+                first_byte_ms=result.first_byte_ms,
+                idle_ms=result.idle_ms,
+                total_ms=result.total_ms,
+                attempt_elapsed_ms=_elapsed_ms(attempt_start_monotonic),
+                ended_at=time.time(),
+                outcome="cancelled",
+                error_detail="upstream HTTP round cancelled",
+                proxy_name=proxy_name,
+                bytes_up=bytes_up,
+                bytes_down=bytes_down,
+                response_body=result.full_response_text,
+                usage=result.usage,
+                usage_observed=result.usage_observed,
+                settle=False,
+            )
+        await asyncio.to_thread(
+            log_db.finish_error,
+            request_id,
+            "client disconnected",
+            retry_count_so_far,
+            final_channel_key=ch.key,
+            final_channel_type=ch.type,
+            final_model=resolved_model,
+            connect_ms=result.connect_ms,
+            first_token_ms=result.first_byte_ms,
+            idle_ms=result.idle_ms,
+            total_ms=result.total_ms,
+            final_round_id=result.round_id,
+            request_elapsed_ms=_elapsed_ms(start_monotonic),
+            http_status=499,
+            affinity_hit=affinity_hit,
+            response_body=result.full_response_text,
+            usage=result.usage,
+            usage_observed=result.usage_observed,
+            upstream_protocol=getattr(ch, "protocol", "anthropic"),
+            proxy_name=proxy_name,
+            proxy_bytes_up=bytes_up,
+            proxy_bytes_down=bytes_down,
+            status="cancelled",
+            **_request_stage_kwargs(result),
+        )
+
+    try:
+        opened = await open_response_with_proxy_chain(
+            channel=ch,
+            resolved_model=resolved_model,
+            upstream_req=upstream_req,
+            connect_timeout=connect_timeout,
+            first_byte_timeout=first_byte_timeout,
+            idle_timeout=idle_timeout,
+            total_timeout=total_timeout,
+            response_mode=(
+                "stream"
+                if is_stream or getattr(ch, "upstream_stream_only", False)
+                else "non_stream"
+            ),
+            request_id=request_id,
+            retry_attempt_id=retry_attempt_id,
+        )
+    except asyncio.CancelledError:
+        cancelled = AttemptResult(
+            outcome="cancelled",
+            error_detail="upstream HTTP round cancelled before response headers",
+        )
+        try:
+            await await_ws_owned(finish_cancelled_http_attempt(cancelled))
+        except Exception:
+            traceback.print_exc()
+        raise
     if opened.error is not None:
         return opened.error
 
@@ -3200,7 +4018,9 @@ async def _try_channel(
                 proxy_name=_proxy_name_used,
                 proxy_bytes=_proxy_bytes,
                 translator_ctx=upstream_req.translator_ctx,
+                partial_state=cancel_state,
             )
+            result = _attach_retry_after_from_response(result, upstream_resp)
             result = _request_invalid_result_if_needed(result)
             result = _finalize_http_attempt(opened, result)
             await _close_proxy_client(_proxy_client)
@@ -3222,7 +4042,9 @@ async def _try_channel(
                 timing=_timing,
                 round_timeouts=opened.round_timeouts,
                 start_monotonic=start_monotonic,
+                cancel_state=cancel_state,
             )
+            result = _attach_retry_after_from_response(result, upstream_resp)
             result = _finalize_http_attempt(opened, result)
             await _close_proxy_client(_proxy_client)
             return result
@@ -3247,7 +4069,9 @@ async def _try_channel(
             retry_attempt_id=retry_attempt_id,
             start_monotonic=start_monotonic,
             attempt_start_monotonic=attempt_start_monotonic,
+            cancel_state=cancel_state,
         )
+        result = _attach_retry_after_from_response(result, upstream_resp)
         if not result.stream_started:
             result = _finalize_http_attempt(opened, result)
             await _close_proxy_client(_proxy_client)
@@ -3259,7 +4083,17 @@ async def _try_channel(
             outcome="cancelled",
             error_detail="upstream HTTP round cancelled before downstream commit",
         )
-        await asyncio.shield(asyncio.to_thread(_finalize_http_attempt, opened, cancelled))
+        cancelled = await await_ws_owned(
+            asyncio.to_thread(_finalize_http_attempt, opened, cancelled)
+        )
+        try:
+            await await_ws_owned(finish_cancelled_http_attempt(
+                cancelled,
+                proxy_name=_proxy_name_used,
+                proxy_bytes=_proxy_bytes,
+            ))
+        except Exception:
+            traceback.print_exc()
         raise
     except Exception as exc:
         traceback.print_exc()
@@ -3307,6 +4141,7 @@ async def _consume_non_stream(
     timing=None,
     round_timeouts=None,
     start_monotonic: float | None = None,
+    cancel_state: dict[str, Any] | None = None,
 ) -> AttemptResult:
     if start_monotonic is None:
         start_monotonic = time.monotonic()
@@ -3327,6 +4162,7 @@ async def _consume_non_stream(
             timing=timing,
             round_timeouts=round_timeouts,
             start_monotonic=start_monotonic,
+            cancel_state=cancel_state,
         )
 
     body_read = await read_non_stream_body(
@@ -3335,6 +4171,7 @@ async def _consume_non_stream(
         connect_ms=connect_ms,
         timing=timing,
         round_timeouts=round_timeouts,
+        partial_state=cancel_state,
     )
     if body_read.error is not None:
         return body_read.error
@@ -3414,7 +4251,7 @@ async def _consume_non_stream(
     _write_affinity_non_stream(ingress_protocol, api_key_name, client_ip,
                                 messages, assistant_msg, body, out_obj,
                                 ch.key, resolved_model,
-                                client_key=client_key)
+                                client_key=client_key, fp_query=fp_query)
 
     response = JSONResponse(
         content=out_obj,
@@ -3454,6 +4291,7 @@ async def _consume_stream_as_non_stream(
     timing=None,
     round_timeouts=None,
     start_monotonic: float | None = None,
+    cancel_state: dict[str, Any] | None = None,
 ) -> AttemptResult:
     """处理 upstream_stream_only=True 渠道的非流式下游请求。
 
@@ -3486,6 +4324,7 @@ async def _consume_stream_as_non_stream(
         timing=timing,
         round_timeouts=round_timeouts,
         translator_ctx=translator_ctx,
+        partial_state=cancel_state,
     )
     if prepared.error is not None:
         return timing.apply_to(prepared.error) if timing is not None else prepared.error
@@ -3548,7 +4387,7 @@ async def _consume_stream_as_non_stream(
     _write_affinity_non_stream(ingress_protocol, api_key_name, client_ip,
                                 messages, assistant_msg, body, out_obj,
                                 ch.key, resolved_model,
-                                client_key=client_key)
+                                client_key=client_key, fp_query=fp_query)
 
     response = JSONResponse(
         content=out_obj,
@@ -3631,6 +4470,7 @@ async def _consume_stream(
     retry_attempt_id: int | None = None,
     start_monotonic: float | None = None,
     attempt_start_monotonic: float | None = None,
+    cancel_state: dict[str, Any] | None = None,
 ) -> AttemptResult:
     if start_monotonic is None:
         start_monotonic = time.monotonic()
@@ -3649,6 +4489,7 @@ async def _consume_stream(
         timing=timing,
         round_timeouts=round_timeouts,
         translator_ctx=translator_ctx,
+        partial_state=cancel_state,
     )
     if stream_start.error is not None:
         return timing.apply_to(stream_start.error) if timing is not None else stream_start.error
@@ -3678,34 +4519,42 @@ async def _consume_stream(
             and bool(getattr(tracker, "saw_stream_end", False))
         )
 
-    async def _persist_stream_retry(outcome: str, error_detail: str | None = None):
+    def _finish_stream_timing(outcome: str, error_detail: str | None = None):
         if timing is None:
             return None
-        snapshot = (
+        return (
             finalize_opened_http_response(opened_response, outcome, error_detail)
             if opened_response is not None
             else timing.finish(outcome, error_detail)
         )
-        if retry_attempt_id is not None:
-            await asyncio.shield(asyncio.to_thread(
-                log_db.update_retry_attempt,
-                retry_attempt_id,
-                final_round_id=snapshot.round_id,
-                connect_ms=snapshot.connect_ms,
-                first_byte_ms=snapshot.first_byte_ms,
-                idle_ms=snapshot.idle_ms,
-                attempt_elapsed_ms=_elapsed_ms(attempt_start_monotonic),
-                request_upload_ms=snapshot.request_upload_ms,
-                response_headers_wait_ms=snapshot.response_headers_wait_ms,
-                response_body_first_byte_wait_ms=snapshot.response_body_first_byte_wait_ms,
-                total_ms=snapshot.total_ms,
-                ended_at=time.time(),
-                outcome=outcome,
-                error_detail=(error_detail or "")[:4000] if error_detail else None,
-                proxy_name=proxy_name,
-                bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
-                bytes_down=_proxy_byte_snapshot(proxy_bytes)[1],
-            ))
+
+    async def _persist_stream_retry_attempt(snapshot, outcome: str, error_detail: str | None = None):
+        if snapshot is None or retry_attempt_id is None:
+            return
+        await asyncio.shield(asyncio.to_thread(
+            log_db.update_retry_attempt,
+            retry_attempt_id,
+            final_round_id=snapshot.round_id,
+            connect_ms=snapshot.connect_ms,
+            first_byte_ms=snapshot.first_byte_ms,
+            idle_ms=snapshot.idle_ms,
+            attempt_elapsed_ms=_elapsed_ms(attempt_start_monotonic),
+            request_upload_ms=snapshot.request_upload_ms,
+            response_headers_wait_ms=snapshot.response_headers_wait_ms,
+            response_body_first_byte_wait_ms=snapshot.response_body_first_byte_wait_ms,
+            total_ms=snapshot.total_ms,
+            ended_at=time.time(),
+            outcome=outcome,
+            error_detail=(error_detail or "")[:4000] if error_detail else None,
+            proxy_name=proxy_name,
+            bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
+            bytes_down=_proxy_byte_snapshot(proxy_bytes)[1],
+            settle=False,
+        ))
+
+    async def _persist_stream_retry(outcome: str, error_detail: str | None = None):
+        snapshot = _finish_stream_timing(outcome, error_detail)
+        await _persist_stream_retry_attempt(snapshot, outcome, error_detail)
         return snapshot
 
     async def _finalize_success():
@@ -3818,10 +4667,16 @@ async def _consume_stream(
             fp_write = fingerprint.fingerprint_write_responses(
                 api_key_name or "", client_ip or "", cur_input, output_items,
             )
+        prompt_cache_key = _openai_prompt_cache_key_from_body(ingress_protocol, body)
+        if fp_query:
+            affinity.upsert(
+                fp_query, ch.key, resolved_model,
+                prompt_cache_key=prompt_cache_key,
+            )
         if fp_write:
             affinity.upsert(
                 fp_write, ch.key, resolved_model,
-                prompt_cache_key=_openai_prompt_cache_key_from_body(ingress_protocol, body),
+                prompt_cache_key=prompt_cache_key,
             )
         # 同步更新 client-level soft affinity
         if client_key:
@@ -3845,6 +4700,7 @@ async def _consume_stream(
             retry_count=retry_count_so_far, affinity_hit=affinity_hit,
             response_body=tracker.get_full_response(),
             http_status=upstream_status,
+            usage_observed=tracker.usage_observed,
             upstream_protocol=getattr(ch, "protocol", "anthropic"),
             proxy_name=proxy_name,
             proxy_bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
@@ -3886,6 +4742,8 @@ async def _consume_stream(
             http_status=(400 if outcome == "request_invalid" else upstream_status),
             affinity_hit=affinity_hit,
             response_body=tracker.get_full_response(),
+            usage=tracker.usage,
+            usage_observed=tracker.usage_observed,
             upstream_protocol=getattr(ch, "protocol", "anthropic"),
             proxy_name=proxy_name,
             proxy_bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
@@ -3919,8 +4777,14 @@ async def _consume_stream(
             return
         state["finalized"] = True
         request_elapsed_ms = _elapsed_ms(start_monotonic)
-        timing_snapshot = await _persist_stream_retry("client_disconnected", "client disconnected")
-        await asyncio.shield(asyncio.to_thread(
+        # The outer request record is the user-visible terminal truth.  Persist
+        # it before the retry-chain bookkeeping: a disconnect can interrupt the
+        # latter after it has been written, which otherwise leaves request_log
+        # pending until the stale-record cleaner falsely calls it a crash.
+        timing_snapshot = _finish_stream_timing(
+            "client_disconnected", "client disconnected",
+        )
+        await await_ws_owned(asyncio.to_thread(
             log_db.finish_error,
             request_id, "client disconnected", retry_count_so_far,
             final_channel_key=ch.key, final_channel_type=ch.type, final_model=resolved_model,
@@ -3929,14 +4793,19 @@ async def _consume_stream(
             total_ms=(timing_snapshot.total_ms if timing_snapshot is not None else None),
             final_round_id=(timing_snapshot.round_id if timing_snapshot is not None else None),
             request_elapsed_ms=request_elapsed_ms,
-            http_status=upstream_status, affinity_hit=affinity_hit,
+            http_status=499, affinity_hit=affinity_hit,
             response_body=tracker.get_full_response(), status="cancelled",
+            usage=tracker.usage,
+            usage_observed=tracker.usage_observed,
             upstream_protocol=getattr(ch, "protocol", "anthropic"),
             proxy_name=proxy_name,
             proxy_bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
             proxy_bytes_down=_proxy_byte_snapshot(proxy_bytes)[1],
             **_timing_stage_kwargs(timing, terminal=True),
         ))
+        await _persist_stream_retry_attempt(
+            timing_snapshot, "client_disconnected", "client disconnected",
+        )
 
     async def stream_generator():
         """把首包 + 后续 chunk 转发给下游，同时在中途错误时用 SSE error event 收尾。"""

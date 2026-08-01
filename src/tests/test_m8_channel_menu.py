@@ -26,6 +26,8 @@ _isolation.isolate()
 import json
 import os
 import sys
+import time
+from datetime import datetime, timedelta, timezone
 
 
 def _import_modules():
@@ -36,14 +38,14 @@ def _import_modules():
         affinity, config, cooldown, log_db, probe, scorer, state_db,
     )
     from src.channel import registry, api_channel
-    from src.telegram import bot, states, ui
-    from src.telegram.menus import channel_menu, main as main_menu
+    from src.telegram import bot, menu_cache, states, ui
+    from src.telegram.menus import channel_menu, main as main_menu, status_menu
     return {
         "affinity": affinity, "config": config, "cooldown": cooldown,
         "log_db": log_db, "probe": probe, "scorer": scorer, "state_db": state_db,
         "registry": registry, "api_channel": api_channel,
-        "bot": bot, "states": states, "ui": ui,
-        "channel_menu": channel_menu, "main_menu": main_menu,
+        "bot": bot, "menu_cache": menu_cache, "states": states, "ui": ui,
+        "channel_menu": channel_menu, "main_menu": main_menu, "status_menu": status_menu,
     }
 
 
@@ -64,8 +66,17 @@ class ApiRecorder:
         return [d for m, d in self.calls if m == method]
 
     def last(self, method):
-        l = self.by(method)
-        return l[-1] if l else None
+        deadline = time.time() + 5
+        while True:
+            calls = self.by(method)
+            item = calls[-1] if calls else None
+            text = str((item or {}).get("text") or "")
+            loading = any(marker in text for marker in (
+                "正在加载，完成后", "统计正在加载", "统计加载中", "历史统计加载中",
+            ))
+            if not loading or time.time() >= deadline:
+                return item
+            time.sleep(0.01)
 
     def clear(self):
         self.calls.clear()
@@ -100,7 +111,23 @@ def _setup(m):
     m["registry"].rebuild_from_config()
 
 
+def _seed_stats_snapshots(m) -> None:
+    """测试显式模拟中央调度器与详情队列已生成快照。"""
+    cache = m["menu_cache"]
+    since = cache.month_start_ts()
+    cache.PERIOD_STATS.store(
+        ("period", int(since)), m["log_db"].stats_period_snapshot(since),
+    )
+    for channel in m["registry"].all_channels():
+        if channel.type == "api":
+            cache.DETAIL_STATS.store(
+                ("channel-model", channel.key, int(since)),
+                m["log_db"].channel_model_stats(channel.key, since_ts=since),
+            )
+
+
 def _install_recorder(m):
+    _seed_stats_snapshots(m)
     rec = ApiRecorder()
     m["ui"].api = rec
     return rec
@@ -126,6 +153,67 @@ def _add_channel(m, name, url="https://example.com/v", models=None):
         "name": name, "baseUrl": url, "apiKey": "sk-testkey12345",
         "models": models, "cc_mimicry": True, "enabled": True,
     })
+
+
+def test_existing_zhipu_1310_is_upgraded_to_stored_reset_on_startup(m):
+    _setup(m)
+    _add_channel(
+        m,
+        "智谱 Max",
+        url="https://open.bigmodel.cn/api/anthropic",
+        models=[{"real": "glm-5.2", "alias": "glm-5.2"}],
+    )
+    bjt = timezone(timedelta(hours=8))
+    reset_dt = (datetime.now(bjt) + timedelta(days=2)).replace(microsecond=0)
+    reset_ms = int(reset_dt.timestamp() * 1000)
+    reset_text = reset_dt.strftime("%Y-%m-%d %H:%M:%S")
+    detail = (
+        'HTTP 429: {"type":"error","error":{"type":"rate_limit_error",'
+        f'"code":"1310","message":"限额将在 {reset_text} 重置"}}}}'
+    )
+    m["state_db"].error_save(
+        "api:智谱 Max", "glm-5.2", 1, int(time.time() * 1000) - 1, detail,
+    )
+    m["cooldown"]._initialized = False
+    m["cooldown"].init()
+    state = m["cooldown"].get_state("api:智谱 Max", "glm-5.2")
+    assert state["cooldown_until"] == reset_ms
+    assert m["cooldown"].is_blocked("api:智谱 Max", "glm-5.2")
+    print("  [PASS] existing 1310 startup quota cooldown upgrade")
+
+
+def test_quota_cooldown_is_explicit_in_channel_detail_and_status(m):
+    _setup(m)
+    _add_channel(
+        m,
+        "智谱 Max",
+        url="https://open.bigmodel.cn/api/anthropic",
+        models=[{"real": "glm-5.2", "alias": "glm-5.2"}],
+    )
+    ch = m["registry"].get_channel("api:智谱 Max")
+    reset_ms = int(time.time() * 1000) + 2 * 24 * 60 * 60 * 1000
+    detail = (
+        'HTTP 429: {"type":"error","error":{"type":"rate_limit_error",'
+        '"code":"1310","message":"[1310][您已达到每周/每月使用上限]"}}'
+    )
+    m["cooldown"].record_error(
+        ch.key, "glm-5.2", detail, cooldown_until=reset_ms,
+    )
+
+    icon, health = m["channel_menu"]._channel_health(ch)
+    assert icon == "🟠" and "配额冷却" in health
+    lines = "\n".join(m["channel_menu"]._channel_model_lines(ch))
+    assert "🟠 <b>配额冷却</b>" in lines
+    assert "周/月额度已用尽（1310）" in lines
+    assert "恢复前自动跳过本渠道模型" in lines
+    assert "北京时间" in lines
+
+    overview = m["status_menu"]._channel_overview()
+    assert overview["anthropic"]["quota_cooling"] == 1
+    problems = "\n".join(m["status_menu"]._problem_channels())
+    assert "配额冷却" in problems
+    assert "周/月额度耗尽（1310）" in problems
+    print("  [PASS] quota cooldown channel/status UI")
 
 
 # ─── Probe mock ─────────────────────────────────────────────────
@@ -158,6 +246,7 @@ def test_list_empty_and_populated(m):
     _add_channel(m, "chA")
     _add_channel(m, "chB", models=[{"real": "gpt-4", "alias": "gpt-4"}])
     _insert_channel_success(m, "chA")
+    _seed_stats_snapshots(m)
     rec.clear()
     m["channel_menu"].show(42, 100)
     last = rec.last("editMessageText")
@@ -165,6 +254,9 @@ def test_list_empty_and_populated(m):
     assert "chA" in last["text"]
     assert "chB" in last["text"]
     assert "缓存 50 (31.2%)" in last["text"]
+    assert "\n  💵 $0.000" in last["text"]
+    assert "缓存 50 (31.2%) · 💵" not in last["text"]
+    assert "≈" not in last["text"]
     print("  [PASS] list empty + populated")
 
 
@@ -288,6 +380,9 @@ def test_detail_renders(m):
     assert "chA" in text
     assert "GLM-5" in text and "glm-5" in text
     assert "缓存 50 (31.2%)" in text
+    assert "\n    💵 $0.000" in text
+    assert "缓存 50 (31.2%) · 💵" not in text
+    assert "≈" not in text
     # API Key 掩码
     assert "sk-tes" in text and "***" in text
     # 按钮
@@ -577,6 +672,99 @@ def test_edit_fields(m):
     print("  [PASS] edit name/url/key/models/cc_mimicry")
 
 
+def test_channel_compatibility_menu_and_model_scope(m):
+    _setup(m)
+    _add_channel(
+        m,
+        "compat",
+        models=[
+            {"real": "claude-fable-5", "alias": "fable"},
+            {"real": "claude-haiku-4-5-20251001", "alias": "haiku"},
+        ],
+    )
+    rec = _install_recorder(m)
+    cm = m["channel_menu"]
+    short = m["ui"].register_code("compat")
+
+    cm.on_edit_menu(42, 100, "cb", short)
+    edit = rec.last("editMessageText")
+    rows = edit["reply_markup"]["inline_keyboard"]
+    assert any(
+        len(row) == 2
+        and row[0]["callback_data"].startswith("ch:emax:")
+        and row[1]["callback_data"].startswith("ch:cmp:")
+        for row in rows
+    )
+    assert not any(
+        button["callback_data"].startswith(("ch:eomit:", "ch:ethink:"))
+        for row in rows for button in row if "callback_data" in button
+    )
+
+    rec.clear()
+    cm.on_compat_menu(42, 100, "cb", short)
+    compat = rec.last("editMessageText")
+    assert "渠道兼容配置" in compat["text"]
+    callbacks = [
+        button["callback_data"]
+        for row in compat["reply_markup"]["inline_keyboard"]
+        for button in row if "callback_data" in button
+    ]
+    assert f"ch:cf:{short}:1m" in callbacks
+    assert f"ch:cf:{short}:fast" in callbacks
+
+    cm.on_compat_feature_mode(42, 100, "cb", short, "1m", "force")
+    entry = next(c for c in m["config"].get()["channels"] if c["name"] == "compat")
+    assert entry["context1mMode"] == "force"
+    assert entry["context1mModels"] == []
+
+    # “全部模型”下点一个模型，转成只强制该真实上游模型。
+    cm.on_compat_feature_toggle_model(42, 100, "cb", short, "1m", "0")
+    entry = next(c for c in m["config"].get()["channels"] if c["name"] == "compat")
+    assert entry["context1mModels"] == ["claude-fable-5"]
+    cm.on_compat_feature_toggle_model(42, 100, "cb", short, "1m", "1")
+    entry = next(c for c in m["config"].get()["channels"] if c["name"] == "compat")
+    assert entry["context1mModels"] == ["claude-fable-5", "claude-haiku-4-5-20251001"]
+    cm.on_compat_feature_all_models(42, 100, "cb", short, "1m")
+    entry = next(c for c in m["config"].get()["channels"] if c["name"] == "compat")
+    assert entry["context1mModels"] == []
+
+    cm.on_compat_feature_mode(42, 100, "cb", short, "fast", "force")
+    cm.on_compat_feature_toggle_model(42, 100, "cb", short, "fast", "1")
+    entry = next(c for c in m["config"].get()["channels"] if c["name"] == "compat")
+    assert entry["fastMode"] == "force"
+    assert entry["fastModels"] == ["claude-haiku-4-5-20251001"]
+
+    cm.on_edit_omit_temperature_toggle(42, 100, "cb", short)
+    cm.on_edit_omit_thinking_toggle(42, 100, "cb", short)
+    entry = next(c for c in m["config"].get()["channels"] if c["name"] == "compat")
+    assert entry["omitTemperature"] is True
+    assert entry["omitThinking"] is True
+
+    # OpenAI 渠道也有 Fast 和通用剔除，但不显示 1M 入口。
+    from src.openai.channel.api_channel import OpenAIApiChannel
+    m["registry"].register_channel_factory("openai-chat", OpenAIApiChannel)
+    m["registry"].add_api_channel({
+        "name": "openai-compat",
+        "baseUrl": "https://example.com/v1",
+        "apiKey": "sk-testkey12345",
+        "protocol": "openai-chat",
+        "models": [{"real": "gpt-5", "alias": "gpt-5"}],
+        "enabled": True,
+    })
+    openai_short = m["ui"].register_code("openai-compat")
+    rec.clear()
+    cm.on_compat_menu(42, 100, "cb", openai_short)
+    openai_menu = rec.last("editMessageText")
+    callbacks = [
+        button["callback_data"]
+        for row in openai_menu["reply_markup"]["inline_keyboard"]
+        for button in row if "callback_data" in button
+    ]
+    assert f"ch:cf:{openai_short}:fast" in callbacks
+    assert f"ch:cf:{openai_short}:1m" not in callbacks
+    print("  [PASS] channel compatibility menu/model scope")
+
+
 def test_router_dispatch(m):
     _setup(m)
     _add_channel(m, "routed")
@@ -646,6 +834,8 @@ def main():
         test_list_pagination_and_detail_return_page,
         test_channel_sort_reorders_config,
         test_detail_renders,
+        test_existing_zhipu_1310_is_upgraded_to_stored_reset_on_startup,
+        test_quota_cooldown_is_explicit_in_channel_detail_and_status,
         test_toggle_clear_errors_clear_affinity,
         test_global_clear,
         test_delete_channel_cascades,
@@ -656,6 +846,7 @@ def main():
         test_add_wizard_cancel,
         test_add_wizard_input_validation,
         test_edit_fields,
+        test_channel_compatibility_menu_and_model_scope,
         test_router_dispatch,
         test_test_panel_single,
     ]

@@ -35,7 +35,10 @@ def _import_modules():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if root not in sys.path:
         sys.path.insert(0, root)
-    from src import affinity, config, cooldown, failover, fingerprint, log_db, scorer, state_db, upstream
+    from src import (
+        affinity, apikey_limiter, concurrency, config, cooldown, failover,
+        fingerprint, log_db, scorer, state_db, upstream,
+    )
     from src.channel import registry
     from src.openai.channel.registration import register_factories
     from src.openai.channel.api_channel import OpenAIApiChannel
@@ -44,6 +47,8 @@ def _import_modules():
     register_factories()
     return {
         "affinity": affinity,
+        "apikey_limiter": apikey_limiter,
+        "concurrency": concurrency,
         "config": config,
         "cooldown": cooldown,
         "failover": failover,
@@ -136,6 +141,8 @@ class FakeWebSocket:
         self.close_calls: list[tuple[int, str]] = []
         self.accepted = False
         self._closed = asyncio.Event()
+        self._relay_wait_cancelled = False
+        self._terminal_seen = False
 
     async def accept(self):
         self.accepted = True
@@ -150,14 +157,32 @@ class FakeWebSocket:
             return {"type": "websocket.receive", "text": text}
         if self._extra_receive:
             return self._extra_receive.pop(0)
+        if self._terminal_seen:
+            self._terminal_seen = False
+            return {"type": "websocket.disconnect", "code": 1000}
+        if self._relay_wait_cancelled:
+            self._relay_wait_cancelled = False
+            return {"type": "websocket.disconnect", "code": 1000}
         # A real connected client blocks here; an immediate synthetic disconnect
-        # races the new owned per-frame timing task and can cancel a healthy
-        # upstream before its terminal frame. ``close()`` releases this waiter.
-        await self._closed.wait()
+        # races the owned per-frame timing task and can cancel a healthy upstream.
+        try:
+            await self._closed.wait()
+        except asyncio.CancelledError:
+            if self._terminal_seen:
+                self._relay_wait_cancelled = True
+            raise
         return {"type": "websocket.disconnect", "code": 1000}
 
     async def send_text(self, text: str):
         self.sent_texts.append(text)
+        try:
+            event_type = json.loads(text).get("type")
+        except Exception:
+            event_type = None
+        if event_type in {
+            "response.completed", "response.failed", "response.incomplete",
+        }:
+            self._terminal_seen = True
 
     async def send_bytes(self, data: bytes):
         self.sent_texts.append(data.decode("utf-8"))
@@ -167,6 +192,65 @@ class FakeWebSocket:
         self._closed.set()
         from starlette.websockets import WebSocketState
         self.application_state = WebSocketState.DISCONNECTED
+
+
+class SequentialFakeWebSocket(FakeWebSocket):
+    """Send the next create only after the active receive task is cancelled."""
+
+    def __init__(self, first_obj: dict[str, Any], *next_objs: dict[str, Any]):
+        super().__init__(first_obj)
+        self._next_texts = [json.dumps(obj) for obj in next_objs]
+
+    async def send_text(self, text: str):
+        await super().send_text(text)
+        try:
+            event_type = json.loads(text).get("type")
+        except Exception:
+            event_type = None
+        if event_type in {
+            "response.completed", "response.failed", "response.incomplete",
+            "error",
+        }:
+            self._terminal_seen = True
+
+    async def receive(self):
+        if (
+            self._first_text is None
+            and self._next_texts
+            and (self._relay_wait_cancelled or self._terminal_seen)
+        ):
+            self._relay_wait_cancelled = False
+            self._terminal_seen = False
+            text = self._next_texts.pop(0)
+            return {"type": "websocket.receive", "text": text}
+        if (
+            self._first_text is None
+            and not self._next_texts
+            and self._terminal_seen
+        ):
+            self._terminal_seen = False
+            return {"type": "websocket.disconnect", "code": 1000}
+        return await super().receive()
+
+
+class IdleBetweenTurnsFakeWebSocket(FakeWebSocket):
+    """Keep the client socket open after one terminal response for inspection."""
+
+    def __init__(self, first_obj: dict[str, Any]):
+        super().__init__(first_obj)
+        self.waiting_between_turns = asyncio.Event()
+        self.disconnect_between_turns = asyncio.Event()
+
+    async def receive(self):
+        if self._first_text is not None:
+            return await super().receive()
+        if self._relay_wait_cancelled or self._terminal_seen:
+            self._relay_wait_cancelled = False
+            self._terminal_seen = False
+            self.waiting_between_turns.set()
+            await self.disconnect_between_turns.wait()
+            return {"type": "websocket.disconnect", "code": 1000}
+        return await super().receive()
 
 
 class FakeUpstreamWebSocket:
@@ -189,6 +273,28 @@ class FakeUpstreamWebSocket:
 
     async def close(self, *args, **kwargs):
         return None
+
+
+class BlockingAfterEventsWebSocket(FakeUpstreamWebSocket):
+    """Deliver finite frames, then signal that the consumer is blocked."""
+
+    def __init__(self, events: list[dict[str, Any]]):
+        super().__init__(events)
+        self.waiting = asyncio.Event()
+        self._release = asyncio.Event()
+        self.closed = False
+
+    async def recv(self):
+        if self._events:
+            return self._events.pop(0)
+        self.waiting.set()
+        await self._release.wait()
+        import websockets
+        raise websockets.ConnectionClosed(None, None)
+
+    async def close(self, *args, **kwargs):
+        self.closed = True
+        self._release.set()
 
 
 
@@ -280,7 +386,9 @@ def _make_oauth_channel_for_failover(m, *, name="oauth@example.com"):
     return ch
 
 
-async def _call_failover_responses(m, ch, body: dict[str, Any]):
+async def _call_failover_responses(
+    m, ch, body: dict[str, Any], *, fp_query=None, bound_channel_key=None,
+):
     from src.scheduler import ScheduleResult
     request_id = f"http-ws-{len(body)}-{int(time.time()*1000000)}"
     start = time.time()
@@ -290,7 +398,11 @@ async def _call_failover_responses(m, ch, body: dict[str, Any]):
         1, 0, {}, body, ingress_protocol="responses",
     )
     body.setdefault("_api_key_name", "ws-key")
-    sr = ScheduleResult(candidates=[(ch, "test-model")], saturated=[], affinity_hit=False, fp_query=None, client_key="client:1")
+    sr = ScheduleResult(
+        candidates=[(ch, "test-model")], saturated=[],
+        affinity_hit=bool(fp_query), fp_query=fp_query, client_key="client:1",
+        bound_channel_key=bound_channel_key,
+    )
     resp = await m["failover"].run_failover(
         sr, body, request_id, "ws-key", "1.2.3.4",
         is_stream=bool(body.get("stream", False)), start_time=start, ingress_protocol="responses",
@@ -311,8 +423,17 @@ def _proxy_chain(m, request_id: str):
         "SELECT * FROM proxy_chain WHERE request_id=? ORDER BY attempt_order", (request_id,)
     ).fetchall()]
 
-def _make_channel(m):
-    ch = m["OpenAIApiChannel"]({
+
+def _attempt_usage(m, request_id: str):
+    conn = m["log_db"]._get_conn()
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM upstream_attempt_usage "
+        "WHERE root_request_id=? ORDER BY attempt_order",
+        (request_id,),
+    ).fetchall()]
+
+def _make_channel(m, *, extra: dict[str, Any] | None = None):
+    entry = {
         "name": "ws-upstream",
         "type": "api",
         "baseUrl": "https://up.example",
@@ -320,7 +441,10 @@ def _make_channel(m):
         "protocol": "openai-responses",
         "models": [{"alias": "test-model", "real": "real-model"}],
         "enabled": True,
-    })
+    }
+    if extra:
+        entry.update(extra)
+    ch = m["OpenAIApiChannel"](entry)
     with m["registry"]._lock:
         m["registry"]._channels = {ch.key: ch}
     return ch
@@ -328,11 +452,26 @@ def _make_channel(m):
 
 @pytest.mark.asyncio
 async def test_responses_ws_routes_maps_model_and_relays(monkeypatch, m):
-    _setup(m)
+    cfg = _setup(m)
+    external_alias = "grok-4.5"
+    logical_model = "test-model"
+    cfg["modelMapping"] = {"global": {external_alias: logical_model}}
+    cfg["modelBindings"] = {
+        "defaults": {
+            logical_model: {"target": "openai/gpt-5.4", "source": "test"},
+        },
+        "scoped": {},
+    }
+    cfg["modelMetadata"] = {}
+    from src import model_pricing
+    model_pricing.reset_for_tests()
+    model_pricing.initialize()
+    assert model_pricing.canonical_official_model(external_alias) == "xai/grok-4.5"
+
     _make_channel(m)
     ws = FakeWebSocket({
         "type": "response.create",
-        "model": "test-model",
+        "model": external_alias,
         "input": "hello",
         "stream": True,
         "background": False,
@@ -369,7 +508,60 @@ async def test_responses_ws_routes_maps_model_and_relays(monkeypatch, m):
         "response.created", "response.in_progress",
         "response.output_text.delta", "response.completed"
     ]
-    assert ws.close_calls[-1][0] == 1000
+    row = _last_request_log(m)
+    chain = _retry_chain(m, row["request_id"])
+    assert row["requested_model"] == logical_model
+    assert len(chain) == 1 and chain[0]["dispatched_at"] is not None
+    assert chain[0]["client_visible_model"] == logical_model
+    assert chain[0]["model"] == "real-model"
+    assert chain[0]["binding_source"] == "metadata_default"
+    assert chain[0]["binding_pricing_key"] == "openai/gpt-5.4"
+    assert chain[0]["binding_pricing_key"] != "xai/grok-4.5"
+    frozen = json.loads(chain[0]["binding_json"])
+    assert frozen["dispatch"] == {
+        "channel_key": "api:ws-upstream",
+        "channel_type": "api",
+        "client_visible_model": logical_model,
+        "outbound_model_id": "real-model",
+        "upstream_protocol": "openai-responses",
+    }
+    assert frozen["tariff"] is not None
+    assert not ws.close_calls
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_forced_fast_updates_wire_and_log(monkeypatch, m):
+    _setup(m)
+    _make_channel(m, extra={"fastMode": "force", "fastModels": []})
+    ws = FakeWebSocket({
+        "type": "response.create",
+        "model": "test-model",
+        "input": "hello",
+        "stream": True,
+    })
+    fake_upstream = FakeUpstreamWebSocket([
+        {"type": "response.created", "response": {"id": "resp_fast"}},
+        {"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": "ok"},
+        {"type": "response.completed", "response": {
+            "id": "resp_fast",
+            "output": [],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }},
+    ])
+
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
+        return fake_upstream
+
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+
+    upstream_first = json.loads(fake_upstream.sent[0])
+    assert upstream_first["service_tier"] == "priority"
+    row = _last_request_log(m)
+    assert row["status"] == "success"
+    assert row["fast_mode"] == 1
+    detail = m["log_db"].log_detail(row["request_id"])["detail"]
+    assert "service_tier" not in json.loads(detail["request_body"])
 
 
 @pytest.mark.asyncio
@@ -442,7 +634,7 @@ async def test_responses_ws_blacklist_before_first_visible_fails_over(monkeypatc
     assert json.loads(good.sent[0])["model"] == "real-model"
     assert [json.loads(t)["response"]["id"] for t in ws.sent_texts if json.loads(t)["type"] == "response.created"] == ["good"]
     assert any(json.loads(t).get("delta") == "ok" for t in ws.sent_texts)
-    assert ws.close_calls[-1][0] == 1000
+    assert not ws.close_calls
 
 
 @pytest.mark.asyncio
@@ -502,12 +694,12 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(mon
     assert upstream_first["stream"] is True
     assert upstream_first["input"] == [{"type": "message", "role": "user", "content": "hello"}]
     assert upstream_first["client_metadata"] == {"a": "b"}
-    # Without client_metadata identity anchors there is no response-side mapping to restore,
-    # so this legacy transform smoke test only requires session/thread headers to be isolated.
-    assert upstream_first["prompt_cache_key"] == "shared-anchor"
+    # Frame and handshake identities share the same isolated session anchor.
+    assert upstream_first["prompt_cache_key"] == captured["headers"]["session-id"]
+    assert upstream_first["prompt_cache_key"] != "shared-anchor"
     assert captured["headers"]["session-id"] != "shared-anchor"
     assert "temperature" not in upstream_first
-    assert ws.close_calls[-1][0] == 1000
+    assert not ws.close_calls
 
 
 @pytest.mark.asyncio
@@ -529,12 +721,175 @@ async def test_responses_ws_accepts_explicit_session_headers(monkeypatch, m):
 
     monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
     await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
-    assert ws.close_calls[-1][0] == 1000
+    assert not ws.close_calls
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_forwards_terminal_only_completed_response(monkeypatch, m):
+    _setup(m)
+    _make_channel(m)
+    ws = FakeWebSocket({
+        "type": "response.create", "model": "test-model",
+        "input": "hello", "stream": True,
+    })
+    fake_upstream = FakeUpstreamWebSocket([
+        {"type": "response.created", "response": {"id": "terminal_only"}},
+        {"type": "response.completed", "response": {
+            "id": "terminal_only",
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "done"}],
+            }],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }},
+    ])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_upstream
+
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+
+    assert [json.loads(text)["type"] for text in ws.sent_texts] == [
+        "response.created", "response.completed",
+    ]
+    completed = json.loads(ws.sent_texts[-1])
+    assert completed["response"]["output"][0]["content"][0]["text"] == "done"
+    assert not ws.close_calls
+    row = _last_request_log(m)
+    assert row["status"] == "success"
+    assert row["input_tokens"] == row["output_tokens"] == 1
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_cancellation_preserves_partial_usage_and_body(monkeypatch, m):
+    _setup(m)
+    _make_channel(m)
+    ws = FakeWebSocket({
+        "type": "response.create", "model": "test-model",
+        "input": "hello", "stream": True,
+    })
+    fake_upstream = BlockingAfterEventsWebSocket([{
+        "type": "response.in_progress",
+        "response": {
+            "id": "cancel_partial",
+            "usage": {
+                "input_tokens": 5,
+                "output_tokens": 1,
+                "input_tokens_details": {"cached_tokens": 2},
+            },
+        },
+    }])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_upstream
+
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    task = asyncio.create_task(
+        m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+    )
+    await asyncio.wait_for(fake_upstream.waiting.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    row = _last_request_log(m)
+    assert row["status"] == "cancelled"
+    assert row["usage_observed"] == 1
+    detail = m["log_db"].log_detail(row["request_id"])
+    assert "response.in_progress" in detail["detail"]["response_body"]
+    attempts = _attempt_usage(m, row["request_id"])
+    assert len(attempts) == 1
+    assert attempts[0]["usage_observed"] == 1
+    assert attempts[0]["input_tokens"] == 3
+    assert attempts[0]["cache_read_tokens"] == 2
+    assert attempts[0]["output_tokens"] == 1
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_sse_error_body_cancellation_terminalizes_usage(
+    monkeypatch, m,
+):
+    _setup(m)
+    _make_channel(m, extra={"responsesWsUpstreamTransport": "sse"})
+    ws = FakeWebSocket({
+        "type": "response.create", "model": "test-model",
+        "input": "hello", "stream": True,
+    })
+    waiting = asyncio.Event()
+    closed = []
+    partial_body = json.dumps({
+        "error": {"code": "server_error", "message": "partial upstream error"},
+        "usage": {
+            "input_tokens": 5,
+            "output_tokens": 1,
+            "input_tokens_details": {"cached_tokens": 2},
+        },
+    }).encode()
+
+    class BlockingErrorResponse:
+        status_code = 503
+        reason_phrase = "Service Unavailable"
+
+        async def aiter_bytes(self):
+            yield partial_body
+            waiting.set()
+            await asyncio.Event().wait()
+
+    class FakeContext:
+        async def __aexit__(self, *args):
+            closed.append(True)
+
+    async def fake_open(**kwargs):
+        m["log_db"].mark_retry_attempt_dispatch(
+            kwargs["retry_attempt_id"], {"service_tier": "default"},
+        )
+        return SimpleNamespace(
+            error=None,
+            response=BlockingErrorResponse(),
+            connect_ms=7,
+            timing=None,
+            proxy_name=None,
+            proxy_bytes={"up": 11, "down": len(partial_body)},
+            proxy_client=None,
+            proxy_attempt_id=None,
+            round_timeouts=None,
+            ctx=FakeContext(),
+        )
+
+    monkeypatch.setattr(
+        m["responses_ws"], "open_response_with_proxy_chain", fake_open,
+    )
+    task = asyncio.create_task(
+        m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+    )
+    await asyncio.wait_for(waiting.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert closed == [True]
+    row = _last_request_log(m)
+    assert row["status"] == "cancelled"
+    assert row["http_status"] == 499
+    assert row["usage_observed"] == 1
+    detail = m["log_db"].log_detail(row["request_id"])
+    assert "partial upstream error" in detail["detail"]["response_body"]
+    attempts = _attempt_usage(m, row["request_id"])
+    assert len(attempts) == 1
+    assert attempts[0]["outcome"] == "cancelled"
+    assert attempts[0]["usage_observed"] == 1
+    assert attempts[0]["input_tokens"] == 3
+    assert attempts[0]["cache_read_tokens"] == 2
+    assert attempts[0]["output_tokens"] == 1
 
 
 @pytest.mark.asyncio
 async def test_responses_ws_error_after_metadata_before_visible_fails_over(monkeypatch, m):
-    _setup(m)
+    cfg = _setup(m)
+    # This case isolates candidate failover; same-candidate transient retry has
+    # dedicated coverage below.
+    cfg["retry"] = {"transient": {"enabled": False}}
     bad = m["OpenAIApiChannel"]({
         "name": "bad-meta", "type": "api", "baseUrl": "https://bad-meta.example",
         "apiKey": "bad", "protocol": "openai-responses",
@@ -550,7 +905,9 @@ async def test_responses_ws_error_after_metadata_before_visible_fails_over(monke
     ws = FakeWebSocket({"type": "response.create", "model": "test-model", "input": "hello", "stream": True})
     bad_up = FakeUpstreamWebSocket([
         {"type": "response.created", "response": {"id": "bad"}},
-        {"type": "error", "status": 503, "error": {"code": "server_error", "message": "boom"}},
+        {"type": "error", "status": 503,
+         "error": {"code": "server_error", "message": "boom"},
+         "usage": {"input_tokens": 0, "output_tokens": 0}},
     ])
     good_up = FakeUpstreamWebSocket([
         {"type": "response.created", "response": {"id": "good"}},
@@ -569,7 +926,139 @@ async def test_responses_ws_error_after_metadata_before_visible_fails_over(monke
     assert "error" not in sent_types
     assert [json.loads(t).get("response", {}).get("id") for t in ws.sent_texts if json.loads(t)["type"] == "response.created"] == ["good"]
     assert any(json.loads(t).get("delta") == "ok" for t in ws.sent_texts)
-    assert ws.close_calls[-1][0] == 1000
+    assert not ws.close_calls
+    row = _last_request_log(m)
+    attempts = _attempt_usage(m, row["request_id"])
+    assert [item["attempt_order"] for item in attempts] == [1, 2]
+    assert attempts[0]["usage_observed"] == 1
+    assert attempts[0]["input_tokens"] == attempts[0]["output_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_transient_retries_same_candidate_and_honors_retry_after(monkeypatch, m):
+    cfg = _setup(m)
+    cfg["retry"] = {
+        "transient": {
+            "enabled": True,
+            "maxExtraAttempts": 1,
+            "backoffSeconds": [0],
+            "errors": {"openaiServerError": True},
+        }
+    }
+    ch = _make_channel(m)
+    ws = FakeWebSocket({
+        "type": "response.create", "model": "test-model", "input": "hello", "stream": True,
+    })
+    bad_up = FakeUpstreamWebSocket([
+        {"type": "response.created", "response": {"id": "bad"}},
+        {"type": "error", "status": 503, "error": {"code": "server_error", "message": "retry me"}},
+    ])
+    bad_up.response = SimpleNamespace(headers={"Retry-After": "4"})
+    good_up = FakeUpstreamWebSocket([
+        {"type": "response.created", "response": {"id": "good"}},
+        {"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": "ok"},
+        {"type": "response.completed", "response": {"id": "good", "output": [], "usage": {}}},
+    ])
+    upstreams = [bad_up, good_up]
+    connect_calls = []
+
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
+        connect_calls.append(url)
+        return upstreams.pop(0)
+
+    observed_retry_after = []
+
+    async def capture_wait(ordinal, retry_cfg, deadline_ts, *, retry_after_seconds=None):
+        observed_retry_after.append(retry_after_seconds)
+        return 0.0
+
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    monkeypatch.setattr(m["responses_ws"], "_wait_for_transient_retry", capture_wait)
+    await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+
+    assert len(connect_calls) == 2
+    assert observed_retry_after == [4.0]
+    assert any(json.loads(text).get("delta") == "ok" for text in ws.sent_texts)
+    assert not ws.close_calls
+    row = _last_request_log(m)
+    assert row["status"] == "success"
+    assert row["retry_count"] == 1
+    assert [item["outcome"] for item in _retry_chain(m, row["request_id"])] == [
+        "upstream_error_json", "success",
+    ]
+    assert m["cooldown"].get_state(ch.key, "real-model") is None
+    assert m["scorer"].get_stats(ch.key, "real-model")["total_requests"] == 1
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_oauth_refresh_setting_can_disable_refresh(monkeypatch, m):
+    cfg = _setup(m)
+    cfg["retry"] = {
+        "transient": {"enabled": False},
+        "recovery": {"oauthRefresh": False},
+    }
+    oauth_ch = _make_oauth_channel_for_failover(m, name="no-refresh@example.com")
+    api_ch = m["OpenAIApiChannel"]({
+        "name": "after-auth", "type": "api", "baseUrl": "https://after-auth.example",
+        "apiKey": "good", "protocol": "openai-responses",
+        "models": [{"alias": "test-model", "real": "real-model"}], "enabled": True,
+    })
+    with m["registry"]._lock:
+        m["registry"]._channels = {oauth_ch.key: oauth_ch, api_ch.key: api_ch}
+
+    ws = FakeWebSocket({"type": "response.create", "model": "test-model", "input": "hello", "stream": True})
+    await ws.accept()
+    first_obj = {"type": "response.create", "model": "test-model", "input": "hello", "stream": True}
+    body = {"model": "test-model", "input": "hello", "stream": True}
+    request_id = "responses-ws-oauth-refresh-disabled"
+    started_at = time.time()
+    started_monotonic = time.monotonic()
+    m["log_db"].insert_pending(
+        request_id, "1.2.3.4", "ws-key", "test-model", True,
+        1, 0, {}, body, ingress_protocol="responses_ws",
+    )
+    calls = []
+
+    async def fake_try(_websocket, **kwargs):
+        channel = kwargs["ch"]
+        calls.append(channel.key)
+        if channel.key == oauth_ch.key:
+            return m["responses_ws"]._WsAttemptResult(
+                outcome="http_auth_error", http_status=401, error_detail="HTTP 401",
+            )
+        m["log_db"].finish_success(
+            request_id, channel.key, channel.type, kwargs["resolved_model"],
+            retry_count=kwargs["retry_count_so_far"], http_status=101,
+            upstream_protocol="openai-responses", upstream_transport="ws",
+        )
+        return m["responses_ws"]._WsAttemptResult(ok=True, outcome="success")
+
+    async def must_not_refresh(_account_key):
+        raise AssertionError("oauthRefresh=false must suppress force_refresh")
+
+    from src.scheduler import ScheduleResult
+    route = ScheduleResult(
+        candidates=[(oauth_ch, "test-model"), (api_ch, "real-model")],
+        saturated=[], affinity_hit=False, fp_query=None, client_key="client:1",
+    )
+    monkeypatch.setattr(m["responses_ws"], "_try_ws_channel", fake_try)
+    monkeypatch.setattr(m["responses_ws"].oauth_manager, "force_refresh", must_not_refresh)
+    accepted = await m["responses_ws"]._run_ws_failover(
+        ws,
+        first_obj=first_obj,
+        schedule_result=route,
+        body=body,
+        request_id=request_id,
+        api_key_name="ws-key",
+        client_ip="1.2.3.4",
+        start_time=started_at,
+        start_monotonic=started_monotonic,
+        fp_query=None,
+    )
+
+    assert accepted is True
+    assert calls == [oauth_ch.key, api_ch.key]
+    assert _last_request_log(m)["status"] == "success"
 
 
 @pytest.mark.asyncio
@@ -612,7 +1101,7 @@ async def test_responses_ws_records_quota_snapshot_from_upgrade_headers(monkeypa
 
     assert recorded["channel"] == ch.key
     assert recorded["headers"]["x-codex-primary-used-percent"] == "12"
-    assert ws.close_calls[-1][0] == 1000
+    assert not ws.close_calls
 
 
 
@@ -816,7 +1305,104 @@ async def test_responses_ws_proxy_chain_falls_back_before_first_event(monkeypatc
     assert rounds[0]["round_id"] != rounds[1]["round_id"]
     assert all(item["ended_at"] is not None for item in rounds)
     assert rounds[-1]["round_id"] == row["final_round_id"]
-    assert ws.close_calls[-1][0] == 1000
+    assert not ws.close_calls
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_connect_failures_never_set_dispatch_marker(monkeypatch, m):
+    _setup(m)
+    _make_channel(m)
+    ws = FakeWebSocket({
+        "type": "response.create", "model": "test-model",
+        "input": "hello", "stream": True,
+    })
+
+    class DummyProxy:
+        type = "socks5"
+        url = "socks5://127.0.0.1:9999"
+        stats = SimpleNamespace(
+            total_attempts=0, last_attempt_ts=0, total_successes=0,
+            last_success_ts=0, last_latency_ms=0, total_failures=0,
+            last_error=None,
+        )
+
+    dummy = DummyProxy()
+
+    async def fail_connect(*args, **kwargs):
+        raise OSError("route unavailable")
+
+    monkeypatch.setattr(
+        m["responses_ws"], "_resolve_ws_route_chain",
+        lambda ch, model: [("p1", dummy), ("direct", None)],
+    )
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fail_connect)
+    await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+
+    row = _last_request_log(m)
+    chain = _retry_chain(m, row["request_id"])
+    assert len(chain) == 1
+    assert chain[0]["outcome"] == "connect_error"
+    assert chain[0]["dispatched_at"] is None
+    conn = m["log_db"]._get_conn()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM upstream_attempt_usage WHERE root_request_id=?",
+        (row["request_id"],),
+    ).fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_does_not_replay_proxy_route_after_create_send_starts(
+    monkeypatch, m,
+):
+    cfg = _setup(m)
+    cfg["retry"] = {"transient": {"enabled": False}}
+    _make_channel(m)
+    ws = FakeWebSocket({
+        "type": "response.create", "model": "test-model",
+        "input": "hello", "stream": True,
+    })
+
+    class DummyProxy:
+        type = "socks5"
+        url = "socks5://127.0.0.1:9999"
+        stats = SimpleNamespace(
+            total_attempts=0, last_attempt_ts=0, total_successes=0,
+            last_success_ts=0, last_latency_ms=0, total_failures=0,
+            last_error=None,
+        )
+
+    class FailOnCreate:
+        response = SimpleNamespace(headers={})
+
+        async def send(self, *args, **kwargs):
+            raise OSError("send outcome is uncertain")
+
+        async def close(self, *args, **kwargs):
+            return None
+
+    dummy = DummyProxy()
+    connect_calls = []
+
+    async def fake_connect(*args, connector=None, **kwargs):
+        connect_calls.append(connector)
+        return FailOnCreate()
+
+    monkeypatch.setattr(
+        m["responses_ws"], "_resolve_ws_route_chain",
+        lambda ch, model: [("p1", dummy), ("direct", None)],
+    )
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+
+    assert connect_calls == [dummy]
+    row = _last_request_log(m)
+    chain = _retry_chain(m, row["request_id"])
+    assert len(chain) == 1 and chain[0]["dispatched_at"] is not None
+    facts = m["log_db"]._get_conn().execute(
+        "SELECT dispatch_state,cost_source FROM upstream_attempt_usage "
+        "WHERE root_request_id=?", (row["request_id"],),
+    ).fetchall()
+    assert [tuple(item) for item in facts] == [("sent", "unpriced")]
 
 
 @pytest.mark.asyncio
@@ -847,7 +1433,7 @@ async def test_responses_ws_filters_non_responses_channels_without_scoring_failu
     monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
     await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
 
-    assert ws.close_calls[-1][0] == 1000
+    assert not ws.close_calls
     row = _last_request_log(m)
     assert row["status"] == "success"
     assert row["final_channel_key"] == good.key
@@ -875,7 +1461,7 @@ async def test_responses_ws_stream_error_after_visible_logs_and_cools_down(monke
     await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
 
     assert any(json.loads(t)["type"] == "response.output_text.delta" for t in ws.sent_texts)
-    assert ws.close_calls[-1][0] == 1011
+    assert not ws.close_calls
     row = _last_request_log(m)
     assert row["status"] == "error"
     assert row["final_channel_key"] == "api:ws-upstream"
@@ -1030,7 +1616,7 @@ async def test_responses_ws_oauth_pending_visible_identity_restored_before_downs
     assert "raw-pck" in first_downstream["delta"]
     assert "turn-raw" in first_downstream["delta"]
     assert "003" not in first_downstream["delta"]  # guard against obvious isolated-session leakage
-    assert ws.close_calls[-1][0] == 1000
+    assert not ws.close_calls
 
 @pytest.mark.asyncio
 async def test_http_responses_uses_oauth_ws_when_enabled_non_stream(monkeypatch, m):
@@ -1109,19 +1695,63 @@ async def test_http_responses_oauth_ws_stream_converts_frames_to_sse(monkeypatch
     monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)
     monkeypatch.setattr(m["failover"], "_connect_oauth_responses_ws", fake_connect)
     body = {"model": "test-model", "stream": True, "input": "hello", "prompt_cache_key": "anchor"}
-    resp, rid = await _call_failover_responses(m, ch, body)
+    stable_fp = "stable-oauth-ws-complete"
+    old_owner = "oauth:old-owner"
+    m["affinity"].upsert(stable_fp, old_owner, "test-model")
+    resp, rid = await _call_failover_responses(
+        m, ch, body, fp_query=stable_fp, bound_channel_key=old_owner,
+    )
     assert resp.status_code == 200
+    assert m["affinity"].get(stable_fp)["channel_key"] == old_owner
     text = b"".join([c async for c in resp.body_iterator]).decode("utf-8")
     assert "event: response.created" in text
     assert "event: response.output_text.delta" in text
     assert '"delta":"ok"' in text or '"delta": "ok"' in text
     assert "event: response.completed" in text
     assert fake_ws.closed is True
+    assert m["affinity"].get(stable_fp)["channel_key"] == ch.key
     row = m["log_db"].log_detail(rid)["log"]
     assert row["status"] == "success"
     assert row["http_status"] == 200
     assert row["upstream_protocol"] == "openai-responses"
     assert row["upstream_transport"] == "ws"
+
+
+@pytest.mark.asyncio
+async def test_http_responses_oauth_ws_truncation_does_not_rebind(monkeypatch, m):
+    cfg = _setup(m)
+    cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
+    cfg.setdefault("oauth", {})["providers"] = {"openai": {"isolateSessionId": True, "forceCodexCLI": True}}
+    ch = _make_oauth_channel_for_failover(m, name="truncated@example.com")
+
+    async def fake_token(account_key):
+        return "tok"
+
+    fake_ws = FakeOAuthHttpStreamWs([
+        {"type": "response.created", "response": {"id": "resp_truncated"}},
+        {"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": "partial"},
+    ])
+
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
+        return fake_ws
+
+    monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)
+    monkeypatch.setattr(m["failover"], "_connect_oauth_responses_ws", fake_connect)
+    stable_fp = "stable-oauth-ws-truncated"
+    old_owner = "oauth:old-owner"
+    m["affinity"].upsert(stable_fp, old_owner, "test-model")
+    body = {"model": "test-model", "stream": True, "input": "hello", "prompt_cache_key": "anchor"}
+    resp, rid = await _call_failover_responses(
+        m, ch, body, fp_query=stable_fp, bound_channel_key=old_owner,
+    )
+    assert resp.status_code == 200
+    assert m["affinity"].get(stable_fp)["channel_key"] == old_owner
+
+    text = b"".join([c async for c in resp.body_iterator]).decode("utf-8")
+    assert "event: response.output_text.delta" in text
+    assert "upstream websocket closed" in text
+    assert m["affinity"].get(stable_fp)["channel_key"] == old_owner
+    assert m["log_db"].log_detail(rid)["log"]["status"] == "error"
 
 
 @pytest.mark.asyncio
@@ -1136,6 +1766,7 @@ async def test_http_responses_oauth_ws_invalid_replay_clears_scope_and_retries(m
         "test-model",
         "prompt-cache:anchor",
         [{"type": "reasoning", "encrypted_content": encrypted_content}],
+        account_key=ch.account_key,
     )
 
     async def fake_token(account_key):
@@ -1171,7 +1802,7 @@ async def test_http_responses_oauth_ws_invalid_replay_clears_scope_and_retries(m
 
     assert resp.status_code == 200
     assert json.loads(resp.body)["output"][0]["content"][0]["text"] == "ok"
-    assert rr.get("test-model", "prompt-cache:anchor") == []
+    assert rr.get("test-model", "prompt-cache:anchor", account_key=ch.account_key) == []
     assert attempts == []
 
     first_payload = json.loads(bad_ws.sent[0])
@@ -1199,6 +1830,7 @@ async def test_http_responses_oauth_ws_invalid_replay_clears_scope_and_retries(m
     assert detail["log"]["status"] == "success", detail["log"]
     assert detail["log"]["final_channel_key"] == ch.key
     assert [item["outcome"] for item in detail["retry_chain"]] == ["request_invalid", "success"]
+    assert all(item["dispatched_at"] is not None for item in detail["retry_chain"])
     assert m["cooldown"].get_state(ch.key, "test-model") is None
 
 
@@ -1327,6 +1959,9 @@ def test_failover_ss2022_cleanup_closes_socketpair_when_ws_connect_fails(monkeyp
 async def test_http_responses_oauth_ws_pre_visible_error_fails_over_to_http_channel(monkeypatch, m):
     cfg = _setup(m)
     cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
+    # This case isolates cross-transport candidate failover; transient same-candidate
+    # retry behavior has dedicated coverage in test_protocol_fake_upstreams.py.
+    cfg["retry"] = {"transient": {"enabled": False}}
     cfg.setdefault("oauth", {})["providers"] = {"openai": {"isolateSessionId": True, "forceCodexCLI": True}}
     oauth_ch = _make_oauth_channel_for_failover(m, name="failover@example.com")
     api_ch = m["OpenAIApiChannel"]({
@@ -1459,6 +2094,888 @@ async def test_http_responses_oauth_ws_consumes_codex_rate_limits_event(monkeypa
     row = m["state_db"].quota_load(ch.account_key)
     assert row["codex_primary_used_pct"] == 42.5
     assert m["log_db"].log_detail(rid)["log"]["upstream_transport"] == "ws"
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_pre_visible_context_error_preserves_explicit_zero_usage(
+    monkeypatch, m,
+):
+    cfg = _setup(m)
+    cfg["retry"] = {"transient": {"enabled": False}}
+    _make_channel(m)
+    ws = FakeWebSocket({
+        "type": "response.create", "model": "test-model",
+        "input": "hello", "stream": True,
+    })
+    fake_upstream = FakeUpstreamWebSocket([
+        {"type": "response.created", "response": {"id": "resp_zero"}},
+        {"type": "response.incomplete", "response": {
+            "id": "resp_zero",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [],
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }},
+    ])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_upstream
+
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+
+    row = _last_request_log(m)
+    assert row["status"] == "error"
+    assert row["http_status"] == 400
+    assert ws.close_calls[-1][0] == 4400
+    detail = m["log_db"].log_detail(row["request_id"])
+    assert "response.incomplete" in (detail["detail"].get("response_body") or "")
+    attempts = _attempt_usage(m, row["request_id"])
+    assert len(attempts) == 1
+    assert attempts[0]["outcome"] == "request_invalid"
+    assert attempts[0]["usage_observed"] == 1
+    assert attempts[0]["input_tokens"] == attempts[0]["output_tokens"] == 0
+
+
+@pytest.mark.parametrize("usage", [
+    {"input_tokens": -1, "output_tokens": 2},
+    {"input_tokens": "bad", "output_tokens": 2},
+    {"input_tokens": 1 << 70, "output_tokens": 2},
+])
+@pytest.mark.asyncio
+async def test_responses_ws_malformed_usage_is_not_logged_as_valid_tokens(
+    monkeypatch, m, usage,
+):
+    _setup(m)
+    _make_channel(m)
+    ws = FakeWebSocket({
+        "type": "response.create", "model": "test-model",
+        "input": "hello", "stream": True,
+    })
+    fake_upstream = FakeUpstreamWebSocket([
+        {"type": "response.output_text.delta", "output_index": 0,
+         "content_index": 0, "delta": "ok"},
+        {"type": "response.completed", "response": {
+            "id": "resp_bad_usage", "output": [], "usage": usage,
+        }},
+    ])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_upstream
+
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+
+    row = _last_request_log(m)
+    assert row["status"] == "success"
+    assert row["usage_observed"] == 0
+    assert row["input_tokens"] == row["output_tokens"] == 0
+    attempts = _attempt_usage(m, row["request_id"])
+    assert len(attempts) == 1
+    assert attempts[0]["usage_observed"] == 0
+    assert attempts[0]["cost_source"] == "unpriced"
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_large_terminal_frame_keeps_billing_evidence(
+    monkeypatch, m,
+):
+    cfg = _setup(m)
+    ch = _make_channel(m)
+    cfg["pricing"] = {
+        "enabled": True,
+        "channelProviders": {ch.key: "xai"},
+    }
+    cfg["modelBindings"] = {
+        "defaults": {},
+        "scoped": {
+            ch.key: {
+                "test-model": {
+                    "target": "xai/grok-4.5",
+                    "outboundModel": "real-model",
+                    "source": "test",
+                },
+            },
+        },
+    }
+    ws = FakeWebSocket({
+        "type": "response.create", "model": "test-model",
+        "input": "hello", "stream": True,
+    })
+    huge_text = "x" * 210_000
+    fake_upstream = FakeUpstreamWebSocket([
+        {"type": "response.output_text.delta", "output_index": 0,
+         "content_index": 0, "delta": "ok"},
+        {"type": "response.completed", "response": {
+            "id": "resp_large_zero",
+            # Billing fields deliberately precede a huge output so a naive tail
+            # slice would remove them from the persisted response body.
+            "service_tier": "priority",
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cost_in_usd_ticks": 4321,
+            },
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": huge_text}],
+            }],
+        }},
+    ])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_upstream
+
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+
+    row = _last_request_log(m)
+    assert row["status"] == "success"
+    assert row["usage_observed"] == 1
+    assert row["actual_service_tier"] == "priority"
+    detail_body = m["log_db"].log_detail(row["request_id"])["detail"]["response_body"]
+    assert len(detail_body) == 200_000
+    assert not detail_body.startswith("{")
+    assert "_parrot_truncated_billing_evidence" in detail_body
+    attempts = _attempt_usage(m, row["request_id"])
+    assert len(attempts) == 1
+    assert attempts[0]["usage_observed"] == 1
+    assert attempts[0]["input_tokens"] == attempts[0]["output_tokens"] == 0
+    assert attempts[0]["service_tier"] == "priority"
+    assert attempts[0]["cost_source"] == "actual"
+    assert attempts[0]["cost_ticks"] == 4321
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_rejects_overlapping_create_without_stopping_active_turn(
+    monkeypatch, m,
+):
+    _setup(m)
+    _make_channel(m)
+    second_create = {
+        "type": "response.create", "model": "test-model",
+        "input": "second", "stream": True,
+    }
+    ws = FakeWebSocket(
+        {
+            "type": "response.create", "model": "test-model",
+            "input": "first", "stream": True,
+        },
+        extra_receive=[{
+            "type": "websocket.receive", "text": json.dumps(second_create),
+        }],
+    )
+
+    class BlockingUpstream:
+        def __init__(self):
+            self.sent: list[str] = []
+            self.response = SimpleNamespace(headers={})
+            self._recv_count = 0
+
+        async def send(self, data, text=None):
+            del text
+            if isinstance(data, bytes):
+                data = data.decode("utf-8")
+            self.sent.append(data)
+
+        async def recv(self):
+            if self._recv_count == 0:
+                self._recv_count += 1
+                return json.dumps({
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "partial",
+                })
+            await asyncio.sleep(0.01)
+            return json.dumps({
+                "type": "response.completed",
+                "response": {
+                    "id": "first-completes", "output": [],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            })
+
+        async def close(self, *args, **kwargs):
+            return None
+
+    fake_upstream = BlockingUpstream()
+
+    async def fake_connect(*args, **kwargs):
+        return fake_upstream
+
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+
+    assert len(fake_upstream.sent) == 1
+    assert json.loads(fake_upstream.sent[0])["input"] == "first"
+    assert any(
+        json.loads(text).get("code") == "invalid_request_error"
+        for text in ws.sent_texts
+    )
+    assert not ws.close_calls
+    row = _last_request_log(m)
+    assert row["status"] == "success"
+    assert len(_retry_chain(m, row["request_id"])) == 1
+    attempts = _attempt_usage(m, row["request_id"])
+    assert len(attempts) == 1
+    assert attempts[0]["outcome"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_accepts_sequential_creates_with_one_ledger_row_each(
+    monkeypatch, m,
+):
+    _setup(m)
+    _make_channel(m)
+    conn = m["log_db"]._get_conn()
+    request_id_before = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM request_log"
+    ).fetchone()[0]
+    retry_id_before = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM retry_chain"
+    ).fetchone()[0]
+    attempt_id_before = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM upstream_attempt_usage"
+    ).fetchone()[0]
+    overall_before = m["log_db"].stats_summary(
+        0, summary_top_limit=0
+    )["overall"]
+    ws = SequentialFakeWebSocket(
+        {
+            "type": "response.create", "model": "test-model",
+            "input": "first", "stream": True,
+        },
+        {
+            "type": "response.create", "model": "test-model",
+            "previous_response_id": "resp_first",
+            "input": "second", "stream": True,
+        },
+    )
+    fake_upstream = FakeUpstreamWebSocket([
+        {"type": "response.created", "response": {"id": "resp_first"}},
+        {"type": "response.output_text.delta", "output_index": 0,
+         "content_index": 0, "delta": "one"},
+        {"type": "response.completed", "response": {
+            "id": "resp_first", "output": [],
+            "usage": {"input_tokens": 3, "output_tokens": 2},
+        }},
+        {"type": "response.created", "response": {"id": "resp_second"}},
+        {"type": "response.output_text.delta", "output_index": 0,
+         "content_index": 0, "delta": "two"},
+        {"type": "response.completed", "response": {
+            "id": "resp_second", "output": [],
+            "usage": {"input_tokens": 5, "output_tokens": 4},
+        }},
+    ])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_upstream
+
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+
+    assert len(fake_upstream.sent) == 2
+    first_wire, second_wire = map(json.loads, fake_upstream.sent)
+    assert first_wire["model"] == second_wire["model"] == "real-model"
+    assert second_wire["previous_response_id"] == "resp_first"
+    rows = conn.execute(
+        "SELECT * FROM request_log WHERE id>? ORDER BY id",
+        (request_id_before,),
+    ).fetchall()
+    chain = conn.execute(
+        "SELECT * FROM retry_chain WHERE id>? ORDER BY id",
+        (retry_id_before,),
+    ).fetchall()
+    attempts = conn.execute(
+        "SELECT * FROM upstream_attempt_usage WHERE id>? ORDER BY id",
+        (attempt_id_before,),
+    ).fetchall()
+    assert len(rows) == len(chain) == len(attempts) == 2
+    assert [row["status"] for row in rows] == ["success", "success"]
+    assert [
+        (row["input_tokens"], row["output_tokens"]) for row in rows
+    ] == [(3, 2), (5, 4)]
+    assert [a["outcome"] for a in attempts] == ["success", "success"]
+    assert [a["upstream_protocol"] for a in attempts] == [
+        "openai-responses", "openai-responses",
+    ]
+    assert [
+        (a["input_tokens"], a["output_tokens"]) for a in attempts
+    ] == [(3, 2), (5, 4)]
+    overall = m["log_db"].stats_summary(0, summary_top_limit=0)["overall"]
+    assert overall["total"] - overall_before["total"] == 2
+    assert (
+        overall["total_input_tokens"] - overall_before["total_input_tokens"],
+        overall["total_output_tokens"] - overall_before["total_output_tokens"],
+    ) == (8, 6)
+    assert not ws.close_calls
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_releases_capacity_while_waiting_between_turns(
+    monkeypatch, m,
+):
+    cfg = _setup(m)
+    cfg["apiKeyConcurrency"] = {
+        "enabled": True,
+        "defaultMaxConcurrent": 1,
+        "defaultMaxQueue": 0,
+        "defaultQueueWaitSeconds": 0,
+    }
+    cfg["concurrency"].update({
+        "enabled": True,
+        "defaultMaxConcurrent": 1,
+        "queueWaitSeconds": 1,
+    })
+    ch = _make_channel(m, extra={"maxConcurrent": 1})
+    ws = IdleBetweenTurnsFakeWebSocket({
+        "type": "response.create", "model": "test-model",
+        "input": "first", "stream": True,
+    })
+    fake_upstream = FakeUpstreamWebSocket([
+        {"type": "response.completed", "response": {
+            "id": "resp_first", "output": [],
+            "usage": {"input_tokens": 3, "output_tokens": 2},
+        }},
+    ])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_upstream
+
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    handler_task = asyncio.create_task(
+        m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+    )
+    try:
+        await asyncio.wait_for(ws.waiting_between_turns.wait(), timeout=2)
+        assert not handler_task.done()
+        assert m["apikey_limiter"].key_snapshot("ws-key")["in_flight"] == 0
+        channel_rows = {
+            row["channel_key"]: row
+            for row in m["concurrency"].snapshot()
+        }
+        assert channel_rows[ch.key]["in_flight"] == 0
+    finally:
+        ws.disconnect_between_turns.set()
+        await asyncio.wait_for(handler_task, timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_translates_and_reacquires_capacity_for_each_turn(
+    monkeypatch, m,
+):
+    _setup(m)
+    ch = _make_channel(m)
+    translated_inputs: list[str] = []
+    api_key_acquires: list[str] = []
+    channel_acquires: list[str] = []
+
+    original_api_key_acquire = m["apikey_limiter"].acquire
+    original_channel_try_acquire = m["concurrency"].try_acquire
+
+    async def tracked_api_key_acquire(key_name, *args, **kwargs):
+        api_key_acquires.append(str(key_name or ""))
+        return await original_api_key_acquire(key_name, *args, **kwargs)
+
+    async def tracked_channel_try_acquire(channel_key):
+        channel_acquires.append(channel_key)
+        return await original_channel_try_acquire(channel_key)
+
+    async def fake_translate(body, *, ingress_protocol, route=None):
+        assert ingress_protocol == "responses"
+        translated_inputs.append(body["input"])
+        translated = dict(body)
+        translated["input"] = f"translated:{body['input']}"
+        return translated
+
+    monkeypatch.setattr(
+        m["responses_ws"].apikey_limiter, "acquire", tracked_api_key_acquire,
+    )
+    monkeypatch.setattr(
+        m["responses_ws"].concurrency, "try_acquire", tracked_channel_try_acquire,
+    )
+    monkeypatch.setattr(
+        m["responses_ws"].translation, "translate_body", fake_translate,
+    )
+
+    ws = SequentialFakeWebSocket(
+        {
+            "type": "response.create", "model": "test-model",
+            "input": "first", "stream": True,
+        },
+        {
+            "type": "response.create", "model": "test-model",
+            "input": "second", "stream": True,
+        },
+    )
+    fake_upstream = FakeUpstreamWebSocket([
+        {"type": "response.completed", "response": {
+            "id": "resp_first", "output": [],
+            "usage": {"input_tokens": 2, "output_tokens": 1},
+        }},
+        {"type": "response.completed", "response": {
+            "id": "resp_second", "output": [],
+            "usage": {"input_tokens": 3, "output_tokens": 1},
+        }},
+    ])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_upstream
+
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+
+    assert translated_inputs == ["first", "second"]
+    assert [json.loads(payload)["input"] for payload in fake_upstream.sent] == [
+        "translated:first", "translated:second",
+    ]
+    assert api_key_acquires == ["ws-key", "ws-key"]
+    assert channel_acquires == [ch.key, ch.key]
+    assert m["apikey_limiter"].key_snapshot("ws-key")["in_flight"] == 0
+    channel_rows = {
+        row["channel_key"]: row for row in m["concurrency"].snapshot()
+    }
+    assert channel_rows[ch.key]["in_flight"] == 0
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_sequential_turn_can_change_to_supported_model(
+    monkeypatch, m,
+):
+    cfg = _setup(m)
+    cfg["apiKeys"]["ws-key"]["allowedModels"].append("other-model")
+    _make_channel(m, extra={"models": [
+        {"alias": "test-model", "real": "real-model"},
+        {"alias": "other-model", "real": "other-real-model"},
+    ]})
+    conn = m["log_db"]._get_conn()
+    request_id_before = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM request_log"
+    ).fetchone()[0]
+    retry_id_before = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM retry_chain"
+    ).fetchone()[0]
+    ws = SequentialFakeWebSocket(
+        {
+            "type": "response.create", "model": "test-model",
+            "input": "first", "stream": True,
+        },
+        {
+            "type": "response.create", "model": "other-model",
+            "input": "second", "stream": True,
+        },
+    )
+    fake_upstream = FakeUpstreamWebSocket([
+        {"type": "response.completed", "response": {
+            "id": "resp_first", "output": [],
+            "usage": {"input_tokens": 2, "output_tokens": 1},
+        }},
+        {"type": "response.completed", "response": {
+            "id": "resp_second", "output": [],
+            "usage": {"input_tokens": 3, "output_tokens": 1},
+        }},
+    ])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_upstream
+
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+
+    assert [json.loads(payload)["model"] for payload in fake_upstream.sent] == [
+        "real-model", "other-real-model",
+    ]
+    rows = conn.execute(
+        "SELECT requested_model, final_model FROM request_log "
+        "WHERE id>? ORDER BY id",
+        (request_id_before,),
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        ("test-model", "real-model"),
+        ("other-model", "other-real-model"),
+    ]
+    retry_rows = conn.execute(
+        "SELECT model, client_visible_model FROM retry_chain "
+        "WHERE id>? ORDER BY id",
+        (retry_id_before,),
+    ).fetchall()
+    assert [tuple(row) for row in retry_rows] == [
+        ("real-model", "test-model"),
+        ("other-real-model", "other-model"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_failed_turn_can_continue_sequentially(
+    monkeypatch, m,
+):
+    _setup(m)
+    _make_channel(m)
+    conn = m["log_db"]._get_conn()
+    request_id_before = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM request_log"
+    ).fetchone()[0]
+    attempt_id_before = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM upstream_attempt_usage"
+    ).fetchone()[0]
+    ws = SequentialFakeWebSocket(
+        {
+            "type": "response.create", "model": "test-model",
+            "input": "first", "stream": True,
+        },
+        {
+            "type": "response.create", "model": "test-model",
+            "input": "recover", "stream": True,
+        },
+    )
+    fake_upstream = FakeUpstreamWebSocket([
+        {"type": "response.failed", "response": {
+            "id": "resp_failed",
+            "error": {"code": "server_error", "message": "turn failed"},
+            "usage": {"input_tokens": 2, "output_tokens": 0},
+        }},
+        {"type": "response.completed", "response": {
+            "id": "resp_recovered", "output": [],
+            "usage": {"input_tokens": 3, "output_tokens": 1},
+        }},
+    ])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_upstream
+
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+
+    rows = conn.execute(
+        "SELECT * FROM request_log WHERE id>? ORDER BY id",
+        (request_id_before,),
+    ).fetchall()
+    attempts = conn.execute(
+        "SELECT * FROM upstream_attempt_usage WHERE id>? ORDER BY id",
+        (attempt_id_before,),
+    ).fetchall()
+    assert [row["status"] for row in rows] == ["error", "success"]
+    assert len(fake_upstream.sent) == len(attempts) == 2
+    assert [a["outcome"] for a in attempts] == [
+        "stream_upstream_error", "success",
+    ]
+    assert [
+        (a["input_tokens"], a["output_tokens"]) for a in attempts
+    ] == [(2, 0), (3, 1)]
+    assert not ws.close_calls
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_previsible_metadata_buffer_is_bounded(m):
+    _setup(m)
+    from src.transports.ws_runtime import (
+        read_until_first_responses_ws_visible_event,
+    )
+
+    upstream = FakeUpstreamWebSocket([
+        {"type": "response.created", "response": {"id": f"r-{idx}"}}
+        for idx in range(1_025)
+    ])
+    result = await read_until_first_responses_ws_visible_event(
+        upstream,
+        m["responses_ws"]._WsTracker(),
+        channel_key="api:ws-upstream",
+        deadline_ts=0,
+        first_wait=5,
+        idle_timeout=5,
+    )
+
+    assert result.outcome == "transport_error"
+    assert result.http_status == 502
+    assert result.error_detail == "pre-visible websocket buffer limit exceeded"
+    assert result.pending == []
+
+
+@pytest.mark.asyncio
+async def test_http_responses_oauth_ws_non_stream_close_before_terminal_is_error(
+    monkeypatch, m,
+):
+    cfg = _setup(m)
+    cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
+    ch = _make_oauth_channel_for_failover(m, name="non-stream-close@example.com")
+
+    async def fake_token(account_key):
+        return "tok"
+
+    fake_ws = FakeOAuthHttpWs([
+        {"type": "response.created", "response": {"id": "resp_truncated"}},
+        {"type": "response.output_text.delta", "output_index": 0,
+         "content_index": 0, "delta": "partial"},
+    ])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_ws
+
+    monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)
+    monkeypatch.setattr(m["failover"], "_connect_oauth_responses_ws", fake_connect)
+    resp, rid = await _call_failover_responses(
+        m, ch, {"model": "test-model", "stream": False, "input": "hello"},
+    )
+
+    assert resp.status_code == 503
+    detail = m["log_db"].log_detail(rid)
+    assert detail["log"]["status"] == "error"
+    assert "partial" in (detail["detail"].get("response_body") or "")
+    attempts = _attempt_usage(m, rid)
+    assert len(attempts) == 1
+    assert attempts[0]["outcome"] == "upstream_closed"
+    assert attempts[0]["usage_observed"] == 0
+    assert attempts[0]["cost_source"] == "unpriced"
+
+
+@pytest.mark.asyncio
+async def test_http_responses_oauth_ws_non_stream_failed_returns_http_error(
+    monkeypatch, m,
+):
+    cfg = _setup(m)
+    cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
+    cfg["retry"] = {"transient": {"enabled": False}}
+    ch = _make_oauth_channel_for_failover(m, name="non-stream-failed@example.com")
+
+    async def fake_token(account_key):
+        return "tok"
+
+    fake_ws = FakeOAuthHttpWs([{
+        "type": "response.failed",
+        "response": {
+            "id": "resp_non_stream_failed",
+            "error": {"code": "server_error", "message": "failed terminal"},
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        },
+    }])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_ws
+
+    monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)
+    monkeypatch.setattr(m["failover"], "_connect_oauth_responses_ws", fake_connect)
+    resp, rid = await _call_failover_responses(
+        m, ch, {"model": "test-model", "stream": False, "input": "hello"},
+    )
+
+    assert resp is not None
+    assert resp.status_code == 503
+    detail = m["log_db"].log_detail(rid)
+    assert detail["log"]["status"] == "error"
+    assert "failed terminal" in detail["log"]["error_message"]
+    assert "response.failed" in (detail["detail"].get("response_body") or "")
+    attempts = _attempt_usage(m, rid)
+    assert len(attempts) == 1
+    assert attempts[0]["outcome"] == "stream_upstream_error"
+    assert attempts[0]["usage_observed"] == 1
+    assert attempts[0]["input_tokens"] == attempts[0]["output_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_http_responses_oauth_ws_success_without_usage_does_not_fabricate_zero(
+    monkeypatch, m,
+):
+    cfg = _setup(m)
+    cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
+    ch = _make_oauth_channel_for_failover(m, name="missing-usage@example.com")
+
+    async def fake_token(account_key):
+        return "tok"
+
+    fake_ws = FakeOAuthHttpWs([
+        {"type": "response.output_text.delta", "output_index": 0,
+         "content_index": 0, "delta": "ok"},
+        {"type": "response.completed", "response": {
+            "id": "resp_missing_usage", "output": [],
+        }},
+    ])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_ws
+
+    monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)
+    monkeypatch.setattr(m["failover"], "_connect_oauth_responses_ws", fake_connect)
+    resp, rid = await _call_failover_responses(
+        m, ch, {"model": "test-model", "stream": False, "input": "hello"},
+    )
+
+    assert resp.status_code == 200
+    assert "usage" not in json.loads(resp.body)
+    detail = m["log_db"].log_detail(rid)
+    assert detail["log"]["status"] == "success"
+    assert detail["log"]["usage_observed"] == 0
+    attempts = _attempt_usage(m, rid)
+    assert len(attempts) == 1
+    assert attempts[0]["usage_observed"] == 0
+    assert attempts[0]["cost_source"] == "unpriced"
+
+
+def test_oauth_ws_tracker_large_frame_keeps_actual_cost_evidence(m):
+    tracker = m["failover"]._WsResponsesTracker()
+    tracker.feed_text(json.dumps({
+        "type": "response.failed",
+        "response": {
+            "service_tier": "priority",
+            "usage": {
+                "input_tokens": 7,
+                "output_tokens": 2,
+                "input_tokens_details": {"cached_tokens": 3},
+                "cost_in_usd_ticks": 9876,
+            },
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "x" * 210_000}],
+            }],
+        },
+    }))
+
+    body = tracker.get_full_response()
+    normalized = m["failover"].model_pricing.normalize_response_billing(body)
+    assert len(body) == 200_000
+    assert "_parrot_truncated_billing_evidence" in body
+    assert normalized.usage_observed is True
+    assert normalized.input_tokens == 4
+    assert normalized.cache_read_tokens == 3
+    assert normalized.output_tokens == 2
+    assert normalized.service_tier == "priority"
+    assert normalized.actual_cost_ticks == 9876
+
+
+@pytest.mark.asyncio
+async def test_http_responses_oauth_ws_large_terminal_keeps_observed_zero_usage(
+    monkeypatch, m,
+):
+    cfg = _setup(m)
+    cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
+    ch = _make_oauth_channel_for_failover(m, name="large-zero@example.com")
+
+    async def fake_token(account_key):
+        return "tok"
+
+    huge_text = "x" * 210_000
+    fake_ws = FakeOAuthHttpWs([
+        {"type": "response.output_text.delta", "output_index": 0,
+         "content_index": 0, "delta": "ok"},
+        {"type": "response.completed", "response": {
+            "id": "resp_oauth_large_zero",
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": huge_text}],
+            }],
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }},
+    ])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_ws
+
+    monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)
+    monkeypatch.setattr(m["failover"], "_connect_oauth_responses_ws", fake_connect)
+    resp, rid = await _call_failover_responses(
+        m, ch, {"model": "test-model", "stream": False, "input": "hello"},
+    )
+
+    assert resp.status_code == 200
+    detail = m["log_db"].log_detail(rid)
+    assert detail["log"]["status"] == "success"
+    assert detail["log"]["usage_observed"] == 1
+    assert len(detail["detail"]["response_body"]) == 200_000
+    attempts = _attempt_usage(m, rid)
+    assert len(attempts) == 1
+    assert attempts[0]["usage_observed"] == 1
+    assert attempts[0]["input_tokens"] == attempts[0]["output_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_http_responses_oauth_ws_cancellation_preserves_partial_usage_and_body(
+    monkeypatch, m,
+):
+    cfg = _setup(m)
+    cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
+    ch = _make_oauth_channel_for_failover(m, name="cancel-partial@example.com")
+
+    async def fake_token(account_key):
+        return "tok"
+
+    fake_ws = BlockingAfterEventsWebSocket([{
+        "type": "response.in_progress",
+        "response": {
+            "id": "oauth_cancel_partial",
+            "usage": {
+                "input_tokens": 7,
+                "output_tokens": 2,
+                "input_tokens_details": {"cached_tokens": 3},
+            },
+        },
+    }])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_ws
+
+    monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)
+    monkeypatch.setattr(m["failover"], "_connect_oauth_responses_ws", fake_connect)
+    task = asyncio.create_task(_call_failover_responses(
+        m, ch, {"model": "test-model", "stream": False, "input": "hello"},
+    ))
+    await asyncio.wait_for(fake_ws.waiting.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    row = _last_request_log(m)
+    assert row["status"] == "cancelled"
+    assert row["usage_observed"] == 1
+    detail = m["log_db"].log_detail(row["request_id"])
+    assert "response.in_progress" in detail["detail"]["response_body"]
+    attempts = _attempt_usage(m, row["request_id"])
+    assert len(attempts) == 1
+    assert attempts[0]["usage_observed"] == 1
+    assert attempts[0]["input_tokens"] == 4
+    assert attempts[0]["cache_read_tokens"] == 3
+    assert attempts[0]["output_tokens"] == 2
+
+
+@pytest.mark.asyncio
+async def test_http_responses_oauth_ws_pre_visible_context_error_keeps_zero_usage(
+    monkeypatch, m,
+):
+    cfg = _setup(m)
+    cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
+    cfg["retry"] = {"transient": {"enabled": False}}
+    ch = _make_oauth_channel_for_failover(m, name="zero-context@example.com")
+
+    async def fake_token(account_key):
+        return "tok"
+
+    fake_ws = FakeOAuthHttpWs([
+        {"type": "response.created", "response": {"id": "resp_zero_context"}},
+        {"type": "response.incomplete", "response": {
+            "id": "resp_zero_context",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [],
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }},
+    ])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_ws
+
+    monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)
+    monkeypatch.setattr(m["failover"], "_connect_oauth_responses_ws", fake_connect)
+    resp, rid = await _call_failover_responses(
+        m, ch, {"model": "test-model", "stream": False, "input": "hello"},
+    )
+
+    assert resp.status_code == 400
+    detail = m["log_db"].log_detail(rid)
+    assert detail["log"]["status"] == "error"
+    assert "response.incomplete" in (detail["detail"].get("response_body") or "")
+    attempts = _attempt_usage(m, rid)
+    assert len(attempts) == 1
+    assert attempts[0]["usage_observed"] == 1
+    assert attempts[0]["input_tokens"] == attempts[0]["output_tokens"] == 0
 
 
 def test_responses_ws_uses_remote_dns_for_socks5(m):

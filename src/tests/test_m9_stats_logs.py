@@ -28,12 +28,12 @@ def _import_modules():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if root not in sys.path:
         sys.path.insert(0, root)
-    from src import config, log_db, state_db
-    from src.telegram import bot, states, ui
+    from src import config, log_db, oauth_manager, state_db
+    from src.telegram import bot, menu_cache, states, ui
     from src.telegram.menus import logs_menu, stats_menu, proxy_menu
     return {
-        "config": config, "log_db": log_db, "state_db": state_db,
-        "bot": bot, "states": states, "ui": ui,
+        "config": config, "log_db": log_db, "oauth_manager": oauth_manager, "state_db": state_db,
+        "bot": bot, "menu_cache": menu_cache, "states": states, "ui": ui,
         "logs_menu": logs_menu, "stats_menu": stats_menu, "proxy_menu": proxy_menu,
     }
 
@@ -45,8 +45,18 @@ class ApiRecorder:
         self.calls.append((method, dict(data) if data else {}))
         return {"ok": True, "result": {}}
     def by(self, m): return [d for mm, d in self.calls if mm == m]
-    def last(self, m):
-        l = self.by(m); return l[-1] if l else None
+    def last(self, method):
+        deadline = time.time() + 5
+        while True:
+            calls = self.by(method)
+            item = calls[-1] if calls else None
+            text = str((item or {}).get("text") or "")
+            loading = any(marker in text for marker in (
+                "正在加载，完成后", "统计正在加载", "统计加载中", "历史统计加载中",
+            ))
+            if not loading or time.time() >= deadline:
+                return item
+            time.sleep(0.01)
     def clear(self):
         self.calls.clear()
 
@@ -62,6 +72,23 @@ def _setup(m):
     conn.execute("DELETE FROM proxy_chain")
     conn.commit()
     def _cfg(c):
+        c.setdefault("pricing", {})["channelProviders"] = {
+            "api:a": "openai",
+            "api:b": "openai",
+            "api:ch": "openai",
+            "api:fast": "openai",
+            "api:openai": "openai",
+            "api:priced": "openai",
+            "api:anthropic-main": "anthropic",
+        }
+        c["modelBindings"] = {
+            "defaults": {
+                "gpt-5.6-sol": {"target": "openai/gpt-5.6-sol", "source": "test"},
+                "gpt-5.6-luna": {"target": "openai/gpt-5.6-luna", "source": "test"},
+                "claude-opus-4-6": {"target": "anthropic/claude-opus-4-6", "source": "test"},
+            },
+            "scoped": {},
+        }
         c["oauthAccounts"] = [{
             "provider": "openai",
             "email": "o@openai.test",
@@ -75,7 +102,20 @@ def _setup(m):
     m["states"].clear_all()
 
 
+def _seed_stats_snapshots(m) -> None:
+    """测试显式模拟中央预热及 3/7 天低频队列已完成。"""
+    stats = m["stats_menu"]
+    cache = m["menu_cache"]
+    for period in ("0", "3", "7", "month"):
+        since = stats._since_ts(period)
+        cache.PERIOD_STATS.store(
+            stats._period_cache_key(period, since),
+            m["log_db"].stats_period_snapshot(since),
+        )
+
+
 def _install_recorder(m):
+    _seed_stats_snapshots(m)
     rec = ApiRecorder()
     m["ui"].api = rec
     return rec
@@ -86,18 +126,21 @@ def _insert_success(
     input_tok=100, output_tok=20, cc=10, cr=50, retry_count=0, affinity_hit=0,
     connect_ms=150, first_token_ms=600, total_ms=3000, is_stream=True,
     ingress_protocol="anthropic", upstream_protocol=None, upstream_transport=None, http_status=200,
+    response_body='{"id":"x"}', fast_mode=None,
 ):
     ld = m["log_db"]
+    if upstream_protocol is None and str(model).startswith("gpt-5.6"):
+        upstream_protocol = "openai-responses"
     ld.insert_pending(request_id, "1.1.1.1", api_key, model, is_stream,
                      msg_count=3, tool_count=0, request_headers={}, request_body={},
-                     ingress_protocol=ingress_protocol)
+                     ingress_protocol=ingress_protocol, fast_mode=fast_mode)
     ld.finish_success(
         request_id, channel_key, channel_type, model,
         input_tokens=input_tok, output_tokens=output_tok,
         cache_creation_tokens=cc, cache_read_tokens=cr,
         connect_ms=connect_ms, first_token_ms=first_token_ms, total_ms=total_ms,
         retry_count=retry_count, affinity_hit=affinity_hit,
-        response_body='{"id":"x"}', http_status=http_status,
+        response_body=response_body, http_status=http_status,
         upstream_protocol=upstream_protocol, upstream_transport=upstream_transport,
     )
 
@@ -134,6 +177,43 @@ def test_fmt_helpers(m):
     assert ui.prompt_total(100, 10, 50) == 160
     assert ui.fmt_cache_phrase(50, 160) == "缓存 50 (31.2%)"
     assert ui.fmt_cache_phrase(51_700, 85_000) == "缓存 51.7K (60.8%)"
+    assert ui.fmt_usd(0.005) == "$0.01"
+    assert ui.fmt_usd(0.06, decimal_places=3) == "$0.060"
+    assert ui.fmt_cost({
+        "cost_ticks": 600_000_000,
+        "estimated_cost_ticks": 600_000_000,
+        "estimated_costed_success": 1,
+        "costed_success": 1,
+    }, show_source=False, decimal_places=3) == "$0.060"
+    assert ui.fmt_cost({
+        "cost_ticks": 123_450_000_000,
+        "costed_success": 1,
+        "unpriced_success": 0,
+    }) == "$12.35"
+    assert ui.fmt_cost({
+        "cost_ticks": 123_450_000_000,
+        "costed_success": 1,
+        "unpriced_success": 2,
+    }) == "$12.35"
+    assert ui.fmt_cost({
+        "cost_ticks": 123_450_000_000,
+        "estimated_cost_ticks": 123_450_000_000,
+        "estimated_costed_success": 1,
+        "costed_success": 1,
+    }) == "$12.35"
+    assert ui.fmt_cost({
+        "cost_ticks": 150_000_000_000,
+        "actual_cost_ticks": 50_000_000_000,
+        "estimated_cost_ticks": 100_000_000_000,
+        "actual_costed_success": 1,
+        "estimated_costed_success": 2,
+        "costed_success": 3,
+    }) == "$15.00"
+    assert "≈" not in ui.fmt_cost({
+        "cost_ticks": 123_450_000_000,
+        "estimated_cost_ticks": 123_450_000_000,
+        "costed_success": 1,
+    })
 
     assert ui.fmt_ms(250) == "250ms"
     assert ui.fmt_ms(1500) == "1.5s"
@@ -175,8 +255,471 @@ def test_stats_overall(m):
     # 亲和命中率（2/5 = 40%），缓存 token 率（1400/3250 = 43.1%）
     assert "40.0%" in text
     assert "缓存 1.4K (43.1%)" in text
+    assert "累计金额 " in text
+    assert " · 💵 " not in text
+    assert "≈" not in text
     assert "cache" not in text
     print("  [PASS] stats overall with counts + flags")
+
+
+def test_stats_cost_estimate_and_unknown_coverage(m):
+    _setup(m)
+    _insert_success(
+        m,
+        "cost-priced",
+        "k1",
+        "gpt-5.6-sol",
+        "api:OpenAI",
+        input_tok=1_000_000,
+        output_tok=1_000_000,
+        cc=1_000_000,
+        cr=1_000_000,
+    )
+    _insert_success(
+        m,
+        "cost-unknown",
+        "k2",
+        "private-unknown-model",
+        "api:Private",
+        input_tok=500,
+        output_tok=100,
+        cc=0,
+        cr=0,
+    )
+
+    result = m["log_db"].stats_summary(0)
+    overall = result["overall"]
+    assert overall["cost_ticks"] == int(68.5 * 10_000_000_000)
+    assert overall["estimated_cost_ticks"] == overall["cost_ticks"]
+    assert overall["actual_cost_ticks"] == 0
+    assert overall["costed_success"] == 1
+    assert overall["unpriced_success"] == 1
+
+    rec = _install_recorder(m)
+    m["stats_menu"].show(42, 100, "cb")
+    text = rec.last("editMessageText")["text"]
+    assert "累计金额 $68.500" in text
+    assert "账号/渠道类型:" not in text
+    assert "估算" not in text and "实际" not in text and "未计价" not in text
+    assert "↑ 3.0M · ↓ 1.0M · 💵" not in text
+    assert "Token: ↑ 3.0M · ↓ 1.0M · 缓存 1.0M (33.3%) · $68.500" in text
+    assert "\n  金额:" not in text
+    assert "≈" not in text
+
+
+def test_stats_prefers_xai_actual_cost_ticks(m):
+    _setup(m)
+    actual_ticks = 123_456_789
+    _insert_success(
+        m,
+        "cost-xai",
+        "k-xai",
+        "grok-private-model",
+        "oauth:xai:account",
+        channel_type="oauth",
+        input_tok=999,
+        output_tok=111,
+        cc=0,
+        cr=100,
+        response_body=json.dumps({"usage": {"cost_in_usd_ticks": actual_ticks}}),
+        ingress_protocol="responses",
+        upstream_protocol="openai-responses",
+    )
+
+    result = m["log_db"].stats_summary(0)
+    overall = result["overall"]
+    assert overall["cost_ticks"] == actual_ticks
+    assert overall["actual_cost_ticks"] == actual_ticks
+    assert overall["estimated_cost_ticks"] == 0
+    assert overall["costed_success"] == 1
+    assert overall["unpriced_success"] == 0
+    row = m["log_db"].recent_logs(limit=1)[0]
+    assert m["ui"].fmt_cost_from_row(row) == "$0.01"
+
+    rec = _install_recorder(m)
+    m["stats_menu"].show(42, 100, "cb")
+    text = rec.last("editMessageText")["text"]
+    assert "$0.01" in text
+    assert "≈" not in text
+
+
+def test_stats_ui_combines_actual_and_estimated_cost(m):
+    _setup(m)
+    _insert_success(
+        m,
+        "cost-estimated-half",
+        "k-est",
+        "gpt-5.6-sol",
+        "api:OpenAI",
+        input_tok=100_000,
+        output_tok=0,
+        cc=0,
+        cr=0,
+    )
+    _insert_success(
+        m,
+        "cost-actual-half",
+        "k-xai",
+        "grok-private-model",
+        "oauth:xai:account",
+        channel_type="oauth",
+        input_tok=1,
+        output_tok=1,
+        cc=0,
+        cr=0,
+        response_body=json.dumps({"usage": {"cost_in_usd_ticks": 5_000_000_000}}),
+        upstream_protocol="xai-responses",
+    )
+    overall = m["log_db"].stats_summary(0)["overall"]
+    assert overall["cost_ticks"] == 10_000_000_000
+    assert overall["actual_costed_success"] == 1
+    assert overall["estimated_costed_success"] == 1
+    assert m["ui"].fmt_cost(overall) == "$1.00"
+
+
+def test_stats_downstream_fast_intent_does_not_invent_priority_pricing(m):
+    _setup(m)
+    _insert_success(
+        m,
+        "cost-priority",
+        "k1",
+        "gpt-5.6-luna",
+        "api:OpenAI",
+        input_tok=100_000,
+        output_tok=100_000,
+        cc=0,
+        cr=0,
+        fast_mode=True,
+    )
+    result = m["log_db"].stats_summary(0)
+    assert result["overall"]["cost_ticks"] == int(0.7 * 10_000_000_000)
+
+
+def test_stats_classifies_long_context_per_request_before_sum(m):
+    _setup(m)
+    # Two 150k requests remain short even though their aggregate exceeds 272k.
+    for idx in range(2):
+        _insert_success(
+            m,
+            f"cost-short-{idx}",
+            "k1",
+            "gpt-5.6-sol",
+            "api:OpenAI",
+            input_tok=150_000,
+            output_tok=0,
+            cc=0,
+            cr=0,
+        )
+    _insert_success(
+        m,
+        "cost-long",
+        "k1",
+        "gpt-5.6-sol",
+        "api:OpenAI",
+        input_tok=300_000,
+        output_tok=0,
+        cc=0,
+        cr=0,
+    )
+    result = m["log_db"].stats_summary(0)
+    # 2 × (150k × $5/M) + (300k × $10/M) = $4.50.
+    assert result["overall"]["cost_ticks"] == int(4.5 * 10_000_000_000)
+    assert result["overall"]["costed_success"] == 3
+
+
+def test_ambiguous_legacy_cached_usage_is_explicitly_unpriced(m):
+    _setup(m)
+    _insert_success(
+        m,
+        "legacy-cache-semantics",
+        "k1",
+        "gpt-5.6-sol",
+        "api:OpenAI",
+        input_tok=100_000,
+        output_tok=10_000,
+        cc=0,
+        cr=80_000,
+        upstream_protocol="",
+    )
+    # Reproduce a pre-usage_observed row. New rows explicitly record that
+    # input_tokens already excludes cache_read_tokens.
+    m["log_db"]._get_conn().execute(
+        "UPDATE request_log SET usage_observed=NULL WHERE request_id=?",
+        ("legacy-cache-semantics",),
+    )
+    m["log_db"]._get_conn().commit()
+    result = m["log_db"].stats_summary(0)
+    assert result["overall"]["costed_success"] == 0
+    assert result["overall"]["unpriced_success"] == 1
+    row = m["log_db"].recent_logs(limit=1)[0]
+    assert m["ui"].fmt_cost_from_row(row) == "$0.00"
+
+
+def test_ambiguous_anthropic_cache_write_ttl_does_not_hide_other_costs(m):
+    _setup(m)
+    _insert_success(
+        m,
+        "claude-no-write",
+        "k1",
+        "claude-opus-4-6",
+        "oauth:anthropic:test",
+        input_tok=1_000,
+        output_tok=100,
+        cc=0,
+        cr=0,
+        upstream_protocol="anthropic",
+    )
+    _insert_success(
+        m,
+        "claude-unknown-ttl",
+        "k1",
+        "claude-opus-4-6",
+        "oauth:anthropic:test",
+        input_tok=1_000,
+        output_tok=100,
+        cc=1_000,
+        cr=0,
+        upstream_protocol="anthropic",
+    )
+    result = m["log_db"].stats_summary(0)
+    overall = result["overall"]
+    assert overall["cost_ticks"] == 75_000_000
+    assert overall["costed_success"] == 1
+    assert overall["unpriced_success"] == 1
+
+
+def test_cost_available_to_all_request_and_window_cache_surfaces(m):
+    _setup(m)
+    expected = int(68.5 * 10_000_000_000)
+    _insert_success(
+        m,
+        "cost-everywhere",
+        "priced-key",
+        "gpt-5.6-sol",
+        "api:Priced",
+        input_tok=1_000_000,
+        output_tok=1_000_000,
+        cc=1_000_000,
+        cr=1_000_000,
+    )
+
+    lifetime = m["log_db"].stats_lifetime()
+    channel = m["log_db"].tokens_for_channel("api:Priced", 0)
+    apikey = m["log_db"].tokens_for_apikey("priced-key", 0)
+    channel_model = m["log_db"].channel_model_stats("api:Priced", 0)[0]
+    apikey_model = m["log_db"].apikey_model_stats("priced-key", 0)[0]
+    for metrics in (lifetime, channel, apikey, channel_model, apikey_model):
+        assert metrics["cost_ticks"] == expected
+        assert metrics["costed_success"] == 1
+        assert metrics["unpriced_success"] == 0
+
+    row = m["log_db"].recent_logs(limit=1)[0]
+    assert row["request_id"] == "cost-everywhere"
+    assert m["log_db"].cost_for_log(row)["cost_ticks"] == expected
+    detail = m["log_db"].log_detail("cost-everywhere")
+    assert m["log_db"].cost_for_log(detail["log"])["cost_ticks"] == expected
+    assert m["ui"].fmt_cost_from_row(row) == "$68.50"
+
+    # OAuth token 刷新通知也是 Telegram 展示面，月度缓存旁必须有金额。
+    _insert_success(
+        m,
+        "cost-refresh-notice",
+        "priced-key",
+        "gpt-5.6-sol",
+        "oauth:openai:notice@example.test:acct",
+        channel_type="oauth",
+        input_tok=1_000_000,
+        output_tok=1_000_000,
+        cc=1_000_000,
+        cr=1_000_000,
+    )
+    notice = m["oauth_manager"]._build_refresh_notice(
+        "openai:notice@example.test:acct", usage_flat=None,
+    )
+    assert "缓存 1.0M (33.3%)\n💵 $68.50" in notice
+    assert "缓存 1.0M (33.3%) · 💵" not in notice
+    assert "≈" not in notice
+
+    # 金额与缓存命中是独立维度；无 cache_read 时仍必须展示金额。
+    _insert_success(
+        m,
+        "cost-refresh-notice-no-cache",
+        "priced-key",
+        "gpt-5.6-sol",
+        "oauth:openai:no-cache@example.test:acct",
+        channel_type="oauth",
+        input_tok=1_000_000,
+        output_tok=1_000_000,
+        cc=0,
+        cr=0,
+    )
+    no_cache_notice = m["oauth_manager"]._build_refresh_notice(
+        "openai:no-cache@example.test:acct", usage_flat=None,
+    )
+    assert "月度统计: ↑ 1.0M · ↓ 1.0M\n💵 $55.00" in no_cache_notice
+
+    # 一个账号仅承担 failover 的前置已计费 attempt 时，request_log 的最终
+    # channel total 为 0；通知仍不能因此隐藏它的 Token/金额。
+    handle = m["log_db"].insert_pending(
+        "cost-refresh-attempt-only", "127.0.0.1", "priced-key",
+        "gpt-5.6-luna", False, 1, 0, {}, {"model": "gpt-5.6-luna"},
+    )
+    first_channel = "oauth:openai:attempt-only@example.test:acct"
+    first = m["log_db"].record_retry_attempt(
+        handle, 1, first_channel, "oauth", "gpt-5.6-luna", 1.0,
+        upstream_protocol="openai-responses",
+    )
+    m["log_db"].mark_retry_attempt_dispatch(
+        first, {"model": "gpt-5.6-luna"},
+    )
+    m["log_db"].update_retry_attempt(
+        first,
+        outcome="http_error",
+        ended_at=2.0,
+        response_body=json.dumps({
+            "usage": {"input_tokens": 1_000_000, "output_tokens": 1_000_000}
+        }),
+    )
+    second = m["log_db"].record_retry_attempt(
+        handle, 2, "oauth:openai:winner@example.test:acct", "oauth",
+        "gpt-5.6-luna", 3.0, upstream_protocol="openai-responses",
+    )
+    m["log_db"].mark_retry_attempt_dispatch(
+        second, {"model": "gpt-5.6-luna"},
+    )
+    final_body = json.dumps({
+        "usage": {"input_tokens": 10, "output_tokens": 2}
+    })
+    m["log_db"].finish_success(
+        handle,
+        "oauth:openai:winner@example.test:acct",
+        "oauth",
+        "gpt-5.6-luna",
+        input_tokens=10,
+        output_tokens=2,
+        response_body=final_body,
+    )
+    m["log_db"].update_retry_attempt(
+        second, outcome="success", ended_at=4.0,
+    )
+    attempt_only = m["log_db"].tokens_for_channel(first_channel, 0)
+    assert attempt_only["total"] == 0
+    assert attempt_only["costed_success"] == 1
+    attempt_notice = m["oauth_manager"]._build_refresh_notice(
+        "openai:attempt-only@example.test:acct", usage_flat=None,
+    )
+    assert "月度统计: ↑ 1.0M · ↓ 1.0M\n💵 $11.00" in attempt_notice
+
+
+def test_log_detail_shows_three_decimal_cost_formula_from_frozen_attempt(m):
+    _setup(m)
+    ld = m["log_db"]
+    handle = ld.insert_pending(
+        "cost-formula", "127.0.0.1", "priced-key", "gpt-5.6-sol", True,
+        msg_count=1, tool_count=0, request_headers={},
+        request_body={"model": "gpt-5.6-sol"}, ingress_protocol="responses",
+    )
+    attempt = ld.record_retry_attempt(
+        handle, 1, "api:Priced", "api", "gpt-5.6-sol", time.time(),
+        upstream_protocol="openai-responses",
+    )
+    ld.mark_retry_attempt_dispatch(attempt, {"model": "gpt-5.6-sol"})
+    body = json.dumps({
+        "usage": {
+            "input_tokens": 258_000,
+            "output_tokens": 1_200,
+            "input_tokens_details": {"cached_tokens": 254_700},
+        }
+    })
+    ld.finish_success(
+        handle, "api:Priced", "api", "gpt-5.6-sol",
+        input_tokens=3_300, output_tokens=1_200,
+        cache_creation_tokens=0, cache_read_tokens=254_700,
+        response_body=body, upstream_protocol="openai-responses",
+        usage_observed=True,
+    )
+    ld.update_retry_attempt(attempt, outcome="success", ended_at=time.time())
+
+    detail = ld.log_detail("cost-formula")
+    assert len(detail["billing_attempts"]) == 1
+    text = m["logs_menu"]._render_detail(detail)
+    assert "<b>计费</b>" in text
+    assert (
+        "💵 $0.180 = 输入 3,300 × $5/M + 输出 1,200 × $30/M"
+        " + 缓存读取 254,700 × $0.5/M"
+    ) in text
+    assert "\n💵 $0.18\n" not in text
+
+
+def test_log_detail_formula_separates_anthropic_5m_and_1h_cache_writes(m):
+    snapshot = json.dumps({
+        "input_per_token": 5 / 1_000_000,
+        "output_per_token": 25 / 1_000_000,
+        "cache_write_per_token": 6.25 / 1_000_000,
+        "cache_write_5m_per_token": 6.25 / 1_000_000,
+        "cache_write_1h_per_token": 10 / 1_000_000,
+        "cache_read_per_token": 0.5 / 1_000_000,
+    })
+    formula = m["logs_menu"]._attempt_cost_formula({
+        "cost_source": "estimated",
+        "input_tokens": 20_000,
+        "output_tokens": 10_000,
+        "cache_creation_tokens": 80_000,
+        "cache_creation_5m_tokens": 30_000,
+        "cache_creation_1h_tokens": 50_000,
+        "cache_read_tokens": 0,
+        "pricing_snapshot_json": snapshot,
+    })
+    assert formula == (
+        "输入 20,000 × $5/M + 输出 10,000 × $25/M"
+        " + 缓存写入 5m 30,000 × $6.25/M"
+        " + 缓存写入 1h 50,000 × $10/M"
+    )
+
+
+def test_cache_miss_write_sample_includes_request_cost(m):
+    _setup(m)
+    _insert_success(
+        m,
+        "cost-cache-write",
+        "priced-key",
+        "gpt-5.6-sol",
+        "api:Priced",
+        input_tok=1_000_000,
+        output_tok=1_000_000,
+        cc=1_000_000,
+        cr=0,
+    )
+    summary = m["log_db"].stats_summary(0)
+    text = m["stats_menu"]._section_cache_misses(summary["recent_cache_misses"])
+    assert "写 1.0M · msgs 3 · tools 0\n  💵 $67.50" in text
+    assert "写 1.0M · 💵" not in text
+    assert "≈" not in text
+
+
+def test_stats_without_cost_never_reads_response_body(m):
+    _setup(m)
+    _insert_success(
+        m,
+        "no-cost-body-read",
+        "k1",
+        "grok-4",
+        "oauth:xai:test",
+        input_tok=10,
+        output_tok=2,
+        cc=0,
+        cr=0,
+        response_body='{"usage":{"cost_in_usd_ticks":123}}',
+        upstream_protocol="xai-responses",
+    )
+    conn = m["log_db"]._get_conn()
+    statements = []
+    conn.set_trace_callback(statements.append)
+    try:
+        m["log_db"].stats_summary(0, include_cost=False)
+    finally:
+        conn.set_trace_callback(None)
+    assert not any("request_detail" in sql.lower() for sql in statements)
 
 
 def test_stats_group_by_channel(m):
@@ -196,6 +739,8 @@ def test_stats_group_by_channel(m):
     assert ">A<" in text and ">B<" in text   # <code>A</code> / <code>B</code>
     assert "命中请求" in text
     assert "缓存 100 (31.2%)" in text
+    assert "累计金额 " in text
+    assert " · 💵 " not in text
     # 当前选中维度按钮应有 ✓ 标记
     btns_labels = [b["text"] for row in edit["reply_markup"]["inline_keyboard"] for b in row if "text" in b]
     assert any("渠道 ✓" in l for l in btns_labels)
@@ -267,7 +812,12 @@ def test_logs_list(m):
     assert "down" in text
 
     assert "最近日志 · 请求日志 · 第 1/1 页 · 共 3 条" in text
-    assert "Token: ↑ 160 · ↓ 20 · 缓存 50 (31.2%)" in text
+    compact_log_lines = [line for line in text.splitlines() if "Token: ↑ 160 · ↓ 20" in line]
+    assert compact_log_lines
+    assert all("缓存 50 (31.2%) · " in line for line in compact_log_lines)
+    assert all("$" in line for line in compact_log_lines)
+    assert "金额:" not in text
+    assert "💵" not in text
     assert "耗时: 连接 150ms · 首字 600ms · 总 3.0s" in text
 
     # 顶部可切换请求/多媒体日志；详情按钮仍单行 3 列紧凑排列。
@@ -726,6 +1276,94 @@ def test_log_db_fast_mode_migration_for_old_month_db(m):
     print("  [PASS] log_db old schema migration adds fast_mode")
 
 
+def test_stats_lifetime_reads_real_old_month_without_mutating_schema(m):
+    _setup(m)
+    ld = m["log_db"]
+    path = os.path.join(ld._log_dir, "1999-01.db")
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.unlink(path + suffix)
+        except FileNotFoundError:
+            pass
+    try:
+        conn = sqlite3.connect(path)
+        conn.executescript(ld._schema_sql())
+        conn.execute(
+            """INSERT INTO request_log(
+                   request_id, created_at, status, api_key_name, requested_model,
+                   final_model, final_channel_key, input_tokens, output_tokens,
+                   cache_creation_tokens, cache_read_tokens)
+               VALUES('old-priced', 1, 'success', 'k', 'gpt-5.6-sol',
+                      'gpt-5.6-sol', 'api:OpenAI', 100000, 10000, 0, 0)"""
+        )
+        for col in (
+            "fast_mode", "ingress_protocol", "upstream_protocol",
+            "upstream_transport", "proxy_name", "proxy_bytes_up", "proxy_bytes_down",
+        ):
+            conn.execute(f"ALTER TABLE request_log DROP COLUMN {col}")
+        conn.commit()
+        conn.close()
+
+        lifetime = ld.stats_lifetime()
+        assert lifetime["total"] == 1
+        assert lifetime["costed_success"] == 1
+        assert lifetime["unpriced_success"] == 0
+        assert lifetime["cost_ticks"] == int(0.8 * 10_000_000_000)
+
+        check = sqlite3.connect(path)
+        cols = {row[1] for row in check.execute("PRAGMA table_info(request_log)")}
+        check.close()
+        assert not ({"fast_mode", "upstream_protocol", "proxy_bytes_up"} & cols)
+    finally:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.unlink(path + suffix)
+            except FileNotFoundError:
+                pass
+
+
+def test_stats_lifetime_readonly_archive_is_not_silently_dropped(m, monkeypatch):
+    _setup(m)
+    ld = m["log_db"]
+    path = os.path.join(ld._log_dir, "1999-02.db")
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.unlink(path + suffix)
+        except FileNotFoundError:
+            pass
+    original = ld._get_conn_for_month
+    try:
+        conn = sqlite3.connect(path)
+        conn.executescript(ld._schema_sql())
+        conn.execute(
+            """INSERT INTO request_log(
+                   request_id, created_at, status, api_key_name, requested_model,
+                   final_model, final_channel_key, input_tokens, output_tokens)
+               VALUES('readonly-unpriced', 1, 'success', 'k', 'gpt-5.6-sol',
+                      'gpt-5.6-sol', 'api:OpenAI', 100000, 10000)"""
+        )
+        conn.commit()
+        conn.close()
+
+        def fail_migration(month):
+            if month == "1999-02":
+                raise sqlite3.OperationalError("readonly archive")
+            return original(month)
+
+        monkeypatch.setattr(ld, "_get_conn_for_month", fail_migration)
+        lifetime = ld.stats_lifetime()
+        assert lifetime["total"] == 1
+        assert lifetime["costed_success"] == 1
+        assert lifetime["unpriced_success"] == 0
+        assert lifetime["cost_ticks"] == int(0.8 * 10_000_000_000)
+    finally:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.unlink(path + suffix)
+            except FileNotFoundError:
+                pass
+
+
 def test_extract_fast_mode_variants(m):
     ld = m["log_db"]
     assert ld.extract_fast_mode({"speed": "fast"}, "anthropic") is True
@@ -1056,6 +1694,86 @@ def test_proxy_stats_include_tokens_latency_and_real_bytes(m):
     print("  [PASS] proxy stats tokens + latency + bytes")
 
 
+def test_proxy_stats_attribute_failover_tokens_to_actual_attempt_proxy(m):
+    ld = m["log_db"]
+    ld.init()
+    conn = ld._get_conn()
+    for table in (
+        "upstream_attempt_usage", "proxy_chain", "retry_chain",
+        "request_detail", "request_log",
+    ):
+        conn.execute(f"DELETE FROM {table}")
+    conn.commit()
+
+    now = time.time()
+    request_id = "px-attempt-attribution"
+    ld.insert_pending(
+        request_id, "1.1.1.1", "k", "gpt-x", True, 1, 0, {}, {},
+    )
+
+    first = ld.record_retry_attempt(
+        request_id, 1, "api:first", "api", "gpt-x", now,
+        proxy_name="p1",
+    )
+    ld.mark_retry_attempt_dispatch(first, {"model": "gpt-x"})
+    first_round = ld.record_proxy_attempt(
+        request_id, first, 1, "p1", now,
+        round_id="round-p1", transport="ws", request_mode="ws",
+    )
+    ld.update_proxy_attempt(
+        first_round, connect_ms=10, first_byte_ms=20, total_ms=30,
+        ended_at=now + 0.1, outcome="http_error", bytes_up=100, bytes_down=200,
+    )
+    ld.update_retry_attempt(
+        first, final_round_id="round-p1", connect_ms=10, first_byte_ms=20,
+        total_ms=30, ended_at=now + 0.1, outcome="http_error",
+        proxy_name="p1", bytes_up=100, bytes_down=200,
+        response_body=json.dumps({
+            "usage": {"input_tokens": 10, "output_tokens": 1},
+        }),
+    )
+
+    second = ld.record_retry_attempt(
+        request_id, 2, "api:second", "api", "gpt-x", now + 0.2,
+        proxy_name="p2",
+    )
+    ld.mark_retry_attempt_dispatch(second, {"model": "gpt-x"})
+    second_round = ld.record_proxy_attempt(
+        request_id, second, 1, "p2", now + 0.2,
+        round_id="round-p2", transport="ws", request_mode="ws",
+    )
+    ld.update_proxy_attempt(
+        second_round, connect_ms=40, first_byte_ms=50, total_ms=60,
+        ended_at=now + 0.3, outcome="success", bytes_up=300, bytes_down=400,
+    )
+    ld.update_retry_attempt(
+        second, final_round_id="round-p2", connect_ms=40, first_byte_ms=50,
+        total_ms=60, ended_at=now + 0.3, outcome="success",
+        proxy_name="p2", bytes_up=300, bytes_down=400, settle=False,
+    )
+    final_body = json.dumps({
+        "usage": {"input_tokens": 20, "output_tokens": 2},
+    })
+    ld.finish_success(
+        request_id, "api:second", "api", "gpt-x",
+        input_tokens=20, output_tokens=2,
+        connect_ms=40, first_token_ms=50, total_ms=60,
+        final_round_id="round-p2", proxy_name="p2",
+        proxy_bytes_up=300, proxy_bytes_down=400,
+        response_body=final_body,
+    )
+
+    rows = {row["proxy_name"]: row for row in ld.proxy_stats(limit=10)}
+    assert rows["p1"]["requests"] == 1
+    assert rows["p1"]["failures"] == 1
+    assert rows["p1"]["total_tokens"] == 11
+    assert rows["p1"]["total_bytes"] == 300
+    assert rows["p2"]["requests"] == 1
+    assert rows["p2"]["successes"] == 1
+    assert rows["p2"]["total_tokens"] == 22
+    assert rows["p2"]["total_bytes"] == 700
+
+
 
 def test_proxy_menu_group_edit_preserves_remove_and_clear_members(m):
     _setup(m)
@@ -1114,6 +1832,9 @@ def test_log_db_migrates_proxy_columns_on_old_schema(m):
     ld = m["log_db"]
     ld.init()
     conn = ld._get_conn()
+    # This test replaces retry_chain and therefore must not leave settlement rows
+    # pointing at ids from the table being discarded.
+    conn.execute("DELETE FROM upstream_attempt_usage")
     # Simulate an old monthly DB where request_log/retry_chain existed before proxy columns.
     conn.execute("ALTER TABLE request_log RENAME TO request_log_new")
     conn.execute("ALTER TABLE retry_chain RENAME TO retry_chain_new")

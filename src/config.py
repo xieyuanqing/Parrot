@@ -10,6 +10,7 @@ import os
 import shutil
 import tempfile
 import threading
+from contextlib import contextmanager
 from typing import Any
 
 COMPACT_RESCUE_DEFAULT_DIRECT_PROMPT = (
@@ -84,7 +85,8 @@ COMPACT_RESCUE_DEFAULT_REDUCE_PROMPT = (
 )
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# DATA_DIR 是所有运行时持久化文件的根目录（config.json / state.db / logs/ / .anthropic_proxy_ids.json）。
+# DATA_DIR 是所有运行时持久化文件的根目录（config.json / state.db /
+# openai_response_store.db / logs/ / .anthropic_proxy_ids.json）。
 # 优先使用环境变量 ANTHROPIC_PROXY_DATA_DIR（容器内通常是 /app/data），不设则回退到 BASE_DIR，
 # 保持现有源码安装方式（systemd 直跑）行为完全不变。
 DATA_DIR = os.environ.get("ANTHROPIC_PROXY_DATA_DIR") or BASE_DIR
@@ -199,6 +201,26 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "queueWaitSeconds": 30,           # TG Bot 可改，全满排队超时
         "defaultMaxConcurrent": 0,        # 渠道未配 maxConcurrent 时的默认（0=不限）
     },
+    # 首包前的同候选瞬时加试，以及各自独立防循环的鉴权/请求修复。
+    # 候选账号/渠道切换与代理组故障转移属于核心路径，不受本开关截断。
+    "retry": {
+        "transient": {
+            "enabled": True,
+            "maxExtraAttempts": 2,        # 全请求共享，不会按候选数倍增
+            "backoffSeconds": [0.75, 1.75],
+            "errors": {
+                "openaiServerOverloaded": True,
+                "openaiServerError": True,
+                "claudeOverloaded": True,
+                "xaiUnavailable": True,
+            },
+        },
+        "recovery": {
+            "oauthRefresh": True,                 # 每个报错 OAuth 账号最多一次
+            "invalidEncryptedContent": True,      # 全请求最多一次
+            "claudeContext1mFallback": True,      # 每个候选/模型最多一次
+        },
+    },
     "errorWindows": [1, 3, 5, 10, 15, 0],
     # OAuth 渠道宽容次数：前 N 次失败只累计计数不进入冷却（成功一次清零）。
     # 第 N+1 次失败开始按 errorWindows 阶梯。设计目的：避免单 OAuth 账号
@@ -280,6 +302,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "channel_recovered": True,    # 永久/长冷却被清除（手动 / probe 恢复）
             "quota_disabled": True,       # OAuth 配额到达阈值被自动禁用
             "quota_resumed": True,        # OAuth 配额恢复被自动启用
+            "quota_cooldown": True,       # API 渠道单模型按上游重置时间临时冷却
             "oauth_refreshed": True,      # OAuth Token 自动刷新成功
             "oauth_refresh_failed": True, # OAuth Token 自动刷新失败（标 auth_error）
             "no_channels": True,          # 无可用渠道（503）
@@ -369,14 +392,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "claude-sonnet-4-6",
         "claude-haiku-4-5-20251001",
     ],
-    # Global alias mapping and model metadata are protocol/account agnostic.
+    # Global alias mapping is protocol/account agnostic. Model metadata is
+    # resolved separately through exact models.dev default/scoped bindings.
     # modelMapping supports both the new global bucket and legacy per-ingress
     # buckets (anthropic/openai-chat/openai-responses) for backward compatibility.
     "modelMapping": {
         "global": {},
     },
     "ingressDefaultModel": {},
-    "modelMetadata": {},
+    # models.dev identities only; catalog metadata/prices stay in the shared cache.
+    "modelBindings": {
+        "defaults": {},
+        "scoped": {},
+    },
+    # Independent compact-rescue model. Legacy modelMetadata[*].compressionModel
+    # is migrated after the bundled/cache models.dev catalog is initialized.
+    "compressionModel": "",
+    "modelMetadata": {},  # read only for one-time exact legacy migration
     "protocolBridge": {
         "anthropicToOpenAI": {
             "reasoning": {
@@ -489,6 +521,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "mode": "forever",
         "days": None,
     },
+    # models.dev 单一目录与金额开关。新请求只从 modelBindings 指向的
+    # provider/model 读取费率；xAI 返回可信 cost_in_usd_ticks 时优先实际金额。
+    "pricing": {
+        "enabled": True,
+        "autoUpdate": True,
+        "sourceUrl": "https://models.dev/api.json",
+        "modelsUrl": "https://models.dev/models.json",
+        "refreshHours": 24,
+        # 以下旧字段只保留配置兼容；dispatch-time 估算不会用它们绕过绑定。
+        "channelProviders": {},
+        "aliases": {},
+        "overrides": {},
+    },
     "stateDbPath": "state.db",
     # OpenAI OAuth/Codex 简化配置。旧版 oauth.providers.openai 仍兼容；加载旧配置时会自动补齐到这里。
     "openaiOAuth": {
@@ -550,8 +595,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # previous_response_id 本地 store（跨变体 chat↔responses 必需，同协议可选）
         "store": {
             "enabled": True,
+            # 独立于 stateDbPath，relative path 以 DATA_DIR 为根；改后需重启。
+            "dbPath": "openai_response_store.db",
             "ttlMinutes": 60,
             "cleanupIntervalSeconds": 300,
+            # 每批同时受行数和 JSON payload 字节数限制，批间释放 Store 锁；
+            # 每轮再受批次数与时间预算限制，既能追赶积压也不长期阻塞 save。
+            "cleanupBatchSize": 100,
+            "cleanupBatchBytes": 8 * 1024 * 1024,
+            "cleanupMaxBatches": 100,
+            "cleanupTimeBudgetSeconds": 10,
         },
         # reasoning 跨协议桥接："passthrough" = 通过非官方字段 reasoning_content 双向映射；"drop" = 丢弃
         "reasoningBridge": "passthrough",
@@ -580,6 +633,7 @@ _mtime: float = 0.0
 # 必须是可重入锁 (RLock)：同一线程内的加载/保存辅助函数可能再次访问配置。
 # reload callbacks 始终在锁外执行，避免 callback 跨模块重入造成死锁。
 _lock = threading.RLock()
+_update_lifecycle_lock = threading.RLock()
 _reload_callbacks: list = []
 
 
@@ -619,6 +673,27 @@ def _normalize_openai_oauth_config(cfg: dict, raw: dict | None = None) -> bool:
         cfg["openaiOAuth"] = merged
         return True
     return False
+
+
+def _normalize_pricing_sources(cfg: dict) -> bool:
+    """Move the former built-in LiteLLM URL to the models.dev API schema.
+
+    Only the exact old default is rewritten. A user-supplied HTTPS mirror of
+    models.dev remains untouched.
+    """
+
+    pricing = cfg.get("pricing")
+    if not isinstance(pricing, dict):
+        return False
+    legacy = (
+        "https://raw.githubusercontent.com/BerriAI/litellm/main/"
+        "model_prices_and_context_window.json"
+    )
+    if str(pricing.get("sourceUrl") or "").strip() != legacy:
+        return False
+    pricing["sourceUrl"] = "https://models.dev/api.json"
+    pricing["modelsUrl"] = "https://models.dev/models.json"
+    return True
 
 
 def _normalize_api_keys(cfg: dict) -> bool:
@@ -693,6 +768,9 @@ def _load_from_disk() -> dict:
     if _normalize_openai_oauth_config(merged, raw):
         changed = True
         print("[config] backfilled openaiOAuth from defaults/legacy oauth.providers.openai")
+    if _normalize_pricing_sources(merged):
+        changed = True
+        print("[config] migrated built-in pricing source from LiteLLM to models.dev")
     if changed:
         _write_atomic(merged)
     return merged
@@ -805,6 +883,13 @@ def save() -> None:
         _mtime = _current_mtime()
 
 
+@contextmanager
+def serialized_updates():
+    """Keep a multi-step config/state lifecycle ahead of other config writes."""
+    with _update_lifecycle_lock:
+        yield
+
+
 def update(mutator, *, skip_if_unchanged: bool = False) -> dict:
     """以 mutator(cfg) 的方式原子修改 cfg 并持久化。
 
@@ -816,19 +901,20 @@ def update(mutator, *, skip_if_unchanged: bool = False) -> dict:
     也消除其它跨模块 callback 链可能产生的死锁。
     """
     global _cache, _mtime
-    with _lock:
-        if _cache is None:
-            _ensure_loaded()
-        candidate = copy.deepcopy(_cache)
-        mutator(candidate)
-        if skip_if_unchanged and candidate == _cache:
-            return _cache
-        _write_atomic(candidate)
-        _mtime = _current_mtime()
-        _cache = candidate
-        snapshot = candidate
-    _fire_reload_callbacks(snapshot)
-    return snapshot
+    with _update_lifecycle_lock:
+        with _lock:
+            if _cache is None:
+                _ensure_loaded()
+            candidate = copy.deepcopy(_cache)
+            mutator(candidate)
+            if skip_if_unchanged and candidate == _cache:
+                return _cache
+            _write_atomic(candidate)
+            _mtime = _current_mtime()
+            _cache = candidate
+            snapshot = candidate
+        _fire_reload_callbacks(snapshot)
+        return snapshot
 
 
 def on_reload(cb) -> None:

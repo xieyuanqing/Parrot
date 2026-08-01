@@ -47,6 +47,12 @@
         }
       ],
       "cc_mimicry": false,
+      "omitTemperature": false,
+      "omitThinking": false,
+      "context1mMode": "auto",
+      "context1mModels": [],
+      "fastMode": "auto",
+      "fastModels": [],
       "enabled": true,
       "disabled_reason": null
     },
@@ -63,6 +69,10 @@
         }
       ],
       "cc_mimicry": false,
+      "omitTemperature": false,
+      "omitThinking": false,
+      "fastMode": "auto",
+      "fastModels": [],
       "enabled": true,
       "disabled_reason": null
     }
@@ -105,6 +115,27 @@
         "claude": false,
         "cloudflare": false
       }
+    }
+  },
+  "retry": {
+    "transient": {
+      "enabled": true,
+      "maxExtraAttempts": 2,
+      "backoffSeconds": [
+        0.75,
+        1.75
+      ],
+      "errors": {
+        "openaiServerOverloaded": true,
+        "openaiServerError": true,
+        "claudeOverloaded": true,
+        "xaiUnavailable": true
+      }
+    },
+    "recovery": {
+      "oauthRefresh": true,
+      "invalidEncryptedContent": true,
+      "claudeContext1mFallback": true
     }
   },
   "errorWindows": [
@@ -170,6 +201,7 @@
       "channel_recovered": true,
       "quota_disabled": true,
       "quota_resumed": true,
+      "quota_cooldown": true,
       "oauth_refreshed": true,
       "oauth_refresh_failed": true,
       "no_channels": true,
@@ -197,6 +229,11 @@
     "global": {}
   },
   "ingressDefaultModel": {},
+  "modelBindings": {
+    "defaults": {},
+    "scoped": {}
+  },
+  "compressionModel": "",
   "modelMetadata": {},
   "protocolBridge": {
     "anthropicToOpenAI": {
@@ -300,6 +337,16 @@
     "mode": "forever",
     "days": null
   },
+  "pricing": {
+    "enabled": true,
+    "autoUpdate": true,
+    "sourceUrl": "https://models.dev/api.json",
+    "modelsUrl": "https://models.dev/models.json",
+    "refreshHours": 24,
+    "channelProviders": {},
+    "aliases": {},
+    "overrides": {}
+  },
   "stateDbPath": "state.db",
   "openaiOAuth": {
     "forceCodexCLI": true,
@@ -347,8 +394,13 @@
   "openai": {
     "store": {
       "enabled": true,
+      "dbPath": "openai_response_store.db",
       "ttlMinutes": 60,
-      "cleanupIntervalSeconds": 300
+      "cleanupIntervalSeconds": 300,
+      "cleanupBatchSize": 100,
+      "cleanupBatchBytes": 8388608,
+      "cleanupMaxBatches": 100,
+      "cleanupTimeBudgetSeconds": 10
     },
     "reasoningBridge": "passthrough",
     "autoPromptCacheKey": {

@@ -10,9 +10,14 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
+import time
 from dataclasses import dataclass, field
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from .. import blacklist, errors
 from ..providers import registry as provider_registry
@@ -82,14 +87,19 @@ def json_error_for_ingress(
     message: str,
     *,
     code: str | None = None,
+    details: dict | None = None,
 ):
     if ingress == "anthropic":
         if protocol_errors.is_context_length_code_or_message(code, message):
             message = protocol_errors.context_length_error_message_for_claude_code(message)
             code = protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
-        return errors.json_error_response(status, anth_err_type, message, code=code)
+        return errors.json_error_response(
+            status, anth_err_type, message, code=code, details=details,
+        )
     mapped = translate_error_type(anth_err_type, ingress)
-    return errors.json_error_openai(status, mapped, message, code=code)
+    return errors.json_error_openai(
+        status, mapped, message, code=code, details=details,
+    )
 
 
 def make_stream_translator(translator_ctx: Optional[dict]):
@@ -208,12 +218,17 @@ class AttemptResult:
     ws_handshake_ms: Optional[int] = None
     error_detail: Optional[str] = None
     error_code: Optional[str] = None
+    # Parsed upstream Retry-After value, bounded before it reaches retry sleeps.
+    retry_after_seconds: Optional[float] = None
     usage: dict = field(default_factory=lambda: {
         "input_tokens": 0,
         "output_tokens": 0,
         "cache_creation": 0,
         "cache_read": 0,
     })
+    # Independent from token values: an authoritative 0/0 usage is observed,
+    # while a missing/malformed usage object is not.
+    usage_observed: Optional[bool] = None
     full_response_text: Optional[str] = None
     assistant_response: Optional[dict] = None
     proxy_name: Optional[str] = None
@@ -256,12 +271,29 @@ async def prepare_non_stream_response(
     cross-protocol response translator.  Scheduler scoring, DB writes, affinity,
     and response construction intentionally stay in the caller.
     """
-    restored = await provider_registry.restore_response_bytes(
-        channel,
-        raw,
-        dynamic_map=dynamic_map,
-        translator_ctx=translator_ctx,
-    )
+    raw_text = bytes(raw).decode("utf-8", errors="replace")
+    try:
+        restored = await provider_registry.restore_response_bytes(
+            channel,
+            raw,
+            dynamic_map=dynamic_map,
+            translator_ctx=translator_ctx,
+        )
+    except Exception as exc:
+        # Restoration is a downstream presentation concern.  Preserve the
+        # exact upstream body so terminal billing can still inspect actual cost,
+        # usage, and service tier even when an adapter itself fails.
+        return PreparedNonStreamResponse(
+            restored_text=raw_text,
+            error=AttemptResult(
+                outcome="transform_error",
+                connect_ms=connect_ms,
+                total_ms=total_ms,
+                error_detail=f"response restoration failed: {exc}"[:2000],
+                full_response_text=raw_text,
+                translator_ctx=translator_ctx,
+            ),
+        )
     restored_text = (
         restored.decode("utf-8", errors="replace")
         if isinstance(restored, bytes)
@@ -279,6 +311,7 @@ async def prepare_non_stream_response(
                 connect_ms=connect_ms,
                 total_ms=total_ms,
                 error_detail=f"non-JSON response: {exc}",
+                full_response_text=restored_text,
             ),
         )
 
@@ -304,6 +337,7 @@ async def prepare_non_stream_response(
                 connect_ms=connect_ms,
                 total_ms=total_ms,
                 error_detail=error_detail[:2000],
+                full_response_text=restored_text,
                 translator_ctx=translator_ctx,
             ),
         )
@@ -319,6 +353,7 @@ async def prepare_non_stream_response(
                 connect_ms=connect_ms,
                 total_ms=total_ms,
                 error_detail=f"blacklist: {bl_hit}",
+                full_response_text=restored_text,
             ),
         )
 
@@ -354,6 +389,278 @@ def should_cooldown(outcome: str) -> bool:
 def should_record_failure(outcome: str) -> bool:
     """Whether an unsuccessful attempt should affect channel health scoring."""
     return outcome != "candidate_guard"
+
+
+DEFAULT_TRANSIENT_RETRY_DELAYS_S = (0.75, 1.75)
+MAX_CONFIGURED_TRANSIENT_RETRIES = 5
+MAX_RETRY_AFTER_SECONDS = 60.0
+
+
+def retry_config(cfg: dict | None) -> dict:
+    raw = (cfg if isinstance(cfg, dict) else {}).get("retry") or {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def transient_retry_config(cfg: dict | None) -> dict:
+    raw = retry_config(cfg).get("transient") or {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def transient_retry_limit(cfg: dict | None) -> int:
+    try:
+        value = int(transient_retry_config(cfg).get("maxExtraAttempts", 2))
+    except (TypeError, ValueError):
+        value = 2
+    return max(0, min(value, MAX_CONFIGURED_TRANSIENT_RETRIES))
+
+
+def transient_retry_allowed(kind: str | None, cfg: dict | None) -> bool:
+    if not kind:
+        return False
+    transient = transient_retry_config(cfg)
+    if not bool(transient.get("enabled", True)):
+        return False
+    event_flags = transient.get("errors") or {}
+    if not isinstance(event_flags, dict):
+        event_flags = {}
+    return bool(event_flags.get(kind, True))
+
+
+def recovery_retry_allowed(name: str, cfg: dict | None) -> bool:
+    recovery = retry_config(cfg).get("recovery") or {}
+    if not isinstance(recovery, dict):
+        recovery = {}
+    return bool(recovery.get(name, True))
+
+
+def configured_transient_retry_delays(cfg: dict | None) -> tuple[float, ...]:
+    raw = transient_retry_config(cfg).get("backoffSeconds", DEFAULT_TRANSIENT_RETRY_DELAYS_S)
+    if not isinstance(raw, (list, tuple)):
+        raw = DEFAULT_TRANSIENT_RETRY_DELAYS_S
+    parsed: list[float] = []
+    for value in raw[:MAX_CONFIGURED_TRANSIENT_RETRIES]:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(number):
+            continue
+        parsed.append(max(0.0, min(number, 60.0)))
+    return tuple(parsed) or DEFAULT_TRANSIENT_RETRY_DELAYS_S
+
+
+def parse_retry_after_seconds(
+    value: Any,
+    *,
+    now_ts: float | None = None,
+    max_seconds: float = MAX_RETRY_AFTER_SECONDS,
+) -> float | None:
+    """Parse delta-seconds or an HTTP-date and clamp it to a safe wait ceiling."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        delay = float(text)
+    except (TypeError, ValueError):
+        try:
+            parsed = parsedate_to_datetime(text)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if parsed is None:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        delay = parsed.timestamp() - (time.time() if now_ts is None else float(now_ts))
+    if not math.isfinite(delay):
+        return None
+    try:
+        ceiling = float(max_seconds)
+    except (TypeError, ValueError):
+        ceiling = MAX_RETRY_AFTER_SECONDS
+    if not math.isfinite(ceiling) or ceiling < 0:
+        ceiling = MAX_RETRY_AFTER_SECONDS
+    return max(0.0, min(delay, ceiling))
+
+
+_RETRYABLE_TRANSIENT_OUTCOMES = frozenset({
+    "http_error",
+    "upstream_error_json",
+    "stream_upstream_error",
+})
+
+
+def _is_xai_channel(channel: Any) -> bool:
+    """Recognize direct xAI API/OAuth channels without guessing from model names."""
+    if str(getattr(channel, "provider", "") or "").strip().lower() == "xai":
+        return True
+    try:
+        host = (urlparse(str(getattr(channel, "base_url", "") or "")).hostname or "").lower()
+    except Exception:
+        return False
+    return host == "api.x.ai" or host.endswith(".api.x.ai") or host == "cli-chat-proxy.grok.com"
+
+
+def _is_openai_channel(channel: Any) -> bool:
+    provider = str(getattr(channel, "provider", "") or "").strip().lower()
+    if provider == "openai" or str(getattr(channel, "key", "") or "").startswith("oauth:openai:"):
+        return True
+    return str(getattr(channel, "protocol", "") or "").strip().lower().startswith("openai-")
+
+
+def _upstream_error_identity(result: AttemptResult) -> tuple[str, str, bool]:
+    """Extract exact lower-case (type, code, structured) attempt identity."""
+    detail = str(getattr(result, "error_detail", "") or "").strip()
+    obj: dict = {}
+    structured = False
+    start = detail.find("{")
+    if start >= 0:
+        try:
+            parsed = json.loads(detail[start:])
+            if isinstance(parsed, dict):
+                obj = parsed
+                structured = True
+        except Exception:
+            obj = {}
+    error = obj.get("error") if isinstance(obj.get("error"), dict) else obj
+    if not isinstance(error, dict):
+        error = {}
+    error_type = str(error.get("type") or obj.get("type") or "").strip().lower()
+    error_code = str(
+        getattr(result, "error_code", None)
+        or error.get("code")
+        or obj.get("code")
+        or ""
+    ).strip().lower()
+    if not error_type and not error_code:
+        # Older WS normalization stored ``server_error: message`` rather than JSON.
+        match = re.match(r"^([a-z][a-z0-9_]+)\s*:", detail, flags=re.IGNORECASE)
+        if match:
+            error_type = match.group(1).lower()
+    return error_type, error_code, structured
+
+
+def bounded_account_quota_error(result: AttemptResult) -> dict[str, str] | None:
+    """Recognize only explicit account/billing exhaustion signals.
+
+    Generic 403/429 responses deliberately remain unclassified so their existing
+    OAuth refresh and retry behaviour is unchanged.
+    """
+    try:
+        status = int(getattr(result, "http_status", None) or 0)
+    except (TypeError, ValueError):
+        return None
+    if status not in (403, 429):
+        return None
+
+    detail = str(getattr(result, "error_detail", "") or "").strip()[:4000]
+    error_type, error_code, _ = _upstream_error_identity(result)
+    message = detail
+    start = detail.find("{")
+    if start >= 0:
+        try:
+            obj = json.loads(detail[start:])
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            error_obj = obj.get("error") if isinstance(obj.get("error"), dict) else obj
+            if isinstance(error_obj, dict):
+                message = str(error_obj.get("message") or obj.get("message") or detail)
+    low = " ".join((error_type, error_code, message.lower(), detail.lower()))
+
+    matched = False
+    if status == 429:
+        matched = error_code in {
+            "quota_exhausted",
+            "insufficient_quota",
+            "billing_hard_limit_reached",
+            "billing_limit_reached",
+            "billing_not_active",
+            "credits_exhausted",
+            "credit_balance_exhausted",
+        } or error_type in {"insufficient_quota", "billing_error"}
+        if not matched:
+            matched = any(marker in low for marker in (
+                "exceeded your current quota",
+                "insufficient quota",
+                "check your plan and billing details",
+                "billing hard limit",
+                "billing limit has been reached",
+                "out of credits",
+                "no credits remaining",
+                "not enough credits",
+                "credit balance is too low",
+                "usage credits are required",
+            ))
+    elif status == 403:
+        matched = error_code in {
+            "quota_exhausted",
+            "insufficient_quota",
+            "billing_hard_limit_reached",
+            "billing_limit_reached",
+            "billing_not_active",
+            "credits_exhausted",
+            "credit_balance_exhausted",
+        } or error_type in {"insufficient_quota", "billing_error"}
+        if not matched:
+            matched = any(marker in low for marker in (
+                "used all credits",
+                "used all your credits",
+                "all credits have been used",
+                "credits exhausted",
+                "monthly spending limit",
+                "monthly spend limit",
+                "monthly budget has been reached",
+            ))
+    if not matched:
+        return None
+    return {
+        "classification": "quota_exhausted",
+        "code": error_code or error_type,
+        "message": message,
+    }
+
+
+def retryable_transient_error_kind(channel: Any, result: AttemptResult) -> str | None:
+    """Classify the small allowlist of safe pre-commit same-candidate retries.
+
+    Returned values are config keys under ``retry.transient.errors``.  Generic
+    5xx/503 responses deliberately return ``None``.
+    """
+    if getattr(result, "success", False) or getattr(result, "stream_started", False):
+        return None
+    if getattr(result, "outcome", None) not in _RETRYABLE_TRANSIENT_OUTCOMES:
+        return None
+    try:
+        status = int(getattr(result, "http_status", None) or 0)
+    except (TypeError, ValueError):
+        status = 0
+    error_type, error_code, structured = _upstream_error_identity(result)
+
+    # xAI's REST 503 is the counterpart of its SDK UNAVAILABLE signal.  Check it
+    # before generic OpenAI-compatible ``server_error`` classification.
+    if status == 503 and _is_xai_channel(channel):
+        return "xaiUnavailable"
+    if error_code == "server_is_overloaded" or (
+        not structured and error_type == "server_is_overloaded"
+    ):
+        return "openaiServerOverloaded"
+    if status == 529 or error_type == "overloaded_error" or error_code == "overloaded_error":
+        return "claudeOverloaded"
+    if _is_openai_channel(channel) and (
+        error_code == "server_error"
+        or (not structured and error_type == "server_error")
+    ):
+        return "openaiServerError"
+    return None
+
+
+def is_retryable_overload_error(channel: Any, result: AttemptResult) -> bool:
+    """Backward-compatible overload predicate (excludes generic OpenAI server_error)."""
+    return retryable_transient_error_kind(channel, result) in {
+        "openaiServerOverloaded", "claudeOverloaded", "xaiUnavailable",
+    }
 
 
 def failover_final_http_status(result: Any | None) -> int:
@@ -682,6 +989,9 @@ def _strip_encrypted_content_value(value: Any) -> tuple[Any, int]:
         out = []
         removed = 0
         for item in value:
+            if isinstance(item, dict) and item.get("type") == "encrypted_content":
+                removed += 1
+                continue
             new_item, n = _strip_encrypted_content_value(item)
             removed += n
             out.append(new_item)
@@ -690,22 +1000,15 @@ def _strip_encrypted_content_value(value: Any) -> tuple[Any, int]:
 
 
 def retry_body_without_encrypted_content(body: dict) -> tuple[dict, int]:
-    """Build a one-shot fallback request by stripping downstream EC from input."""
-    retry_body = copy.deepcopy(body)
-    inp = retry_body.get("input")
-    if not isinstance(inp, list):
-        return retry_body, 0
-    new_input: list[Any] = []
-    removed = 0
-    for item in inp:
-        if isinstance(item, dict) and item.get("type") == "reasoning":
-            removed += 1
-            continue
-        new_item, n = _strip_encrypted_content_value(item)
-        removed += n
-        new_input.append(new_item)
-    retry_body["input"] = new_input
-    return retry_body, removed
+    """Deep-copy a request and recursively remove only encrypted content.
+
+    Reasoning items themselves are portable once their opaque EC field is gone;
+    summary/content/id and adjacent message/tool items must remain available to a
+    failover candidate.
+    """
+    copied = copy.deepcopy(body)
+    stripped, removed = _strip_encrypted_content_value(copied)
+    return (stripped if isinstance(stripped, dict) else copied), removed
 
 
 def is_context_1m_credit_error(result: AttemptResult, resolved_model: str, body: dict) -> bool:

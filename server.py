@@ -32,7 +32,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from src import (
     __version__, drain,
     affinity, apikey_limiter, auth, compact_rescue, config, cooldown, errors, failover,
-    fingerprint, image_db, log_db, model_mapping, model_metadata, network,
+    fingerprint, image_db, log_db, model_mapping, model_metadata, model_pricing, network,
     network_monitor, notifier, oauth_manager, probe, public_ip, quota_primer,
     scheduler, scorer, state_db, status_monitor, token_counter, translation,
     update_checker, updater, upstream,
@@ -237,7 +237,7 @@ async def lifespan(app: FastAPI):
     from src.openai.channel.registration import register_factories as _openai_register_factories
     _openai_register_factories()
 
-    # OpenAI previous_response_id Store（挂在同一张 state.db，独立表）
+    # OpenAI previous_response_id Store（独立 SQLite；旧 state.db 只读兼容）
     from src.openai import store as openai_store
     openai_store.init()
 
@@ -247,6 +247,17 @@ async def lifespan(app: FastAPI):
 
     # httpx 客户端
     upstream.create_client()
+    try:
+        model_pricing.initialize()
+        migrated = model_metadata.migrate_legacy_config()
+        if migrated["bindings"] or migrated["compression"]:
+            print(
+                "[Metadata] migrated legacy config: "
+                f"bindings={migrated['bindings']} compression={migrated['compression']}"
+            )
+    except Exception as exc:
+        # 金额统计是旁路能力，价格表异常不能阻断代理启动；后台刷新仍会继续尝试恢复。
+        print(f"[Pricing] local catalog load failed: {exc}")
 
     # 后台获取公网 IPv4（用于主菜单显示外网 BaseURL，失败则不显示）
     public_ip.fetch_async()
@@ -284,6 +295,7 @@ async def lifespan(app: FastAPI):
     _background_tasks.append(asyncio.create_task(status_monitor.monitor_loop()))
     _background_tasks.append(asyncio.create_task(network_monitor.monitor_loop()))
     _background_tasks.append(asyncio.create_task(update_checker.update_loop()))
+    _background_tasks.append(asyncio.create_task(model_pricing.refresh_loop()))
     # 自更新：若进程是被自更新重启拉起的，恢复流程做健康检查/回滚
     try:
         updater.resume_after_restart()
@@ -602,20 +614,15 @@ def _anthropic_to_openai_context_preflight(body: dict, result) -> dict | None:
         return None
     if getattr(ch, "protocol", "anthropic") == "anthropic":
         return None
-    model_candidates = []
-    for candidate in (resolved_model, body.get("model")):
-        name = str(candidate or "").strip()
-        if name and name not in model_candidates:
-            model_candidates.append(name)
-    metadata_model = ""
-    safe_limit = None
-    for name in model_candidates:
-        limit = model_metadata.safe_prompt_limit(name)
-        if limit is not None and limit > 0:
-            metadata_model = name
-            safe_limit = limit
-            break
-    if not metadata_model or safe_limit is None:
+    metadata_model = str(
+        body.get("_client_visible_model") or body.get("model") or ""
+    ).strip()
+    safe_limit = model_metadata.safe_prompt_limit(
+        metadata_model,
+        scope_key=str(getattr(ch, "key", "") or ""),
+        outbound_model=str(resolved_model or ""),
+    )
+    if not metadata_model or safe_limit is None or safe_limit <= 0:
         return None
     prompt_tokens = token_counter.count_request_tokens(body, model=metadata_model)
     if prompt_tokens <= safe_limit:
@@ -948,6 +955,7 @@ async def proxy_messages(request: Request):
         model_mapping.apply_mapping(body, "anthropic")
 
     model = body.get("model")
+    body["_client_visible_model"] = str(model or "").strip()
     explicit_context_1m = request_wants_context_1m(
         body,
         downstream_betas=downstream_betas,

@@ -347,6 +347,7 @@ JSON 请求体：
 - 维度：汇总（两家族分段）/ 按渠道 / 按模型 / 按 Key
 - **汇总视图**：先 🅰 Anthropic 段（overall + 按渠道 Top3 + 按模型 Top3），后 🅾 OpenAI 段（同上，完整含重试/亲和）；底部跨家族按 Key Top + 最近调用（带家族图标）+ 未命中样本
 - **专题视图**：按渠道 / 按模型 Top10，每条前缀 🅰/🅾 家族图标
+- **模型元数据与金额统计**：客户端可见模型通过默认或 scope 专属 binding 精确绑定到 [models.dev](https://models.dev) `provider/model`；上下文、最大输出、能力与完整价格均来自绑定指向的同一目录记录，专属优先于默认，无绑定不猜测 provider。Telegram 支持 canonical exact 自动同步，以及 OAuth/API scope → 现有模型 → provider → 目录模型的专属绑定流程；压缩模型独立设置并按实际 compact 路由解析相同 binding limits。每次真实上游尝试在 dispatch 时冻结输入 / 输出 / 缓存写入 / 缓存读取 Token 的 USD 费率，支持单档长上下文阶梯、OpenAI Priority 与 Anthropic Fast 完整替换价；xAI 响应若返回可信的 `cost_in_usd_ticks` 则优先采用真实金额。界面区分实际、估算、混合与未计价；无绑定、缺失 usage、无法确认旧 Token 口径、Claude 缓存写入 TTL 不可区分、多档 context tier、缺失 Priority/Fast tariff、未知 service tier，或日志缺少独立 reasoning/audio Token 维度时都会 fail-closed 为“未计价”，不会静默按 `$0` 或错误档位处理。models.dev 与 xAI 实际费用均为 USD，不做实时汇率换算。
 
 ### 📋 最近日志
 页面可在两类日志之间切换：
@@ -524,13 +525,13 @@ API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ �
 
 > `images.cacheRetentionDays=0` 表示不按时间清理；`images.cacheMaxBytes=0` 表示不按空间清理。相对 `cachePath` 会落在数据目录下，Parrot 会阻止相对路径逃逸。
 
-**不可热加载字段**（改后需重启容器）：`listen.host` / `listen.port` / `stateDbPath` / `logDir` / `telegram.botToken` / `telegram.adminIds`。
+**不可热加载字段**（改后需重启容器）：`listen.host` / `listen.port` / `stateDbPath` / `openai.store.dbPath` / `logDir` / `telegram.botToken` / `telegram.adminIds`。
 
 ---
 
 ## 🛠 运维
 
-所有持久化数据集中在 `<安装目录>/data/`：`config.json` / `state.db` / `image_logs.db` / `logs/` / `images/` / `.anthropic_proxy_ids.json`。
+所有持久化数据集中在 `<安装目录>/data/`：`config.json` / `state.db` / `openai_response_store.db` / `image_logs.db` / `logs/` / `images/` / `.anthropic_proxy_ids.json`。
 
 ### 启动 / 停止 / 重启 / 状态（Docker Compose）
 
@@ -574,7 +575,11 @@ GPT/Grok 图片及 Grok 视频任务使用独立日志库 `data/image_logs.db`�
 
 ### 状态数据
 
-`data/state.db`（SQLite）：performance_stats / channel_errors / cache_affinities / oauth_quota_cache / openai_response_store。永久保留。
+`data/state.db`（SQLite）：performance_stats / channel_errors / cache_affinities / oauth_quota_cache 等轻量运行时状态，永久保留。
+
+`data/openai_response_store.db`（SQLite）：`previous_response_id` history 表
+`openai_response_store`。升级自旧版本时不在线迁移旧表；新库 miss 会只读回退
+`state.db`，让旧 id 在原 TTL 内继续可用。
 
 ### 配置备份
 
@@ -619,6 +624,7 @@ Parrot/
 ├── data/                        ← 运行时持久化（容器挂载点；源码模式不存在）
 │   ├── config.json              ← 唯一配置文件
 │   ├── state.db                 ← 运行时状态（永久）
+│   ├── openai_response_store.db ← previous_response_id history（TTL）
 │   ├── image_logs.db            ← 图片/视频统一多媒体任务日志（兼容旧图片历史）
 │   ├── logs/YYYY-MM.db          ← 按月分库业务日志
 │   ├── images/                  ← 图片/视频缓存（开启后，保留兼容目录名）
@@ -628,6 +634,8 @@ Parrot/
     ├── auth.py                  ← 下游 API Key 验证
     ├── errors.py                ← 标准错误响应
     ├── state_db.py              ← state.db 读写
+    ├── channel_state.py         ← 运行期渠道改名的配置/DB/内存原子协调
+    ├── sqlite_errors.py         ← SQLite 可用性错误精确分类
     ├── log_db.py                ← 按月日志库读写 + 跨月聚合（支持 family 过滤）
     ├── image_db.py              ← 兼容旧库的多媒体日志底层 + GPT 图片尝试统计
     ├── media_db.py              ← 统一图片/视频日志门面

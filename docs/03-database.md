@@ -1,11 +1,13 @@
 # 03 — 数据库设计
 
-两套独立的 SQLite 库：
+三套独立的 SQLite 库：
 
 - **state.db** — 运行时状态，**永久保留**（性能统计、错误冷却、亲和、配额缓存）
+- **openai_response_store.db** — OpenAI `previous_response_id` history（TTL 清理）
 - **logs/YYYY-MM.db** — 业务日志，**按月分库**（请求流水、重试链、完整 body）
 
-两者均启用 WAL 模式，定时 checkpoint。
+各库均启用 WAL 模式。OpenAI history 与 `state.db` 分库，避免大表清理长时间
+占用轻量状态写锁；旧版 `state.db.openai_response_store` 只用于升级后的只读 fallback。
 
 ## 3.1 state.db Schema
 
@@ -101,9 +103,12 @@ def quota_save(email, data: dict)
 def quota_load(email) -> Row | None
 def quota_load_all() -> list[Row]
 def quota_delete(email)
+
+# coordinated live rename (performance/errors/fp/client/quota in one transaction)
+def rename_runtime_channel_state(old_channel_key, new_channel_key, ...)
 ```
 
-所有写操作由单一 `_write_lock`（threading.Lock）序列化，避免跨协程冲突。
+所有 state.db 写操作由单一 `_write_lock`（`threading.RLock`）序列化。运行期渠道改名不直接逐表调用这些接口，而由 `src/channel_state.py` 协调：配置写入和 reload、单个 SQLite 事务、scorer/cooldown/两类 affinity 内存发布共用同一生命周期锁；失败时在释放过渡 key 前恢复旧配置。这样 reload cleanup 不会把改名中的 old/new 状态误判为 stale，也不会留下只更新 DB 或只更新内存的中间态。
 
 ## 3.2 logs/YYYY-MM.db Schema
 
@@ -231,7 +236,9 @@ def retry_chain_of(request_id) -> list[Row]
 - 未变化：返回已打开连接
 - 变化了：关闭旧连接，打开新月份 DB，重建 schema（`CREATE IF NOT EXISTS`）
 
-所有写操作都经由 `_get_conn()`，跨月请求会自动写入新月库（不跨库迁移数据）。
+新请求在 `insert_pending()` 时绑定当时的月库，后续 request/retry/proxy/local-web/
+attempt-usage 写入都携带同一个 `RowLogHandle`。因此跨过北京时间月界的长请求仍完整
+落在开始月份，不会出现摘要在旧库、结算在新库的拆分；月界之后新建的请求才进入新库。
 
 ## 3.4 跨库数据聚合（TG Bot 统计）
 
@@ -251,10 +258,38 @@ def retry_chain_of(request_id) -> list[Row]
 | 错误冷却 | state.db | 否 | 临时（cooldown 到期清除） |
 | 亲和绑定 | state.db | 否 | TTL 30min |
 | OAuth 配额缓存 | state.db | 否 | 实时覆盖写 |
+| OpenAI response history | openai_response_store.db | 否 | TTL 60min（默认） |
 | 请求流水 | logs/YYYY-MM.db | 是 | 默认永久保留；可由 `logRetention` 按天清理 |
 | 重试链 | logs/YYYY-MM.db | 是 | 与所属请求流水同生命周期 |
+| 上游尝试结算 | logs/YYYY-MM.db | 是 | 与所属请求流水同生命周期 |
 | 请求/响应 body | logs/YYYY-MM.db | 是 | 与所属请求流水同生命周期 |
 
-原则：**状态数据需要快速读写且重启恢复**，放 state.db；**业务日志写多读少且数据量大**，按月分库便于归档与迁移。
+原则：**轻量状态数据需要快速读写且重启恢复**，放 state.db；体积可能很大的
+OpenAI history 独立分库；**业务日志写多读少且数据量大**，按月分库便于归档与迁移。
 
-当 `logRetention.mode="days"` 时，完整过期月份直接删除整库；留存临界所在月份会删除过期请求及 `request_detail` / retry / proxy / local-web 关联行，再压缩 SQLite 以实际回收磁盘空间。TG Bot 必须经两次确认后才会保存该策略并执行首次清理；之后由后台维护循环每天最多检查一次。
+当 `logRetention.mode="days"` 时，完整过期月份直接删除整库；留存临界所在月份会删除过期请求及 `request_detail` / retry / proxy / local-web / attempt-usage 关联行，再压缩 SQLite 以实际回收磁盘空间。TG Bot 必须经两次确认后才会保存该策略并执行首次清理；之后由后台维护循环每天最多检查一次。
+
+## 按上游尝试结算
+
+`request_log` 继续作为向后兼容的下游请求摘要：Token 字段只描述 Parrot 对下游
+暴露的用量，不会改写为包含重试或故障转移的用量。费用单独结算到
+`upstream_attempt_usage`；每次真实上游 dispatch 对应一条不可变、可幂等 finalize
+的记录。dispatch 前发生的转换/guard 错误只留在 `retry_chain` 供排障，不作为账单事实。
+`retry_chain.dispatched_at` 在传输层开始发送时立即落盘：若进程随后在 finalize 前退出，
+聚合会把缺失结算的该次 dispatch 明确计为 `unpriced`，而不是回退请求摘要后漏算整次尝试。
+HTTP/WS 代理链只允许在尚未开始发送时切换下一条 route；一旦请求可能离开 Parrot 就不在
+同一 retry 行内重放，避免生成两次上游账单却只留下一个结算事实。
+
+每条尝试结算保存规范化 Token、是否真实观察到 Token usage、响应/出站 service tier、
+dispatch 确定性、补全 provider 的模型、冻结后的实际费率快照及版本，以及费用来源
+（`actual`、`estimated`、`unpriced`）。Tier 优先级为“响应实际 tier > 出站请求 tier >
+未知”；下游意图不是账单事实。显式全零 Token 字段属于已观察用量，估价为 0；缺失
+usage 不得估成 0。xAI 上游返回的实际费用可以在 Token usage 缺失时结算；无法确认
+是否已发出的传输错误必须标为未计价。
+
+重试、failover、本地 WebSearch 多轮和 Compact map/reduce 子调用分别结算。Compact
+子调用 ID 只在聚合时映射回原下游请求。聚合以不可变尝试事实为准；只有完全没有
+尝试事实的旧记录才回退到 `request_log` 旧计价逻辑。
+
+月度数据库使用增量迁移：旧请求记录继续可读；新增请求摘要/尝试账本字段和索引时，
+不会改写历史 Token 语义。
