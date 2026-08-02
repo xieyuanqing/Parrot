@@ -276,15 +276,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "accessRefreshThrottleSeconds": 180,
     },
     # ─── OAuth 5h 滚动窗口启动器 ─────────────────────────────────
-    # 默认关闭。开启后，当已知 5h reset 时间过去且账号在 reset 后没有真实模型请求时，
-    # 对 Claude/OpenAI OAuth 账号发一次普通短请求，主动启动下一段滚动窗口。
+    # 默认关闭。开启后，在已知 5h reset 过去约 6 分钟且期间没有真实模型请求时，
+    # 对 Claude/OpenAI OAuth 账号发一次普通短请求；成功返回的新 reset 会驱动下一轮。
     "quotaPrimer": {
         "enabled": False,
-        "intervalSeconds": 600,
-        "intervalJitterSeconds": 90,
+        "intervalSeconds": 60,
+        "intervalJitterSeconds": 10,
         "initialDelaySeconds": 90,
-        "graceSeconds": 60,
+        "postResetDelaySeconds": 360,
+        "windowSeconds": 18000,
         "minIntervalSeconds": 17400,
+        "failureRetrySeconds": 300,
+        "failureRetryMaxSeconds": 1800,
         "timeoutSeconds": 20,
         "bootstrapWhenUnknown": False,
         "claudeZeroUtilFallback": True,
@@ -314,6 +317,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "status_alert": True,         # 上游 status page（Claude/OpenAI/Cloudflare）事件
             "app_update": True,           # Parrot 本身的新版本上线提醒
             "network_monitor": True,      # Parrot 自身网络健康检测失败/恢复
+            "quota_primer": False,        # 5h 滚动窗口 primer 成功/失败
         },
     },
     # ─── 上游 status page 监控 ─────────────────────────────────

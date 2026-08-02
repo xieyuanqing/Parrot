@@ -1,0 +1,528 @@
+config.example.json                   |  24 +++
+ server.py                             |   7 +-
+ src/channel/oauth_channel.py          |   3 +-
+ src/channel/openai_oauth_channel.py   |  21 ++-
+ src/config.py                         |  37 ++++
+ src/quota_primer.py                   | 337 ++++++++++++++++++++++++++++++++++
+ src/telegram/menus/system_menu.py     | 106 ++++++++++-
+ src/tests/test_cc_v2_1_156_upgrade.py |  64 ++++++-
+ src/tests/test_m10_system_menu.py     |   4 +-
+ src/tests/test_quota_primer.py        | 141 ++++++++++++++
+ src/transform/cc_mimicry.py           | 231 ++++++++++++++++++++---
+ 11 files changed, 922 insertions(+), 53 deletions(-)
+
+--- Changes ---
+
+config.example.json
+  @@ -173,6 +173,23 @@
+  +  "quotaPrimer": {
+  +    "enabled": false,
+  +    "intervalSeconds": 600,
+  +    "intervalJitterSeconds": 90,
+  +    "initialDelaySeconds": 90,
+  +    "graceSeconds": 60,
+  +    "minIntervalSeconds": 17400,
+  +    "timeoutSeconds": 20,
+  +    "bootstrapWhenUnknown": false,
+  +    "claudeZeroUtilFallback": true,
+  +    "includeQuotaDisabledAfterReset": true,
+  +    "providers": {
+  +      "claude": true,
+  +      "openai": true
+  +    },
+  +    "notify": false
+  +  },
+     "contentBlacklist": {
+       "default": [],
+       "byChannel": {}
+  @@ -193,6 +210,13 @@
+  +  "cchStaticValue": "00000",
+  +  "customSettings": {
+  +    "enableDefaultContext1m": false,
+  +    "enableClaudeCodeSystemPrompt": true,
+  +    "claudeOAuthCacheTtl": "passthrough",
+  +    "enableSillyTavernCacheMode": false
+  +  },
+     "oauthDefaultModels": [
+       "claude-opus-4-5",
+       "claude-opus-4-6",
+  +24 -0
+
+server.py
+  @@ -33,9 +33,9 @@ from src import (
+  -    network_monitor, notifier, oauth_manager, probe, public_ip, scheduler, scorer,
+  -    state_db, status_monitor, token_counter, translation, update_checker, updater,
+  -    upstream,
+  +    network_monitor, notifier, oauth_manager, probe, public_ip, quota_primer,
+  +    scheduler, scorer, state_db, status_monitor, token_counter, translation,
+  +    update_checker, updater, upstream,
+   )
+   from src.channel import registry
+   from src.client_ip import get_client_ip
+  @@ -290,6 +290,7 @@ async def lifespan(app: FastAPI):
+  +        _background_tasks.append(asyncio.create_task(quota_primer.primer_loop()))
+       _background_tasks.append(asyncio.create_task(probe.recovery_loop()))
+       _background_tasks.append(asyncio.create_task(status_monitor.monitor_loop()))
+       _background_tasks.append(asyncio.create_task(network_monitor.monitor_loop()))
+  +4 -3
+
+src/channel/oauth_channel.py
+  @@ -95,7 +95,8 @@ class OAuthChannel(Channel):
+  -            body_with_model, email=self.email, session_id=sid)
+  +            body_with_model, email=self.email, session_id=sid,
+  +            cache_ttl=cc_mimicry.claude_oauth_cache_ttl())
+           signed = cc_mimicry.sign_body(payload)
+           downstream_betas = body_with_model.get(cc_mimicry.PARROT_DOWNSTREAM_BETAS_KEY)
+           original_model = body_with_model.get(cc_mimicry.PARROT_ORIGINAL_MODEL_KEY)
+  +2 -1
+
+src/channel/openai_oauth_channel.py
+  @@ -434,7 +434,8 @@ class OpenAIOAuthChannel(Channel):
+  -        用户主动触发，知情同意。
+  +        用户主动触发，知情同意。探测不设置人工 max_tokens 上限，避免极低输出上限
+  +        被上游当作非正常用量而不刷新窗口。
+           """
+           # 延迟 import 以免循环依赖
+           from .. import oauth_manager, state_db
+  @@ -457,17 +458,18 @@ class OpenAIOAuthChannel(Channel):
+  -        # 构造最小探测请求体。走 build_upstream_request 能顺带用到 codex
+  -        # transform（store=false / stream=true / 模型规范化 / instructions 兜底 / ...）
+  +        # 构造普通短探测请求体。走 build_upstream_request 能顺带用到 codex
+  +        # transform（store=false / stream=true / 模型规范化 / instructions 兜底 / ...）。
+  +        # 默认不设置 max_tokens；用简单完整请求并消费响应，避免极低输出上限
+  +        # 或过早断流导致上游不把它算作正常窗口启动请求。
+           prov_cfg = _provider_cfg()
+           probe_cfg = prov_cfg.get("quotaProbe") if isinstance(prov_cfg.get("quotaProbe"), dict) else {}
+           fallback_model = str(probe_cfg.get("fallbackModel") or "gpt-5.2")
+           probe_model = self.models[0] if self.models else fallback_model
+           test_body = {
+               "model": probe_model,
+  -            "input": str(probe_cfg.get("input") or "1"),
+  -            # 极短 instructions，减少 input token
+  -            "instructions": str(probe_cfg.get("instructions") or "reply ok"),
+  +            "input": str(probe_cfg.get("input") or "hello"),
+  +            "instructions": str(probe_cfg.get("instructions") or "Reply with a short hello."),
+               # 不设 stream 让 transform 强制 stream=true
+           }
+           try:
+  @@ -485,14 +487,17 @@ class OpenAIOAuthChannel(Channel):
+  -                # stream 模式：拿到响应头即可，不消费 body 直接关流
+  -                # （上游会继续生成一小段 token 直到发现连接关闭，算作探测成本）
+  +                # stream 模式：完整消费一个普通短响应，确保上游把它当作正常模型请求。
+                   async with client.stream(
+                       "POST", req.url,
+                       headers=req.headers, content=req.body,
+                   ) as resp:
+                       status = resp.status_code
+                       headers_snapshot = dict(resp.headers)
+  +                    try:
+  +                        await resp.aread()
+  +                    except Exception:
+  +                        pass
+           except httpx.TimeoutException:
+               return {"ok": False, "reason": f"timeout > {timeout_s}s"}
+           except Exception as exc:
+  +13 -8
+
+src/config.py
+  @@ -271,6 +271,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
+  +    # ─── OAuth 5h 滚动窗口启动器 ─────────────────────────────────
+  +    # 默认关闭。开启后，当已知 5h reset 时间过去且账号在 reset 后没有真实模型请求时，
+  +    # 对 Claude/OpenAI OAuth 账号发一次普通短请求，主动启动下一段滚动窗口。
+  +    "quotaPrimer": {
+  +        "enabled": False,
+  +        "intervalSeconds": 600,
+  +        "intervalJitterSeconds": 90,
+  +        "initialDelaySeconds": 90,
+  +        "graceSeconds": 60,
+  +        "minIntervalSeconds": 17400,
+  +        "timeoutSeconds": 20,
+  +        "bootstrapWhenUnknown": False,
+  +        "claudeZeroUtilFallback": True,
+  +        "includeQuotaDisabledAfterReset": True,
+  +        "providers": {"claude": True, "openai": True},
+  +        "notify": False,
+  +    },
+       "contentBlacklist": {
+           "default": [],
+           "byChannel": {},
+  @@ -347,6 +364,26 @@ DEFAULT_CONFIG: dict[str, Any] = {
+  +    # ─── 用户自定义开关 ─────────────────────────────────────────
+  +    # 单独收纳本地 fork 的行为开关，避免和上游 CCH / 翻译 / 渠道设置混在一起，
+  +    # 后续 rebase/merge 上游时也更容易处理冲突。
+  +    "customSettings": {
+  +        # 是否对支持的模型默认开启 1M context beta。
+  +        # False = 仅在下游显式请求 1M 时开启，避免 Opus 4.x 自动触发
+  +        # "Usage credits are required for long context requests"。
+  +        "enableDefaultContext1m": False,
+  +        # Claude OAuth 的 cc_mimicry 必须注入 Claude Code 身份 system prompt。
+  +        # 保留此字段兼容旧配置，但运行期强制视为 True。
+  +        "enableClaudeCodeSystemPrompt": True,
+  +        # Claude 官方 OAuth 渠道 prompt cache：默认请求透传。
+  +        # passthrough = 不自动添加 cache_control/TTL；下游请求带什么就转什么。
+  +        # 旧值 "5m"/"1h" 仍被 cc_mimicry 兼容，但生产默认不再使用。
+  +        "claudeOAuthCacheTtl": "passthrough",
+  +        # 酒馆缓存模式：开启后，Claude OAuth 自动缓存不再打在 Tavern 常见的
+  +        # 动态尾巴（当前 interactive_input / ACK / 测试尾巴）上，而是前移到
+  +        # 当前输入之前的最后一条稳定历史消息，牺牲一点缓存长度换取连续推进时可读。
+  +        "enableSillyTavernCacheMode": False,
+  +    },
+       "oauthDefaultModels": [
+           "claude-opus-4-5",
+           "claude-opus-4-6",
+  +37 -0
+
+src/quota_primer.py
+  @@ -0,0 +1,337 @@
+  +"""OAuth quota rolling-window primer.
+  +
+  +Some subscription backends use a rolling 5h window that only starts on the first
+  +model request after the previous window refreshes. This module can send one
+  +ordinary short request after a known 5h reset time has passed so the next rolling
+  +window starts even if no user traffic arrives immediately.
+  +
+  +Safety defaults:
+  +- disabled by default;
+  +- only OAuth channels are considered;
+  +- user/auth disabled accounts are never touched;
+  +- quota-disabled accounts are touched only after their reset time passed and only
+  +  when quotaPrimer.includeQuotaDisabledAfterReset is true;
+  +- one successful primer is recorded per observed reset timestamp.
+  +"""
+  +
+  +from __future__ import annotations
+  +
+  +import asyncio
+  +import json
+  +import os
+  +import random
+  +import time
+  +from datetime import datetime, timezone
+  +from typing import Any
+  +
+  +import httpx
+  +
+  +from . import config, network, oauth_manager, state_db
+  +from .anthropic import rate_limit_headers as anthropic_rl
+  +from .channel.oauth_channel import OAuthChannel
+  +from .channel.openai_oauth_channel import OpenAIOAuthChannel
+  +from .channel import registry
+  +
+  +_STATE_PREFIX = "quota_primer:"
+  +
+  +
+  +def _cfg() -> dict:
+  +    base = {
+  +        "enabled": False,
+  +        "intervalSeconds": 600,
+  +        "intervalJitterSeconds": 90,
+  +        "initialDelaySeconds": 90,
+  +        "graceSeconds": 60,
+  +        "minIntervalSeconds": 17_400,  # 4h50m guard against bad/moving reset data
+  +        "timeoutSeconds": 20,
+  +        "bootstrapWhenUnknown": False,
+  +        "claudeZeroUtilFallback": True,
+  +        "includeQuotaDisabledAfterReset": True,
+  +        "providers": {"claude": True, "openai": True},
+  +        "notify": False,
+  +    }
+  +    cur = config.get().get("quotaPrimer") or {}
+  +    out = dict(base)
+  +    out.update({k: v for k, v in cur.items() if k != "providers"})
+  +    providers = dict(base["providers"])
+  +    providers.update(cur.get("providers") or {})
+  +    out["providers"] = providers
+  +    return out
+  +
+  +
+  +def _now() -> float:
+  +    return time.time()
+  +
+  +
+  +def _parse_iso_utc(value: Any) -> float | None:
+  +    if not value:
+  +        return None
+  +    s = str(value).strip()
+  +    if not s:
+  +        return None
+  +    try:
+  +        if s.endswith("Z"):
+  +            dt = datetime.fromisoformat(s[:-1] + "+00:00")
+  +        else:
+  +            dt = datetime.fromisoformat(s)
+  +        if dt.tzinfo is None:
+  +            dt = dt.replace(tzinfo=timezone.utc)
+  +        return dt.timestamp()
+  +    except Exception:
+  +        return None
+  +
+  +
+  +def _state_key(account_key: str) -> str:
+  +    return _STATE_PREFIX + account_key
+  +
+  +
+  +def _load_state(account_key: str) -> dict:
+  +    raw = state_db.schema_meta_get(_state_key(account_key))
+  +    if not raw:
+  +        return {}
+  +    try:
+  +        data = json.loads(raw)
+  +        return data if isinstance(data, dict) else {}
+  +    except Exception:
+  +        return {}
+  +
+  +
+  +def _save_state(account_key: str, patch: dict) -> dict:
+  +    data = _load_state(account_key)
+  ... (237 lines truncated)
+  +337 -0
+
+src/telegram/menus/system_menu.py
+  @@ -135,8 +135,22 @@ def _main_text_and_kb() -> tuple[str, dict]:
+  +    custom = cfg.get("customSettings") or {}
+  +    default_1m = bool(custom.get("enableDefaultContext1m", False))
+  +    tavern_cache = bool(custom.get("enableSillyTavernCacheMode", False))
+  +    cache_ttl = str(custom.get("claudeOAuthCacheTtl", "passthrough") or "passthrough").strip().lower()
+  +    if cache_ttl not in {"passthrough", "5m", "1h"}:
+  +        cache_ttl = "passthrough"
+  +    cache_label = "请求透传" if cache_ttl == "passthrough" else cache_ttl
+  +
+       text += f"黑名单: 默认 {bl_default_count} 条 · 渠道专属 {bl_by_ch_count} 条"
+       text += f"\n翻译层: <code>{tl_summary}</code>"
+  +    text += (
+  +        "\n自定义: "
+  +        f"1M默认 <code>{'开' if default_1m else '关'}</code>"
+  +        f" · Claude缓存 <code>{cache_label}</code>"
+  +        f" · 酒馆 <code>{'开' if tavern_cache else '关'}</code>"
+  +    )
+   
+       net = cfg.get("network") or {}
+       dns_servers = (net.get("dns") or {}).get("servers") or ["8.8.8.8"]
+  @@ -162,10 +176,11 @@ def _main_text_and_kb() -> tuple[str, dict]:
+  -        [ui.btn("🗃 数据留存", "sys:show:retention"),
+  -         ui.btn("🆕 版本更新", "menu:update")],
+  +        [ui.btn("🧩 自定义设置", "sys:show:custom"),
+  +         ui.btn("🗃 数据留存", "sys:show:retention")],
+           [ui.btn("🔁 重试设置", "sys:show:retry"),
+  -         ui.btn("◀ 返回主菜单", "menu:main")],
+  +         ui.btn("🆕 版本更新", "menu:update")],
+  +        [ui.btn("◀ 返回主菜单", "menu:main")],
+       ])
+       return text, kb
+   
+  @@ -2244,6 +2259,12 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
+  +    # 自定义设置
+  +    if data == "sys:show:custom":             _show_custom_settings(chat_id, message_id, cb_id); return True
+  +    if data == "sys:custom:cache_ttl:toggle": _on_custom_cache_ttl_toggle(chat_id, message_id, cb_id); return True
+  +    if data.startswith("sys:custom:toggle:"):
+  +        _on_custom_toggle(chat_id, message_id, cb_id, data.split(":", 3)[3]); return True
+  +
+       return False
+   
+   
+  @@ -2580,3 +2601,82 @@ def _on_ws_mode_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
+  +
+  +
+  +# ─── 自定义设置 ─────────────────────────────────────────────────────
+  +
+  +def _custom_settings_cfg() -> dict:
+  +    cfg = config.get()
+  +    custom = cfg.get("customSettings") or {}
+  +    cache_ttl = str(custom.get("claudeOAuthCacheTtl", "passthrough") or "passthrough").strip().lower()
+  +    if cache_ttl not in {"passthrough", "5m", "1h"}:
+  +        cache_ttl = "passthrough"
+  +    return {
+  +        "enableDefaultContext1m": bool(custom.get("enableDefaultContext1m", False)),
+  +        "enableSillyTavernCacheMode": bool(custom.get("enableSillyTavernCacheMode", False)),
+  +        "enableClaudeCodeSystemPrompt": True,
+  +        "claudeOAuthCacheTtl": cache_ttl,
+  +    }
+  +
+  +
+  +def _show_custom_settings(chat_id: int, message_id: int, cb_id: str) -> None:
+  +    if cb_id:
+  +        ui.answer_cb(cb_id)
+  +    custom = _custom_settings_cfg()
+  +    default_1m = custom["enableDefaultContext1m"]
+  +    tavern_cache = custom["enableSillyTavernCacheMode"]
+  +    cache_ttl = custom["claudeOAuthCacheTtl"]
+  +    cache_label = "请求透传" if cache_ttl == "passthrough" else cache_ttl
+  +    lines = [
+  +        "🧩 <b>自定义设置</b>",
+  +        "",
+  +        f"默认开启 1M 长上下文: <code>{'开' if default_1m else '关'}</code>",
+  +        f"Claude 官方 OAuth 缓存: <code>{cache_label}</code>",
+  +        f"酒馆缓存模式: <code>{'开' if tavern_cache else '关'}</code>",
+  +        "",
+  +        "说明：",
+  +        "• <b>默认开启 1M 长上下文</b>：开启后，对支持的 Opus 4.x 默认带 <code>context-1m</code> beta；关闭后仅在下游显式请求 1M 时才带。",
+  +        "• <b>Claude 官方 OAuth 缓存</b>：请求透传=不自动添加 cache_control；5m/1h=由 Parrot 自动加缓存断点。",
+  +        "• <b>酒馆缓存模式</b>：只在 Claude OAuth 自动缓存开启时生效；会把断点从动态尾巴前移到当前输入之前的稳定历史，适合 SillyTavern/RP 预设。",
+  +        "• Claude Code 身份指纹已强制保留，不再提供关闭按钮；这是 OAuth 链路可用性要求。",
+  +        "",
+  +        "<i>这些自定义缓存设置只影响 Claude 官方 OAuth 渠道；第三方 API 渠道仍按渠道自己的配置执行。</i>",
+  +    ]
+  +    ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb([
+  +        [ui.btn("🔴 关闭默认 1M" if default_1m else "🟢 开启默认 1M", "sys:custom:toggle:enableDefaultContext1m")],
+  +        [ui.btn("🟣 关闭酒馆缓存" if tavern_cache else "🟢 开启酒馆缓存", "sys:custom:toggle:enableSillyTavernCacheMode")],
+  +        [ui.btn(f"Claude缓存: {cache_label}", "sys:custom:cache_ttl:toggle")],
+  +        [ui.btn("◀ 返回设置", "menu:settings")],
+  +    ]))
+  +
+  +
+  +def _on_custom_toggle(chat_id: int, message_id: int, cb_id: str, field: str) -> None:
+  +    if field not in {"enableDefaultContext1m", "enableSillyTavernCacheMode"}:
+  +        ui.answer_cb(cb_id, "未知设置")
+  +        return
+  +    cfg = _custom_settings_cfg()
+  +    new_val = not bool(cfg[field])
+  +
+  +    def _mut(c):
+  +        custom = c.setdefault("customSettings", {})
+  +        custom[field] = new_val
+  +
+  +    config.update(_mut)
+  +    ui.answer_cb(cb_id, "已切换")
+  +    _show_custom_settings(chat_id, message_id, "")
+  +
+  +
+  +def _on_custom_cache_ttl_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
+  +    def _mut(c):
+  +        custom = c.setdefault("customSettings", {})
+  +        current = str(custom.get("claudeOAuthCacheTtl", "passthrough") or "passthrough").strip().lower()
+  +        order = ["passthrough", "5m", "1h"]
+  +        if current not in order:
+  +            current = "passthrough"
+  +        custom["claudeOAuthCacheTtl"] = order[(order.index(current) + 1) % len(order)]
+  +        # 旧开关保留兼容，但运行期不允许关 Claude Code 身份指纹。
+  +        custom["enableClaudeCodeSystemPrompt"] = True
+  +
+  +    config.update(_mut)
+  +    ui.answer_cb(cb_id, "已切换缓存 TTL")
+  +    _show_custom_settings(chat_id, message_id, "")
+  +103 -3
+
+src/tests/test_cc_v2_1_156_upgrade.py
+  @@ -162,13 +162,9 @@ def test_messages_beta_matches_capture_head7_for_explicit_1m():
+  -def test_context_1m_defaults_for_opus_only_and_sonnet_requires_explicit_signal():
+  -    # Parrot 可用性策略：Opus 4.x 默认开启 1M；Sonnet 4.5/4.6 只在下游显式要求时开启。
+  -    for model in ("claude-opus-4-8", "claude-opus-4-6"):
+  -        h = m.build_upstream_headers("tok", session_id="s", model=model)
+  -        assert "context-1m-2025-08-07" in h["anthropic-beta"].split(",")
+  -
+  -    for model in ("claude-sonnet-4-5", "claude-sonnet-4-6"):
+  +def test_context_1m_default_disabled_and_explicit_signal_still_works():
+  +    # 本地补丁策略：默认不再给 Opus 4.x 加 1M；只有下游显式要求时开启。
+  +    for model in ("claude-opus-4-8", "claude-opus-4-6", "claude-sonnet-4-5", "claude-sonnet-4-6"):
+           h = m.build_upstream_headers("tok", session_id="s", model=model)
+           assert "context-1m-2025-08-07" not in h["anthropic-beta"].split(",")
+           h = m.build_upstream_headers("tok", session_id="s", model=model, wants_context_1m=True)
+  @@ -183,9 +179,15 @@ def test_context_1m_defaults_for_opus_only_and_sonnet_requires_explicit_signal()
+  -    # 显式 False 仍可强制关闭。
+  -    h = m.build_upstream_headers("tok", session_id="s", model="claude-opus-4-8", wants_context_1m=False)
+  -    assert "context-1m-2025-08-07" not in h["anthropic-beta"].split(",")
+  +    # 兼容旧开关：手动开启后 Opus 4.x 可恢复默认 1M，但显式 False 仍可强制关闭。
+  +    m._ap_config.update(lambda cfg: cfg.setdefault("customSettings", {}).__setitem__("enableDefaultContext1m", True))
+  +    try:
+  +        h = m.build_upstream_headers("tok", session_id="s", model="claude-opus-4-8")
+  +        assert "context-1m-2025-08-07" in h["anthropic-beta"].split(",")
+  +        h = m.build_upstream_headers("tok", session_id="s", model="claude-opus-4-8", wants_context_1m=False)
+  +        assert "context-1m-2025-08-07" not in h["anthropic-beta"].split(",")
+  +    finally:
+  +        m._ap_config.update(lambda cfg: cfg.setdefault("customSettings", {}).__setitem__("enableDefaultContext1m", False))
+   
+   
+   def test_fast_mode_request_signals_and_header_gate():
+  @@ -282,6 +284,48 @@ def test_payload_gates_context_management_and_extended_ttl():
+  +def _collect_cache_controls(obj):
+  +    found = []
+  +    if isinstance(obj, dict):
+  +        cc = obj.get("cache_control")
+  +        if isinstance(cc, dict):
+  +            found.append(cc)
+  +        for value in obj.values():
+  +            found.extend(_collect_cache_controls(value))
+  +    elif isinstance(obj, list):
+  +        for value in obj:
+  +            found.extend(_collect_cache_controls(value))
+  +    return found
+  +
+  +
+  +def test_transform_request_cache_ttl_can_use_default_5m_without_extended_beta():
+  +    body = {
+  +        "model": "claude-sonnet-4-6",
+  +        "messages": [{"role": "user", "content": "hi"}],
+  +        "tools": [{"name": "foo", "description": "d", "input_schema": {"type": "object"}}],
+  +    }
+  +    payload, _ = m.transform_request(body, session_id="s", cache_ttl="5m")
+  +    cache_controls = _collect_cache_controls(payload)
+  +    assert cache_controls
+  +    assert all(cc == {"type": "ephemeral"} for cc in cache_controls)
+  +    h = m.build_upstream_headers("tok", session_id="s", model="claude-sonnet-4-6", payload=payload)
+  +    assert "extended-cache-ttl-2025-04-11" not in h["anthropic-beta"].split(",")
+  +
+  +
+  +def test_transform_request_cache_ttl_1h_keeps_extended_beta():
+  +    body = {
+  +        "model": "claude-sonnet-4-6",
+  +        "messages": [{"role": "user", "content": "hi"}],
+  +        "tools": [{"name": "foo", "description": "d", "input_schema": {"type": "object"}}],
+  +    }
+  +    payload, _ = m.transform_request(body, session_id="s", cache_ttl="1h")
+  +    cache_controls = _collect_cache_controls(payload)
+  +    assert cache_controls
+  +    assert all(cc == {"type": "ephemeral", "ttl": "1h"} for cc in cache_controls)
+  +    h = m.build_upstream_headers("tok", session_id="s", model="claude-sonnet-4-6", payload=payload)
+  +    assert "extended-cache-ttl-2025-04-11" in h["anthropic-beta"].split(",")
+  +
+  +
+   # ─────────────────────────── headers (§7) ───────────────────────────
+   
+   def test_headers_no_x_client_request_id():
+  +54 -10
+
+src/tests/test_m10_system_menu.py
+  @@ -80,14 +80,14 @@ def test_main_page(m):
+  -                "menu:main"}
+  +                "sys:show:custom", "menu:main"}
+       for e in expected:
+           assert e in btns, f"missing btn {e}"
+       assert "menu:loadbalancing" not in btns
+       assert "sys:show:cch" not in btns
+       assert "sys:show:quota" not in btns
+       bottom = edit["reply_markup"]["inline_keyboard"][-1]
+  -    assert [button["callback_data"] for button in bottom] == ["sys:show:retry", "menu:main"]
+  +    assert [button["callback_data"] for button in bottom] == ["menu:main"]
+       assert "候选按序故障转移" in text
+       print("  [PASS] main settings page")
+   
+  +2 -2
+
+src/tests/test_quota_primer.py
+  @@ -0,0 +1,141 @@
+  +import asyncio
+  +import unittest
+  +from typing import Any, cast
+  +from unittest.mock import patch
+  +
+  +from src import quota_primer
+  +from src.channel.base import UpstreamRequest
+  +
+  +
+  +class QuotaPrimerDueReasonTest(unittest.TestCase):
+  +    def setUp(self):
+  +        self.cfg = {
+  +            "graceSeconds": 60,
+  +            "minIntervalSeconds": 300,
+  +            "bootstrapWhenUnknown": False,
+  +            "claudeZeroUtilFallback": True,
+  +            "includeQuotaDisabledAfterReset": True,
+  +        }
+  +        self.acc = {"email": "a@example.com", "disabled_reason": None}
+  +
+  +    def _due(self, row, acc=None, cfg=None, *, account_key="claude:a@example.com", now: float = 1_800_000_000):
+  +        with patch.object(quota_primer, "_load_state", return_value={}):
+
+... (more changes truncated)
+  +22 -0
+[full diff: rtk git diff --no-compact]

@@ -138,9 +138,8 @@ def _main_text_and_kb() -> tuple[str, dict]:
     custom = cfg.get("customSettings") or {}
     default_1m = bool(custom.get("enableDefaultContext1m", False))
     tavern_cache = bool(custom.get("enableSillyTavernCacheMode", False))
-    cache_ttl = str(custom.get("claudeOAuthCacheTtl", "passthrough") or "passthrough").strip().lower()
-    if cache_ttl not in {"passthrough", "5m", "1h"}:
-        cache_ttl = "passthrough"
+    from src.transform.cc_mimicry import normalize_cache_ttl
+    cache_ttl = normalize_cache_ttl(custom.get("claudeOAuthCacheTtl", "passthrough"))
     cache_label = "请求透传" if cache_ttl == "passthrough" else cache_ttl
 
     text += f"黑名单: 默认 {bl_default_count} 条 · 渠道专属 {bl_by_ch_count} 条"
@@ -2608,9 +2607,10 @@ def _on_ws_mode_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
 def _custom_settings_cfg() -> dict:
     cfg = config.get()
     custom = cfg.get("customSettings") or {}
-    cache_ttl = str(custom.get("claudeOAuthCacheTtl", "passthrough") or "passthrough").strip().lower()
-    if cache_ttl not in {"passthrough", "5m", "1h"}:
-        cache_ttl = "passthrough"
+    # Use the same normalization as cc_mimicry so the menu shows what the runtime
+    # actually uses.  normalize_cache_ttl maps unknowns to "5m", not "passthrough".
+    from src.transform.cc_mimicry import normalize_cache_ttl
+    cache_ttl = normalize_cache_ttl(custom.get("claudeOAuthCacheTtl", "passthrough"))
     return {
         "enableDefaultContext1m": bool(custom.get("enableDefaultContext1m", False)),
         "enableSillyTavernCacheMode": bool(custom.get("enableSillyTavernCacheMode", False)),
@@ -2669,10 +2669,9 @@ def _on_custom_toggle(chat_id: int, message_id: int, cb_id: str, field: str) -> 
 def _on_custom_cache_ttl_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
     def _mut(c):
         custom = c.setdefault("customSettings", {})
-        current = str(custom.get("claudeOAuthCacheTtl", "passthrough") or "passthrough").strip().lower()
+        from src.transform.cc_mimicry import normalize_cache_ttl
+        current = normalize_cache_ttl(custom.get("claudeOAuthCacheTtl", "passthrough"))
         order = ["passthrough", "5m", "1h"]
-        if current not in order:
-            current = "passthrough"
         custom["claudeOAuthCacheTtl"] = order[(order.index(current) + 1) % len(order)]
         # 旧开关保留兼容，但运行期不允许关 Claude Code 身份指纹。
         custom["enableClaudeCodeSystemPrompt"] = True

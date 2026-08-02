@@ -423,9 +423,9 @@ class OpenAIOAuthChannel(Channel):
     async def probe_usage(self, *, timeout_s: float = 20.0) -> dict:
         """主动发一条最小 codex 请求，读响应头更新 Codex 用量 snapshot。
 
-        对齐 sub2api account_test_service 的做法：构造一个"hi" 级别的小请求，
-        拿到响应头即可 close 流，不等完整回复。响应头里的 x-codex-* 字段喂给
-        state_db.quota_save_openai_snapshot，相当于"显式刷新一次用量"。
+        构造一个普通短请求并完整消费响应，确保上游把它计作正常模型使用。
+        响应头里的 x-codex-* 字段喂给 state_db.quota_save_openai_snapshot，
+        相当于“显式刷新一次用量”。
 
         用户在 TG bot 主动点按钮时调用；不触发 failover 节流桶（那个只在请求
         链路里生效），这里直接写库。
@@ -510,14 +510,15 @@ class OpenAIOAuthChannel(Channel):
             try:
                 state_db.quota_save_openai_snapshot(self.account_key, snap, normalized, email=self.email)
             except Exception as exc:
-                return {"ok": False, "reason": f"quota write: {exc}"}
+                return {"ok": False, "request_ok": status == 200,
+                        "reason": f"quota write: {exc}"}
 
         if status != 200:
-            return {"ok": False, "reason": f"HTTP {status}"}
+            return {"ok": False, "request_ok": False, "reason": f"HTTP {status}"}
         if not snap:
-            return {"ok": False,
+            return {"ok": False, "request_ok": True,
                     "reason": "upstream 200 but no x-codex-* headers"}
-        return {"ok": True, "reason": "probed"}
+        return {"ok": True, "request_ok": True, "reason": "probed"}
 
     # ─── UI ──────────────────────────────────────────────────
 

@@ -2,8 +2,10 @@
 
 Some subscription backends use a rolling 5h window that only starts on the first
 model request after the previous window refreshes. This module can send one
-ordinary short request after a known 5h reset time has passed so the next rolling
-window starts even if no user traffic arrives immediately.
+ordinary short request a few minutes after a known 5h reset time so the next
+rolling window starts even if no user traffic arrives immediately.  A successful
+request normally returns the next reset timestamp, which becomes the anchor for
+the following cycle.
 
 Safety defaults:
 - disabled by default;
@@ -38,11 +40,14 @@ _STATE_PREFIX = "quota_primer:"
 def _cfg() -> dict:
     base = {
         "enabled": False,
-        "intervalSeconds": 600,
-        "intervalJitterSeconds": 90,
+        "intervalSeconds": 60,
+        "intervalJitterSeconds": 10,
         "initialDelaySeconds": 90,
-        "graceSeconds": 60,
+        "postResetDelaySeconds": 360,
+        "windowSeconds": 18_000,
         "minIntervalSeconds": 17_400,  # 4h50m guard against bad/moving reset data
+        "failureRetrySeconds": 300,
+        "failureRetryMaxSeconds": 1_800,
         "timeoutSeconds": 20,
         "bootstrapWhenUnknown": False,
         "claudeZeroUtilFallback": True,
@@ -139,8 +144,78 @@ def _recent_model_request(row: dict | None, now: float, min_interval: int) -> bo
     return last_model_at is not None and now - last_model_at < min_interval
 
 
+def _successful_prime_at(state: dict) -> float:
+    """Read the successful-prime timestamp, including legacy persisted state."""
+    value = state.get("last_success_at")
+    if value is None and state.get("last_ok") is True:
+        value = state.get("last_prime_at")
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _failure_retry_delay(cfg: dict, failure_count: int) -> int:
+    base = max(30, int(cfg.get("failureRetrySeconds", 300) or 300))
+    cap = max(base, int(cfg.get("failureRetryMaxSeconds", 1_800) or 1_800))
+    exponent = max(0, min(int(failure_count) - 1, 10))
+    return min(cap, base * (2 ** exponent))
+
+
+def _effective_reset_at(row: dict | None, state: dict) -> float | None:
+    """Return the newest reset anchor from quota cache or persisted scheduler state."""
+    candidates = [
+        _parse_iso_utc((row or {}).get("five_hour_reset")),
+        _float_or_none(state.get("next_cycle_reset_at")),
+    ]
+    valid = [value for value in candidates if value is not None and value > 0]
+    return max(valid) if valid else None
+
+
+def _result_state_patch(previous_state: dict, result: dict, *, reason: str,
+                        trigger_reset: Any, trigger_reset_at: float | None,
+                        reset_after: Any, now_ts: int,
+                        cfg: dict) -> dict:
+    """Build the persistent scheduler state for one real primer attempt."""
+    patch = {
+        "last_attempt_at": now_ts,
+        "last_reason": reason,
+        "last_ok": bool(result.get("ok")),
+        "last_result": result.get("reason"),
+        "last_model": result.get("model"),
+    }
+    if result.get("ok"):
+        returned_reset_at = _parse_iso_utc(reset_after)
+        # If the response did not advance the reset timestamp, keep the cycle
+        # alive with the known 5h window length.  A later real quota snapshot may
+        # move this target forward, and _effective_reset_at() will prefer it.
+        if returned_reset_at is None or (
+            trigger_reset_at is not None and returned_reset_at <= trigger_reset_at
+        ):
+            returned_reset_at = float(now_ts + max(300, int(cfg.get("windowSeconds", 18_000) or 18_000)))
+        patch.update({
+            "last_prime_at": now_ts,  # retained for compatibility
+            "last_success_at": now_ts,
+            # This is the reset that caused this attempt, not the newly returned
+            # reset.  The latter is the anchor of the following 5h cycle.
+            "last_trigger_reset": trigger_reset,
+            "last_trigger_at": trigger_reset_at,
+            "observed_next_reset": reset_after,
+            "next_cycle_reset_at": int(returned_reset_at),
+            "failure_count": 0,
+            "next_retry_at": 0,
+        })
+    else:
+        failure_count = int(previous_state.get("failure_count") or 0) + 1
+        patch.update({
+            "failure_count": failure_count,
+            "next_retry_at": now_ts + _failure_retry_delay(cfg, failure_count),
+        })
+    return patch
+
+
 def _loop_sleep_seconds(cfg: dict) -> float:
-    interval = int(cfg.get("intervalSeconds", 600) or 600)
+    interval = int(cfg.get("intervalSeconds", 60) or 60)
     jitter = max(0, int(cfg.get("intervalJitterSeconds", 0) or 0))
     if jitter:
         interval += random.uniform(-jitter, jitter)
@@ -162,13 +237,15 @@ def _due_reason(account_key: str, row: dict | None, acc: dict | None, cfg: dict,
     if acc.get("disabled_reason") in ("user", "auth_error"):
         return False, f"skip:{acc.get('disabled_reason')}"
 
-    last_prime = float(state.get("last_prime_at") or 0)
+    next_retry_at = _float_or_none(state.get("next_retry_at")) or 0
+    if next_retry_at > now:
+        return False, "skip:retry_backoff"
+
+    last_success = _successful_prime_at(state)
     min_interval = max(300, int(cfg.get("minIntervalSeconds", 17_400) or 17_400))
-    if last_prime and now - last_prime < min_interval:
-        return False, "skip:min_interval"
 
     reset_iso = (row or {}).get("five_hour_reset") if row else None
-    reset_ts = _parse_iso_utc(reset_iso)
+    reset_ts = _effective_reset_at(row, state)
 
     disabled_reason = acc.get("disabled_reason")
     disabled_until_ts = _parse_iso_utc(acc.get("disabled_until"))
@@ -179,6 +256,15 @@ def _due_reason(account_key: str, row: dict | None, acc: dict | None, cfg: dict,
             return False, "skip:quota_reset_future"
 
     if reset_ts is None:
+        # quota-disabled accounts must only be primed against a known reset
+        # timestamp.  The zero-util fallback is for healthy Claude accounts that
+        # show util=0 but haven't started the next rolling window yet; a
+        # quota-disabled account with no reset data should not get exploratory
+        # requests.
+        if disabled_reason == "quota":
+            return False, "skip:quota_disabled_no_reset"
+        if last_success and now - last_success < min_interval:
+            return False, "skip:min_interval"
         provider = _provider_from_account_key(account_key)
         util = _float_or_none((row or {}).get("five_hour_util"))
         # Claude usage may show five_hour_util=0 after refresh but omit the next
@@ -191,11 +277,17 @@ def _due_reason(account_key: str, row: dict | None, acc: dict | None, cfg: dict,
             return True, "unknown_bootstrap"
         return False, "skip:no_known_reset"
 
-    grace = max(0, int(cfg.get("graceSeconds", 60) or 60))
-    if reset_ts > now + grace:
-        return False, "skip:reset_future"
+    post_reset_delay = max(0, int(cfg.get("postResetDelaySeconds", 360) or 360))
+    if now < reset_ts + post_reset_delay:
+        return False, "skip:post_reset_delay"
 
-    if str(state.get("last_reset_primed") or "") == str(reset_iso):
+    # New state records the reset that triggered the successful request.  The old
+    # implementation stored the reset returned *after* success, which is actually
+    # the next cycle and must not suppress it after an upgrade.
+    last_trigger_at = _float_or_none(state.get("last_trigger_at"))
+    legacy_trigger_at = _parse_iso_utc(state.get("last_trigger_reset"))
+    handled_at = last_trigger_at if last_trigger_at is not None else legacy_trigger_at
+    if handled_at is not None and int(handled_at) == int(reset_ts):
         return False, "skip:reset_already_primed"
 
     last_model_at = _last_model_request_at(row)
@@ -255,7 +347,11 @@ async def _prime_openai(ch: OpenAIOAuthChannel, *, timeout_s: float) -> dict:
             oauth_manager.evaluate_and_toggle_by_usage(ch.account_key, row, threshold=threshold, fresh=True)
         except Exception as exc:
             print(f"[quota_primer] OpenAI quota evaluation failed for {ch.account_key}: {exc}")
-    return {"ok": bool(result.get("ok")), "reason": str(result.get("reason") or ""), "model": (ch.models[0] if ch.models else "")}
+    # A completed HTTP 200 model request starts the rolling window even when the
+    # response omitted quota headers.  Treat it as a scheduler success to avoid
+    # repeatedly spending tokens; quota refresh can catch up on later traffic.
+    request_ok = bool(result.get("ok") or result.get("request_ok"))
+    return {"ok": request_ok, "reason": str(result.get("reason") or ""), "model": (ch.models[0] if ch.models else "")}
 
 
 async def primer_once() -> dict[str, str]:
@@ -292,16 +388,21 @@ async def primer_once() -> dict[str, str]:
             result = {"ok": False, "reason": str(exc)[:200], "model": ""}
 
         row_after = state_db.quota_load(ch.account_key) or row or {}
+        previous_state = _load_state(ch.account_key)
+        trigger_reset = (row or {}).get("five_hour_reset") if row else None
+        trigger_reset_at = _effective_reset_at(row, previous_state)
         reset_after = row_after.get("five_hour_reset") or ((row or {}).get("five_hour_reset") if row else None)
-        state_patch = {
-            "last_prime_at": int(_now()),
-            "last_reason": reason,
-            "last_ok": bool(result.get("ok")),
-            "last_result": result.get("reason"),
-            "last_model": result.get("model"),
-        }
-        if result.get("ok") and reset_after:
-            state_patch["last_reset_primed"] = reset_after
+        now_ts = int(_now())
+        state_patch = _result_state_patch(
+            previous_state,
+            result,
+            reason=reason,
+            trigger_reset=trigger_reset,
+            trigger_reset_at=trigger_reset_at,
+            reset_after=reset_after,
+            now_ts=now_ts,
+            cfg=cfg,
+        )
         _save_state(ch.account_key, state_patch)
 
         status = "ok" if result.get("ok") else "failed"
@@ -310,6 +411,25 @@ async def primer_once() -> dict[str, str]:
             f"[quota_primer] {status} provider={provider} account={getattr(ch, 'email', '?')} "
             f"model={result.get('model') or '-'} trigger={reason} result={result.get('reason') or ''}"
         )
+        if cfg.get("notify"):
+            try:
+                from . import notifier
+                if result.get("ok"):
+                    notifier.notify_event(
+                        "quota_primer",
+                        f"✅ <b>5h 窗口已启动</b>\n"
+                        f"账户: <code>{notifier.escape_html(getattr(ch, 'email', ch.account_key))}</code>\n"
+                        f"触发: {reason} · 模型: <code>{result.get('model') or '-'}</code>",
+                    )
+                else:
+                    notifier.notify_event(
+                        "quota_primer",
+                        f"❌ <b>5h 窗口启动失败</b>\n"
+                        f"账户: <code>{notifier.escape_html(getattr(ch, 'email', ch.account_key))}</code>\n"
+                        f"触发: {reason} · 原因: {notifier.escape_html(str(result.get('reason') or ''))[:200]}",
+                    )
+            except Exception as exc:
+                print(f"[quota_primer] notify failed: {exc}")
         # Avoid a burst across multiple accounts. This is intentionally small;
         # each actual upstream request is still gated by minInterval/reset state.
         await asyncio.sleep(2)

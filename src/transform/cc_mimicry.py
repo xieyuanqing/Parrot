@@ -152,8 +152,6 @@ def load_config():
         "cch_mode": cfg.get("cchMode", "disabled"),
         "cch_static_value": cfg.get("cchStaticValue", "00000"),
         "enable_default_context_1m": bool(custom.get("enableDefaultContext1m", False)),
-        # Claude OAuth 身份指纹必须保留；旧配置里的 False 不再生效。
-        "enable_claude_code_system_prompt": True,
         "claude_oauth_cache_ttl": normalize_cache_ttl(custom.get("claudeOAuthCacheTtl", PASSTHROUGH_CACHE_TTL)),
         "enable_silly_tavern_cache_mode": bool(custom.get("enableSillyTavernCacheMode", False)),
     }
@@ -188,7 +186,6 @@ def build_system_blocks(messages, cache_ttl="1h", *, inject_cache=True):
     version = f"{CC_VERSION}.{fp}"
     cfg = load_config()
     cch_mode = _normalize_cch_mode(cfg.get("cch_mode", "dynamic"))
-    include_claude_code_prompt = bool(cfg.get("enable_claude_code_system_prompt", True))
     blocks = []
     if cch_mode != "disabled":
         parts = [f"cc_version={version}", f"cc_entrypoint={CC_ENTRYPOINT}"]
@@ -198,35 +195,14 @@ def build_system_blocks(messages, cache_ttl="1h", *, inject_cache=True):
             parts.append(f"cch={_normalize_cch_value(cfg.get('cch_static_value', '00000'))}")
         attribution = "x-anthropic-billing-header: " + "; ".join(parts) + ";"
         blocks.append({"type": "text", "text": attribution})
-    if include_claude_code_prompt:
-        cc_block: dict = {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}
-        if inject_cache:
-            cc_cache_control = cache_control_for_ttl(cache_ttl)
-            if cc_cache_control:
-                cc_block["cache_control"] = cc_cache_control
-        blocks.append(cc_block)
+    # Claude Code identity prompt is always injected for OAuth viability.
+    cc_block: dict = {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}
+    if inject_cache:
+        cc_cache_control = cache_control_for_ttl(cache_ttl)
+        if cc_cache_control:
+            cc_block["cache_control"] = cc_cache_control
+    blocks.append(cc_block)
     return blocks
-
-
-def _user_system_to_blocks(user_system):
-    """把下游原始 system 保留为 Anthropic top-level system blocks。"""
-    if not user_system:
-        return []
-    if isinstance(user_system, str):
-        text = user_system.strip()
-        return [{"type": "text", "text": text}] if text else []
-    if isinstance(user_system, list):
-        blocks = []
-        for block in user_system:
-            if isinstance(block, str):
-                if block.strip():
-                    blocks.append({"type": "text", "text": block})
-            elif isinstance(block, dict):
-                btype = block.get("type")
-                if btype == "text" and str(block.get("text", "")).strip():
-                    blocks.append({k: v for k, v in block.items() if k in {"type", "text", "cache_control"}})
-        return blocks
-    return []
 
 
 def inject_user_system_to_messages(messages, user_system):
@@ -833,13 +809,8 @@ def transform_request(body, email="", session_id=None, cache_ttl="1h"):
     messages = body.get("messages", [])
     user_system = body.get("system")
     cfg = load_config()
-    include_claude_code_prompt = bool(cfg.get("enable_claude_code_system_prompt", True))
-    if include_claude_code_prompt:
-        messages = inject_user_system_to_messages(messages, user_system)
-    else:
-        # 关闭 Claude Code 身份提示词时，不再把用户 system 伪造成 user/assistant 对话，
-        # 而是尽量保留为 Anthropic 原生 top-level system。
-        messages = inject_user_system_to_messages(messages, None)
+    # Claude Code identity is always required for OAuth link viability.
+    messages = inject_user_system_to_messages(messages, user_system)
     messages = _normalize_messages_for_api(messages)
     messages = _strip_assistant_thinking_blocks(messages)
     if preserve_downstream_cache:
@@ -851,8 +822,6 @@ def transform_request(body, email="", session_id=None, cache_ttl="1h"):
         else:
             messages = add_cache_breakpoints(messages, cache_ttl=cache_ttl)
     system_blocks = build_system_blocks(messages, cache_ttl=cache_ttl, inject_cache=not preserve_downstream_cache)
-    if not include_claude_code_prompt:
-        system_blocks.extend(_user_system_to_blocks(user_system))
     model = body.get("model", "claude-sonnet-4-20250514")
 
     # 动态工具名映射（tools > 5 时触发）
