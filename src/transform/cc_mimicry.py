@@ -856,8 +856,9 @@ def transform_request(body, email="", session_id=None, cache_ttl="1h"):
                 t["name"] = _sanitize_tool_name(t["name"], dynamic_tool_map)
         tool_cache_control = cache_control_for_ttl(cache_ttl)
         if not preserve_downstream_cache and tool_cache_control:
-            tools[-1] = dict(tools[-1])
-            tools[-1]["cache_control"] = tool_cache_control
+            cache_hints.apply_anthropic_tools_cache_breakpoint(
+                tools, cache_control=tool_cache_control,
+            )
         payload["tools"] = tools
 
     top_cache = cache_hints.top_level_cache_control(body)
