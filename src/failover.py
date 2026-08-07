@@ -33,7 +33,7 @@ from . import (
 from .channel.base import Channel
 from .channel.openai_oauth_channel import OpenAIOAuthChannel
 from .transform import cc_mimicry
-from .openai import reasoning_replay
+from .openai import deepseek_reasoning, reasoning_replay
 from .openai.codex_identity_confuse import ConfuseState
 from .openai.responses_ws_runtime import (
     build_oauth_responses_ws_frame,
@@ -259,7 +259,8 @@ def forget_anthropic_snapshot(account_key_or_email: str) -> None:
 #   - Anthropic: surpassed-threshold=true OR utilization>=1.0（任一窗口）
 #   - OpenAI  : primary/secondary used_percent ≥ disableThresholdPercent (default 95)
 #
-# 幂等：账号已是 disabled_reason="quota" 时不重复置位。
+# 幂等：账号已是 disabled_reason="quota" 时不重复通知或移动恢复时间，但仍
+# 持久化最新 observation generation，供并发恢复 CAS 使用。
 # auth_error / user 禁用的账号不碰（保留原始禁用原因）。
 
 
@@ -334,7 +335,7 @@ def _maybe_auto_disable_by_codex_snapshot(account_key: str, email: str,
     from . import oauth_manager
 
     acc = oauth_manager.get_account(account_key)
-    if acc is None or acc.get("disabled_reason"):
+    if acc is None or acc.get("disabled_reason") not in (None, "quota"):
         return
 
     threshold = _get_quota_disable_threshold_pct()
@@ -378,9 +379,18 @@ def _maybe_auto_disable_by_codex_snapshot(account_key: str, email: str,
         latest_iso = latest.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     try:
-        oauth_manager.set_disabled_by_quota(account_key, latest_iso)
+        disable_result = oauth_manager.set_disabled_by_quota(
+            account_key,
+            latest_iso,
+            observation=oauth_manager.codex_quota_observation(snap),
+        )
     except Exception as exc:
         print(f"[failover] auto-disable (codex) failed for {account_key}: {exc}")
+        return
+
+    # A quota-disabled account still records a new generation/observation for
+    # recovery CAS, but only the transition from enabled emits a notification.
+    if (disable_result or {}).get("state") != "disabled":
         return
 
     try:
@@ -613,6 +623,20 @@ def _maybe_cache_codex_reasoning_replay(translator_ctx: Optional[dict], response
         reasoning_replay.cache_from_translator_ctx(translator_ctx, response_obj)
     except Exception as exc:
         print(f"[failover] codex reasoning replay cache failed: {exc}")
+
+
+def _maybe_cache_deepseek_reasoning(ch: Channel, model: str, response_obj: Any) -> None:
+    """Cache terminal DeepSeek reasoning for later tool-call replay."""
+    try:
+        is_deepseek = getattr(ch, "_is_deepseek", None)
+        if not callable(is_deepseek) or not is_deepseek(model):
+            return
+        if getattr(ch, "protocol", "") == "openai-responses":
+            deepseek_reasoning.cache_from_responses_response(response_obj, model=model)
+        else:
+            deepseek_reasoning.cache_from_chat_response(response_obj, model=model)
+    except Exception as exc:
+        print(f"[failover] deepseek reasoning replay cache failed: {exc}")
 
 
 def _maybe_clear_codex_reasoning_replay(translator_ctx: Optional[dict]) -> bool:
@@ -4237,6 +4261,7 @@ async def _consume_non_stream(
     )
 
     # 跨变体：把上游 JSON 反向成 ingress 期望的格式；同协议 translator_ctx=None 即原样
+    _maybe_cache_deepseek_reasoning(ch, resolved_model, obj)
     _maybe_cache_codex_reasoning_replay(translator_ctx, obj)
     out_obj = _apply_non_stream_response_translator(obj, translator_ctx or {})
     if ingress_protocol == "responses" and getattr(ch, "protocol", "") == "openai-responses":
@@ -4374,6 +4399,7 @@ async def _consume_stream_as_non_stream(
     )
 
     # 6) 走跨变体 translator（如果 ingress 是 chat，上游 responses JSON 要翻译成 chat.completion JSON）
+    _maybe_cache_deepseek_reasoning(ch, resolved_model, obj)
     _maybe_cache_codex_reasoning_replay(translator_ctx, obj)
     out_obj = _apply_non_stream_response_translator(obj, translator_ctx or {})
     if ingress_protocol == "responses" and getattr(ch, "protocol", "") == "openai-responses":
@@ -4618,9 +4644,16 @@ async def _consume_stream(
             total_ms=round_total_ms,
         )
 
-        if getattr(ch, "protocol", "anthropic") == "openai-responses" and hasattr(builder, "to_full_json"):
+        upstream_protocol = getattr(ch, "protocol", "anthropic")
+        if upstream_protocol == "openai-chat" and hasattr(builder, "get_assistant"):
+            _maybe_cache_deepseek_reasoning(ch, resolved_model, {
+                "model": resolved_model,
+                "choices": [{"message": builder.get_assistant()}],
+            })
+        if upstream_protocol == "openai-responses" and hasattr(builder, "to_full_json"):
             try:
                 native_response_obj = builder.to_full_json(fallback_model=resolved_model)
+                _maybe_cache_deepseek_reasoning(ch, resolved_model, native_response_obj)
                 _maybe_cache_codex_reasoning_replay(translator_ctx, native_response_obj)
                 if ingress_protocol == "responses":
                     _maybe_save_native_responses_store(

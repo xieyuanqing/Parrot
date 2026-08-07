@@ -863,6 +863,11 @@ def transform_request(body, email="", session_id=None, cache_ttl="1h"):
     top_cache = cache_hints.top_level_cache_control(body)
     if top_cache:
         payload["cache_control"] = top_cache
+    # passthrough/explicit-cache modes must not gain Parrot-generated breakpoints.
+    # In managed modes the local TTL/SillyTavern policy has already populated
+    # the four cache sections; the upstream helper safely fills any missing one.
+    if not preserve_downstream_cache:
+        cache_hints.apply_anthropic_block_cache_breakpoints(payload)
 
     # tool_choice：CC 不"主动加"，但客户端显式传入时必须透传（含工具名混淆），
     # 否则会吞掉下游强制/禁用工具的意图。抓包未含此字段是会话未用到，非协议禁止。
